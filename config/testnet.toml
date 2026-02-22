@@ -1,0 +1,79 @@
+# Solana C Validator - Testnet Configuration
+#
+# This configuration is for running a validator on Solana's testnet.
+# Testnet is used for testing changes before deploying to mainnet.
+#
+# Entrypoints and parameters may change - check https://docs.solana.com
+# for the latest testnet configuration.
+
+[validator]
+# Path to identity keypair (generate with: sol-keygen new -o identity.json)
+identity_keypair = "./identity.json"
+
+# Path to vote account pubkey file
+# vote_account = "./vote.json"
+
+# Ledger storage path
+ledger_path = "./ledger"
+
+[network]
+# Testnet entrypoints (check Solana docs for current entrypoints)
+entrypoints = [
+    "entrypoint.testnet.solana.com:8001",
+    "entrypoint2.testnet.solana.com:8001",
+    "entrypoint3.testnet.solana.com:8001"
+]
+
+# Known validators (trusted nodes for snapshot download)
+known_validators = [
+    "5D1fNXzvv5NjV1ysLjirC4WY92RNsVH18vjmcszZd8on",
+    "dDzy5SR3AXdYWVqbDEkVFdvSPCtS9ihF5kJkHCtXoFs",
+    "Ft5fbkqNa76vnsjYNwjDZUXoTWpP7VYm3mtsaQckQADN"
+]
+
+[rpc]
+# RPC server configuration
+enable = true
+bind_address = "127.0.0.1"
+port = 8899
+
+# Enable debug RPC methods (not recommended for production)
+enable_debug = false
+
+[gossip]
+port = 8001
+
+[tpu]
+port = 8003
+
+[tvu]
+port = 8004
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log format: text, json
+format = "text"
+
+# Optional log file (leave empty for stderr)
+# file = "./validator.log"
+
+[metrics]
+# Prometheus metrics
+enable = true
+port = 9090
+
+[consensus]
+# Voting is enabled by default on testnet
+enable_voting = true
+
+# Wait for vote account to be created before starting
+wait_for_vote_account = true
+
+[performance]
+# Number of threads for signature verification
+sigverify_threads = 4
+
+# Number of threads for banking stage
+banking_threads = 4

@@ -1,0 +1,52 @@
+# Build artifacts
+/build*/
+/bin/
+/Testing/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.o
+*.a
+*.so
+*.dSYM
+
+# Caches
+/.cache/
+**/__pycache__/
+*.pyc
+
+# Ledgers / snapshots / parity runs
+/ledger*/
+/ledger.*
+/agave*/
+/agave.*
+/agave-reptest/
+/agave_ledger_prebuilt/
+/agave_rpc_test/
+/delta_dumps_*
+/parity_run*.log
+/parity_test*.log
+/block_*_txresults.tsv
+
+# External sources (local clones)
+/external/
+
+# Large local docs/data
+/plan.md
+/scripts/delta_pubkeys.txt
+
+# Temp dumps
+/tmp.*.elf
+/tmp.*.programdata
+/tmp.*.real.elf
+
+# Tool binaries / editor backups
+/tools/dump_appendvec
+/tools/read_tx_status
+*.bak
+
+# Logs
+*.log
+*.tsv

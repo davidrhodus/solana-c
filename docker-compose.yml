@@ -1,0 +1,102 @@
+# Solana C Validator - Docker Compose Configuration
+#
+# Usage:
+#   docker-compose up -d        Start validator
+#   docker-compose logs -f      View logs
+#   docker-compose down         Stop validator
+#
+# For testnet:
+#   docker-compose -f docker-compose.yml -f docker-compose.testnet.yml up -d
+
+version: '3.8'
+
+services:
+  validator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: solana-c-validator
+    restart: unless-stopped
+    volumes:
+      - ./ledger:/ledger
+      - ./config:/config:ro
+      - ./identity.json:/config/identity.json:ro
+      - ./vote.json:/config/vote.json:ro
+    ports:
+      - "8899:8899"   # RPC
+      - "8001:8001"   # Gossip UDP
+      - "8003:8003"   # TPU
+      - "8004:8004"   # TVU
+      - "9090:9090"   # Prometheus
+    environment:
+      - RUST_LOG=info
+      - SOL_LOG_LEVEL=info
+    command:
+      - --ledger
+      - /ledger
+      - --identity
+      - /config/identity.json
+      - --vote-account
+      - /config/vote.json
+      - --rpc-bind
+      - "0.0.0.0"
+      - --rpc-port
+      - "8899"
+      - --gossip-port
+      - "8001"
+      - --metrics-port
+      - "9090"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8899/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 16G
+        reservations:
+          cpus: '2'
+          memory: 8G
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    container_name: solana-prometheus
+    restart: unless-stopped
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9091:9090"
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=7d'
+    depends_on:
+      - validator
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:10.1.0
+    container_name: solana-grafana
+    restart: unless-stopped
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+
+volumes:
+  prometheus_data:
+  grafana_data:

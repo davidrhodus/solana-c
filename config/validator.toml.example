@@ -1,0 +1,94 @@
+# Solana C Validator Configuration
+# Copy this file to validator.toml and customize for your deployment
+
+[identity]
+# Path to identity keypair JSON file
+keypair = "/var/solana/identity.json"
+# Vote account address (base58)
+# vote_account = "VoteAccountPubkey..."
+
+[ledger]
+# Path to ledger directory
+path = "/var/solana/ledger"
+# Path to RocksDB base directory (optional; uses accounts/ and blockstore/ subdirs)
+# rocksdb_path = "/var/solana/rocksdb"
+# Path to snapshots directory (optional, defaults to ledger/snapshots)
+# snapshot_path = "/var/solana/snapshots"
+
+[consensus]
+# Path to persistent tower state (optional, defaults to <ledger>/tower.bin)
+# tower_path = "/var/solana/ledger/tower.bin"
+
+[network]
+# Cluster entrypoints
+entrypoints = [
+    "entrypoint.mainnet-beta.solana.com:8001",
+    "entrypoint2.mainnet-beta.solana.com:8001",
+    "entrypoint3.mainnet-beta.solana.com:8001"
+]
+
+# Optional: public IP to advertise in gossip contact info.
+# If omitted, the validator will try to infer an outbound IP from the first entrypoint.
+# advertise_ip = "1.2.3.4"
+
+# Optional: cluster shred version (0 = auto-discover via RPC).
+# shred_version = 0
+
+# Optional: RPC URL to use for shred version auto-discovery.
+# Defaults to snapshots.rpc_urls[0] when provided, otherwise chooses an official endpoint
+# based on the entrypoint hostname (mainnet/testnet/devnet).
+# shred_version_rpc_url = "https://api.mainnet-beta.solana.com"
+
+# Gossip port
+gossip_port = 8001
+
+# TPU port (transaction processing)
+tpu_port = 8003
+
+# TVU port (transaction validation)
+tvu_port = 8004
+
+# RPC port
+rpc_port = 8899
+
+# Enable QUIC transport for TPU
+enable_quic = true
+
+[rpc]
+# Enable RPC server
+enable = true
+# RPC bind address
+bind = "0.0.0.0"
+# RPC port (same as network.rpc_port)
+port = 8899
+
+[snapshots]
+# Full snapshot interval (slots)
+full_interval = 25000
+# Incremental snapshot interval (slots)
+incremental_interval = 5000
+# Max lag (slots) between persisted AccountsDB bootstrap state and the best available snapshot
+# before forcing a fresh snapshot load. Set to 0 to always reuse existing bootstrap state.
+# max_bootstrap_lag_slots = 50000
+# Optional: verify snapshot accounts hash at load time (very expensive)
+# verify_accounts_hash = false
+# Optional: snapshot service manifest URL for auto-bootstrapping
+# manifest_url = "https://data.pipedev.network/snapshot-manifest.json"
+# Optional: RPC URLs to try if snapshot service fails (each URL should serve /snapshot.tar.*)
+# rpc_urls = [
+#   "http://127.0.0.1:8899"
+# ]
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+# Log format: text, json
+format = "text"
+# Log file path (empty for stderr)
+# file = "/var/log/solana/validator.log"
+
+[metrics]
+# Enable Prometheus metrics endpoint
+enable = true
+# Metrics port
+port = 9090

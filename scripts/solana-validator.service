@@ -1,0 +1,61 @@
+[Unit]
+Description=Solana C Validator
+Documentation=https://github.com/solana-c/solana-c
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solana
+Group=solana
+
+# Main process
+ExecStart=/usr/local/bin/solana-validator --config /var/solana/validator.toml
+
+# Restart policy
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=120
+TimeoutStopSec=60
+
+# Resource limits
+LimitNOFILE=1000000
+LimitNPROC=65535
+LimitMEMLOCK=infinity
+
+# CPU and memory
+CPUQuota=400%
+MemoryMax=80%
+
+# Working directory
+WorkingDirectory=/var/solana
+
+# Environment
+Environment=RUST_LOG=solana=info
+Environment=SOLANA_METRICS_CONFIG=""
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+# Writable paths
+ReadWritePaths=/var/solana /var/log/solana
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solana-validator
+
+# Watchdog
+WatchdogSec=300
+
+[Install]
+WantedBy=multi-user.target

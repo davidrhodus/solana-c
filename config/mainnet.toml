@@ -1,0 +1,107 @@
+# Solana C Validator - Mainnet Configuration
+#
+# WARNING: Running a mainnet validator requires significant resources
+# and careful configuration. Incorrect settings can result in:
+# - Slashing of staked SOL
+# - Missing vote credits
+# - Network instability
+#
+# Please ensure you have:
+# 1. Tested on testnet first
+# 2. Sufficient hardware (see docs/deployment.md)
+# 3. Proper key management
+# 4. Monitoring and alerting configured
+#
+# Check https://docs.solana.com for the latest mainnet configuration.
+
+[validator]
+# Path to identity keypair
+# CRITICAL: Protect this keypair - it's your validator's identity
+identity_keypair = "./identity.json"
+
+# Path to vote account pubkey file
+vote_account = "./vote-account.json"
+
+# Ledger storage path
+# Recommended: Use fast NVMe SSD with at least 2TB
+ledger_path = "./ledger"
+
+[network]
+# Mainnet-beta entrypoints (check Solana docs for current entrypoints)
+entrypoints = [
+    "entrypoint.mainnet-beta.solana.com:8001",
+    "entrypoint2.mainnet-beta.solana.com:8001",
+    "entrypoint3.mainnet-beta.solana.com:8001",
+    "entrypoint4.mainnet-beta.solana.com:8001",
+    "entrypoint5.mainnet-beta.solana.com:8001"
+]
+
+# Known validators (trusted nodes for snapshot download)
+# Add known high-reputation validators here
+known_validators = [
+    # Solana Foundation validators
+    "7Np41oeYqPefeNQEHSv1UDhYrehxin3NStELsSKCT4K2",
+    "GdnSyH3YtwcxFvQrVVJMm1JhTS4QVX7MFsX56uJLUfiZ",
+    # Add more trusted validators...
+]
+
+[rpc]
+# RPC server configuration
+# For public validators, consider running RPC on a separate node
+enable = true
+bind_address = "127.0.0.1"
+port = 8899
+
+# NEVER enable debug methods on mainnet
+enable_debug = false
+
+[gossip]
+port = 8001
+
+[tpu]
+port = 8003
+
+[tvu]
+port = 8004
+
+[logging]
+# Use info level for production
+level = "info"
+
+# JSON format recommended for log aggregation
+format = "json"
+
+# Log to file for persistence
+file = "./validator.log"
+
+[metrics]
+# Prometheus metrics - essential for monitoring
+enable = true
+port = 9090
+
+[consensus]
+# Voting enabled
+enable_voting = true
+
+# Wait for vote account - important for startup
+wait_for_vote_account = true
+
+[performance]
+# Optimize for your hardware
+# AMD EPYC or Intel Xeon recommended with 32+ cores
+sigverify_threads = 8
+banking_threads = 8
+
+[storage]
+# Use RocksDB for persistent storage
+# backend = "rocksdb"
+
+# Account snapshot configuration
+# accounts_snapshot_interval = 25000
+
+[security]
+# Private key encryption (if supported)
+# encrypt_private_keys = true
+
+# Rate limiting for RPC
+# rpc_rate_limit = 100
