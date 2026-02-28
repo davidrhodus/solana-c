@@ -9,6 +9,7 @@
 #include "../crypto/sol_ed25519.h"
 #include "../crypto/sol_sha256.h"
 #include <string.h>
+#include <pthread.h>
 
 /*
  * ==========================================================================
@@ -26,15 +27,13 @@
 /* Precomputed log and exp tables for fast GF(2^8) multiplication */
 static uint8_t gf_log[GF_SIZE];
 static uint8_t gf_exp[GF_SIZE * 2];
-static bool gf_tables_initialized = false;
+static pthread_once_t gf_tables_once = PTHREAD_ONCE_INIT;
 
 /*
  * Initialize GF(2^8) log and exp tables
  */
 static void
 gf_init_tables(void) {
-    if (gf_tables_initialized) return;
-
     uint16_t x = 1;
     for (int i = 0; i < 255; i++) {
         gf_exp[i] = (uint8_t)x;
@@ -51,7 +50,14 @@ gf_init_tables(void) {
     }
 
     gf_log[0] = 0;  /* Log of 0 is undefined, but we set to 0 for safety */
-    gf_tables_initialized = true;
+}
+
+static inline void
+gf_ensure_tables(void) {
+    /* FEC recovery runs on multiple shred verify threads. The GF tables must
+     * be initialized exactly once before use to avoid data races and corrupt
+     * arithmetic (which can manifest as singular decoding matrices). */
+    pthread_once(&gf_tables_once, gf_init_tables);
 }
 
 /*
@@ -424,10 +430,26 @@ sol_shred_verify(const sol_shred_t* shred, const sol_pubkey_t* leader) {
     }
 
     /* Merkle shreds: leader signs the Merkle root (Hash) of the erasure batch. */
-    return sol_ed25519_verify(leader,
-                              merkle_root.bytes,
-                              SOL_SHRED_MERKLE_ROOT_SIZE,
-                              &shred->signature);
+    if (sol_ed25519_verify(leader,
+                           merkle_root.bytes,
+                           SOL_SHRED_MERKLE_ROOT_SIZE,
+                           &shred->signature)) {
+        return true;
+    }
+
+    /* Some resigned shred formats swap the leader signature into the trailing
+     * retransmitter signature field. Accept either layout when verifying
+     * against the slot leader. */
+    if (shred->resigned && shred->retransmitter_signature) {
+        sol_signature_t alt;
+        memcpy(alt.bytes, shred->retransmitter_signature, SOL_SIGNATURE_SIZE);
+        return sol_ed25519_verify(leader,
+                                  merkle_root.bytes,
+                                  SOL_SHRED_MERKLE_ROOT_SIZE,
+                                  &alt);
+    }
+
+    return false;
 }
 
 bool
@@ -623,8 +645,8 @@ sol_fec_set_recover(sol_fec_set_t* fec) {
         return SOL_OK;
     }
 
-    /* Initialize GF tables if needed */
-    gf_init_tables();
+    /* Initialize GF tables (thread-safe) */
+    gf_ensure_tables();
 
     uint16_t k = fec->num_data;
     uint16_t total = fec->num_data + fec->num_code;
@@ -690,7 +712,7 @@ sol_fec_set_recover(sol_fec_set_t* fec) {
 
     /* Invert the matrix */
     if (!gf_matrix_invert(encoding_rows, inverse, k)) {
-        sol_log_warn("FEC matrix inversion failed (singular matrix)");
+        sol_log_debug("FEC matrix inversion failed (singular matrix)");
         sol_free(encoding_rows);
         sol_free(inverse);
         sol_free(row_indices);

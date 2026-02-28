@@ -290,6 +290,79 @@ typedef struct {
     rocksdb_column_family_handle_t*     cf;
 } rocksdb_backend_ctx_t;
 
+sol_err_t
+sol_rocksdb_backend_get_pinned(sol_storage_backend_t* backend,
+                               const uint8_t* key,
+                               size_t key_len,
+                               const uint8_t** value,
+                               size_t* value_len,
+                               sol_rocksdb_pinned_slice_t** out_slice) {
+    if (value) *value = NULL;
+    if (value_len) *value_len = 0;
+    if (out_slice) *out_slice = NULL;
+
+    if (!backend || !backend->ctx || !key || !value || !value_len || !out_slice) {
+        return SOL_ERR_INVAL;
+    }
+
+    rocksdb_backend_ctx_t* rctx = backend->ctx;
+    if (!rctx || !rctx->db || !rctx->db->db || !rctx->db->read_options || !rctx->cf) {
+        return SOL_ERR_UNSUPPORTED;
+    }
+
+    char* err = NULL;
+    rocksdb_pinnableslice_t* slice = rocksdb_get_pinned_cf(
+        rctx->db->db,
+        rctx->db->read_options,
+        rctx->cf,
+        (const char*)key,
+        key_len,
+        &err
+    );
+
+    if (err) {
+        sol_log_error("RocksDB get_pinned error: %s", err);
+        rocksdb_free(err);
+        if (slice) {
+            rocksdb_pinnableslice_destroy(slice);
+        }
+        return SOL_ERR_IO;
+    }
+
+    if (!slice) {
+        return SOL_ERR_NOTFOUND;
+    }
+
+    size_t len = 0;
+    const char* val = rocksdb_pinnableslice_value(slice, &len);
+    if (!val) {
+        rocksdb_pinnableslice_destroy(slice);
+        return SOL_ERR_NOTFOUND;
+    }
+
+    /* Preserve storage-backend convention: empty value may be represented as
+     * value==NULL, value_len==0. */
+    if (len == 0) {
+        rocksdb_pinnableslice_destroy(slice);
+        *value = NULL;
+        *value_len = 0;
+        __atomic_fetch_add(&rctx->db->stats.reads, 1, __ATOMIC_RELAXED);
+        return SOL_OK;
+    }
+
+    *value = (const uint8_t*)val;
+    *value_len = len;
+    *out_slice = (sol_rocksdb_pinned_slice_t*)slice;
+    __atomic_fetch_add(&rctx->db->stats.reads, 1, __ATOMIC_RELAXED);
+    return SOL_OK;
+}
+
+void
+sol_rocksdb_backend_pinned_destroy(sol_rocksdb_pinned_slice_t* slice) {
+    if (!slice) return;
+    rocksdb_pinnableslice_destroy((rocksdb_pinnableslice_t*)slice);
+}
+
 static sol_err_t
 sol_rocksdb_backend_get(void* ctx, const uint8_t* key, size_t key_len,
                         uint8_t** value, size_t* value_len) {
@@ -319,19 +392,35 @@ sol_rocksdb_backend_get(void* ctx, const uint8_t* key, size_t key_len,
         return SOL_ERR_NOTFOUND;
     }
 
-    uint8_t* copy = NULL;
-    if (len > 0) {
-        copy = sol_alloc(len);
-        if (!copy) {
-            rocksdb_free(val);
-            return SOL_ERR_NOMEM;
-        }
-        memcpy(copy, val, len);
+    /* Preserve the storage backend contract: NULL is a valid representation of
+     * an empty value. */
+    if (len == 0) {
+        rocksdb_free(val);
+        *value = NULL;
+        *value_len = 0;
+        __atomic_fetch_add(&rctx->db->stats.reads, 1, __ATOMIC_RELAXED);
+        return SOL_OK;
     }
 
+#ifdef SOL_USE_JEMALLOC
+    /* RocksDB allocates return values with libc malloc/free. When we build
+     * solana-c with jemalloc, those pointers are not safe to pass to sol_free()
+     * (je_free). Copy into our allocator in that configuration. */
+    uint8_t* copy = sol_alloc(len);
+    if (!copy) {
+        rocksdb_free(val);
+        return SOL_ERR_NOMEM;
+    }
+    memcpy(copy, val, len);
     rocksdb_free(val);
-
-    *value = copy;  /* Caller must free with sol_free */
+    *value = copy; /* Caller frees with sol_free() */
+#else
+    /* Fast-path: avoid an extra alloc+copy in the hot get() path. The RocksDB C
+     * API uses rocksdb_free() which ultimately delegates to libc free(); in the
+     * non-jemalloc build sol_free() is also libc free(), so the pointer is safe
+     * to hand off to the caller. */
+    *value = (uint8_t*)val; /* Caller frees with sol_free() */
+#endif
     *value_len = len;
 
     __atomic_fetch_add(&rctx->db->stats.reads, 1, __ATOMIC_RELAXED);
@@ -1134,6 +1223,27 @@ sol_rocksdb_stats(sol_rocksdb_t* db) {
     (void)db;
     sol_rocksdb_stats_t stats = {0};
     return stats;
+}
+
+sol_err_t
+sol_rocksdb_backend_get_pinned(sol_storage_backend_t* backend,
+                               const uint8_t* key,
+                               size_t key_len,
+                               const uint8_t** value,
+                               size_t* value_len,
+                               sol_rocksdb_pinned_slice_t** out_slice) {
+    (void)backend;
+    (void)key;
+    (void)key_len;
+    if (value) *value = NULL;
+    if (value_len) *value_len = 0;
+    if (out_slice) *out_slice = NULL;
+    return SOL_ERR_UNSUPPORTED;
+}
+
+void
+sol_rocksdb_backend_pinned_destroy(sol_rocksdb_pinned_slice_t* slice) {
+    (void)slice;
 }
 
 void

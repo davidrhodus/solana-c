@@ -11,8 +11,133 @@
 #include "sol_blake3.h"
 #include "sol_lt_hash.h"
 #include "sol_keccak256.h"
+#include "blake3/fd_blake3.h"
 #include "sol_alloc.h"
 #include <string.h>
+#if SOL_USE_OPENSSL
+#include <openssl/bn.h>
+#endif
+
+#if SOL_USE_OPENSSL
+/* Reference decompression check matching Solana `bytes_are_curve_point()`. */
+static bool
+ed25519_pubkey_is_on_curve_openssl_bn(const sol_pubkey_t* pubkey) {
+    if (!pubkey) return false;
+
+    bool valid = false;
+
+    uint8_t y_bytes[32];
+    memcpy(y_bytes, pubkey->bytes, sizeof(y_bytes));
+
+    uint8_t sign = (uint8_t)((y_bytes[31] >> 7) & 1);
+    y_bytes[31] &= 0x7F;
+
+    uint8_t y_be[32];
+    for (size_t i = 0; i < sizeof(y_be); i++) {
+        y_be[sizeof(y_be) - 1 - i] = y_bytes[i];
+    }
+
+    BN_CTX* ctx = BN_CTX_new();
+    if (ctx == NULL) {
+        return false;
+    }
+
+    BN_CTX_start(ctx);
+    BIGNUM* y = BN_CTX_get(ctx);
+    BIGNUM* p = BN_CTX_get(ctx);
+    BIGNUM* one = BN_CTX_get(ctx);
+    BIGNUM* y2 = BN_CTX_get(ctx);
+    BIGNUM* u = BN_CTX_get(ctx);
+    BIGNUM* v = BN_CTX_get(ctx);
+    BIGNUM* d = BN_CTX_get(ctx);
+    BIGNUM* inv = BN_CTX_get(ctx);
+    BIGNUM* x2 = BN_CTX_get(ctx);
+    BIGNUM* x = BN_CTX_get(ctx);
+    BIGNUM* numer = BN_CTX_get(ctx);
+    BIGNUM* denom = BN_CTX_get(ctx);
+    BIGNUM* x_alt = BN_CTX_get(ctx);
+
+    if (x_alt == NULL) {
+        BN_CTX_end(ctx);
+        BN_CTX_free(ctx);
+        return false;
+    }
+
+    BN_bin2bn(y_be, sizeof(y_be), y);
+
+    BN_one(p);
+    BN_lshift(p, p, 255);
+    BN_sub_word(p, 19);
+    BN_one(one);
+
+    if (BN_cmp(y, p) >= 0) {
+        goto done;
+    }
+
+    if (BN_mod_sqr(y2, y, p, ctx) != 1) {
+        goto done;
+    }
+    if (BN_mod_sub(u, y2, one, p, ctx) != 1) {
+        goto done;
+    }
+
+    BN_set_word(numer, 121665);
+    BN_set_word(denom, 121666);
+    if (BN_mod_inverse(inv, denom, p, ctx) == NULL) {
+        goto done;
+    }
+    if (BN_mod_mul(d, numer, inv, p, ctx) != 1) {
+        goto done;
+    }
+    if (BN_mod_sub(d, p, d, p, ctx) != 1) {
+        goto done;
+    }
+
+    if (BN_mod_mul(v, d, y2, p, ctx) != 1) {
+        goto done;
+    }
+    if (BN_mod_add(v, v, one, p, ctx) != 1) {
+        goto done;
+    }
+
+    if (BN_mod_inverse(inv, v, p, ctx) == NULL) {
+        goto done;
+    }
+    if (BN_mod_mul(x2, u, inv, p, ctx) != 1) {
+        goto done;
+    }
+
+    if (BN_mod_sqrt(x, x2, p, ctx) == NULL) {
+        goto done;
+    }
+
+    if ((BN_is_odd(x) ? 1 : 0) != sign) {
+        if (BN_mod_sub(x_alt, p, x, p, ctx) != 1) {
+            goto done;
+        }
+        if ((BN_is_odd(x_alt) ? 1 : 0) != sign) {
+            goto done;
+        }
+    }
+
+    valid = true;
+
+done:
+    BN_CTX_end(ctx);
+    BN_CTX_free(ctx);
+    return valid;
+}
+
+static uint64_t
+xorshift64star(uint64_t* s) {
+    uint64_t x = *s;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *s = x;
+    return x * 2685821657736338717ULL;
+}
+#endif
 
 /*
  * SHA-256 test vectors from NIST FIPS 180-4
@@ -291,6 +416,55 @@ TEST(ed25519_pda) {
     TEST_ASSERT(!sol_ed25519_pubkey_is_on_curve(&pda));
 }
 
+#if SOL_USE_OPENSSL
+TEST(ed25519_on_curve_matches_openssl) {
+    /* Ensure our fast-path curve check matches OpenSSL BN decompression semantics. */
+    /* Known torsion points must be treated as "on curve". */
+    static const uint8_t torsion[8][32] = {
+        {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+        {0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
+         0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a},
+        {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80},
+        {0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0,
+         0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05},
+        {0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f},
+        {0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0,
+         0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x85},
+        {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+        {0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
+         0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0xfa},
+    };
+
+    for (size_t i = 0; i < 8; i++) {
+        sol_pubkey_t pk;
+        memcpy(pk.bytes, torsion[i], 32);
+        TEST_ASSERT(sol_ed25519_pubkey_is_on_curve(&pk));
+        TEST_ASSERT(ed25519_pubkey_is_on_curve_openssl_bn(&pk));
+    }
+
+    /* Deterministic PRNG: xorshift64* */
+    uint64_t st = 0x243f6a8885a308d3ULL;
+
+    /* Random fuzz to catch subtle semantic mismatches. Keep this bounded; the
+     * OpenSSL BN reference is intentionally slow. */
+    for (int i = 0; i < 4096; i++) {
+        sol_pubkey_t pk;
+        for (size_t j = 0; j < 32; j += 8) {
+            uint64_t v = xorshift64star(&st);
+            memcpy(pk.bytes + j, &v, 8);
+        }
+
+        bool a = sol_ed25519_pubkey_is_on_curve(&pk);
+        bool b = ed25519_pubkey_is_on_curve_openssl_bn(&pk);
+        TEST_ASSERT_EQ(a, b);
+    }
+}
+#endif
+
 /*
  * BLAKE3 test vectors from the official test suite
  */
@@ -341,6 +515,43 @@ TEST(blake3_incremental) {
     sol_blake3_final(&ctx, &hash2);
 
     TEST_ASSERT(sol_blake3_equal(&hash1, &hash2));
+}
+
+TEST(blake3_xof2048_matches_fd) {
+    /* solana-c uses a portable BLAKE3 implementation for general hashing, but
+     * switches to the vendored Firedancer implementation for the 2048-byte XOF
+     * used by accounts LtHash (performance-critical).
+     *
+     * This test ensures the outputs match exactly for a range of input sizes. */
+
+    static const size_t lens[] = {
+        0u, 1u, 3u, 63u, 64u, 65u,
+        1000u, 1024u, 1025u,
+        8192u, 8193u, 20000u,
+    };
+
+    uint8_t buf[20000];
+    for (size_t i = 0; i < sizeof(buf); i++) {
+        buf[i] = (uint8_t)((i * 131u + 17u) & 0xFFu);
+    }
+
+    for (size_t i = 0; i < sizeof(lens) / sizeof(lens[0]); i++) {
+        size_t len = lens[i];
+
+        uint8_t out_portable[SOL_LT_HASH_SIZE_BYTES];
+        sol_blake3_ctx_t portable;
+        sol_blake3_init(&portable);
+        sol_blake3_update(&portable, buf, len);
+        sol_blake3_final_xof(&portable, out_portable, sizeof(out_portable));
+
+        uint8_t out_fd[SOL_LT_HASH_SIZE_BYTES] __attribute__((aligned(32)));
+        fd_blake3_t fd[1];
+        fd_blake3_init(fd);
+        fd_blake3_append(fd, buf, (ulong)len);
+        fd_blake3_fini_2048(fd, out_fd);
+
+        TEST_ASSERT_MEM_EQ(out_portable, out_fd, SOL_LT_HASH_SIZE_BYTES);
+    }
 }
 
 TEST(blake3_keyed) {
@@ -469,9 +680,13 @@ static test_case_t crypto_tests[] = {
     TEST_CASE(ed25519_sign_verify),
     TEST_CASE(ed25519_verify_invalid),
     TEST_CASE(ed25519_pda),
+#if SOL_USE_OPENSSL
+    TEST_CASE(ed25519_on_curve_matches_openssl),
+#endif
     TEST_CASE(blake3_empty),
     TEST_CASE(blake3_abc),
     TEST_CASE(blake3_incremental),
+    TEST_CASE(blake3_xof2048_matches_fd),
     TEST_CASE(blake3_keyed),
     TEST_CASE(lt_hash_checksum_vectors),
     TEST_CASE(keccak256_empty),

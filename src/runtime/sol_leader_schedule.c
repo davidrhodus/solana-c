@@ -402,6 +402,42 @@ sol_leader_schedule_from_slot_leaders(sol_slot_t first_slot,
     return schedule;
 }
 
+sol_leader_schedule_t*
+sol_leader_schedule_clone(const sol_leader_schedule_t* schedule) {
+    if (!schedule) return NULL;
+
+    sol_leader_schedule_t* copy = sol_calloc(1, sizeof(sol_leader_schedule_t));
+    if (!copy) return NULL;
+
+    copy->config = schedule->config;
+    copy->epoch = schedule->epoch;
+    copy->first_slot = schedule->first_slot;
+    copy->last_slot = schedule->last_slot;
+    copy->num_slots = schedule->num_slots;
+    copy->num_unique_leaders = schedule->num_unique_leaders;
+
+    if (schedule->num_slots > 0) {
+        copy->leaders = sol_calloc(schedule->num_slots, sizeof(sol_pubkey_t));
+        if (!copy->leaders) {
+            sol_leader_schedule_destroy(copy);
+            return NULL;
+        }
+        memcpy(copy->leaders, schedule->leaders, schedule->num_slots * sizeof(sol_pubkey_t));
+    }
+
+    if (schedule->num_unique_leaders > 0) {
+        copy->unique_leaders = sol_calloc(schedule->num_unique_leaders, sizeof(sol_pubkey_t));
+        if (!copy->unique_leaders) {
+            sol_leader_schedule_destroy(copy);
+            return NULL;
+        }
+        memcpy(copy->unique_leaders, schedule->unique_leaders,
+               schedule->num_unique_leaders * sizeof(sol_pubkey_t));
+    }
+
+    return copy;
+}
+
 /*
  * Context for stake extraction iteration
  */

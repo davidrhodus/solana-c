@@ -16,6 +16,7 @@
 #include "../programs/sol_vote_program.h"
 #include "../programs/sol_stake_program.h"
 #include "../entry/sol_entry.h"
+#include "../util/sol_map.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -24,6 +25,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -81,6 +83,17 @@ typedef struct {
 } sol_ws_client_t;
 
 /*
+ * HTTP client connections (tracked so shutdown can force active client threads
+ * to exit before shared state is destroyed).
+ */
+#define MAX_HTTP_CLIENTS 8192
+
+typedef struct {
+    int                     fd;
+    bool                    active;
+} sol_http_client_t;
+
+/*
  * RPC server structure
  */
 struct sol_rpc {
@@ -88,6 +101,8 @@ struct sol_rpc {
     sol_bank_forks_t*       bank_forks;
     sol_blockstore_t*       blockstore;
     struct sol_gossip*      gossip;
+    sol_leader_schedule_t*  leader_schedule;
+    uint32_t                leader_schedule_readers;
 
     /* Node identity */
     sol_pubkey_t            identity;
@@ -106,6 +121,7 @@ struct sol_rpc {
     pthread_t               accept_thread;
     bool                    running;
     pthread_mutex_t         lock;
+    sol_http_client_t       http_clients[MAX_HTTP_CLIENTS];
 
     /* WebSocket server state */
     int                     ws_listen_fd;
@@ -122,6 +138,47 @@ struct sol_rpc {
     /* Stats */
     sol_rpc_stats_t         stats;
 };
+
+static inline sol_bank_forks_t*
+rpc_bank_forks(const sol_rpc_t* rpc) {
+    if (!rpc) return NULL;
+    return __atomic_load_n(&rpc->bank_forks, __ATOMIC_ACQUIRE);
+}
+
+static inline sol_blockstore_t*
+rpc_blockstore(const sol_rpc_t* rpc) {
+    if (!rpc) return NULL;
+    return __atomic_load_n(&rpc->blockstore, __ATOMIC_ACQUIRE);
+}
+
+static inline sol_gossip_t*
+rpc_gossip(const sol_rpc_t* rpc) {
+    if (!rpc) return NULL;
+    /* Field type is `struct sol_gossip*` but `sol_gossip_t` is that same type. */
+    return (sol_gossip_t*)__atomic_load_n(&rpc->gossip, __ATOMIC_ACQUIRE);
+}
+
+static sol_leader_schedule_t*
+rpc_leader_schedule_acquire(sol_rpc_t* rpc) {
+    if (!rpc) return NULL;
+    pthread_mutex_lock(&rpc->lock);
+    sol_leader_schedule_t* schedule = rpc->leader_schedule;
+    if (schedule) {
+        rpc->leader_schedule_readers++;
+    }
+    pthread_mutex_unlock(&rpc->lock);
+    return schedule;
+}
+
+static void
+rpc_leader_schedule_release(sol_rpc_t* rpc) {
+    if (!rpc) return;
+    pthread_mutex_lock(&rpc->lock);
+    if (rpc->leader_schedule_readers > 0) {
+        rpc->leader_schedule_readers--;
+    }
+    pthread_mutex_unlock(&rpc->lock);
+}
 
 static bool
 rpc_rate_limit_allow(sol_rpc_t* rpc) {
@@ -481,8 +538,9 @@ handle_get_health(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id) {
 static void
 handle_get_slot(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id) {
     sol_slot_t slot = 0;
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -496,8 +554,9 @@ handle_get_slot(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id) {
 static void
 handle_get_block_height(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id) {
     uint64_t height = 0;
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             height = sol_bank_tick_height(bank);
         }
@@ -533,9 +592,12 @@ handle_get_balance(sol_rpc_t* rpc, sol_json_builder_t* b,
 
     /* Get balance */
     uint64_t lamports = 0;
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_slot_t slot = 0;
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
+            slot = sol_bank_slot(bank);
             sol_account_t* account = sol_bank_load_account(bank, &pubkey);
             if (account) {
                 lamports = account->meta.lamports;
@@ -548,8 +610,7 @@ handle_get_balance(sol_rpc_t* rpc, sol_json_builder_t* b,
     sol_json_builder_key(b, "context");
     sol_json_builder_object_begin(b);
     sol_json_builder_key(b, "slot");
-    sol_json_builder_uint(b, rpc->bank_forks ?
-        sol_bank_slot(sol_bank_forks_working_bank(rpc->bank_forks)) : 0);
+    sol_json_builder_uint(b, slot);
     sol_json_builder_object_end(b);
     sol_json_builder_key(b, "value");
     sol_json_builder_uint(b, lamports);
@@ -581,8 +642,9 @@ handle_get_account_info(sol_rpc_t* rpc, sol_json_builder_t* b,
     sol_account_t* account = NULL;
     sol_slot_t slot = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             account = sol_bank_load_account(bank, &pubkey);
@@ -727,8 +789,9 @@ handle_get_multiple_accounts(sol_rpc_t* rpc, sol_json_builder_t* b,
     /* Get current slot */
     sol_slot_t slot = 0;
     sol_bank_t* bank = NULL;
-    if (rpc->bank_forks) {
-        bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -827,8 +890,9 @@ handle_get_program_accounts(sol_rpc_t* rpc, sol_json_builder_t* b,
     /* Get current slot and bank */
     sol_slot_t slot = 0;
     sol_bank_t* bank = NULL;
-    if (rpc->bank_forks) {
-        bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -1037,8 +1101,9 @@ handle_get_token_accounts_by_owner(sol_rpc_t* rpc, sol_json_builder_t* b,
     /* Get current slot and bank */
     sol_slot_t slot = 0;
     sol_bank_t* bank = NULL;
-    if (rpc->bank_forks) {
-        bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -1100,8 +1165,9 @@ handle_get_token_supply(sol_rpc_t* rpc, sol_json_builder_t* b,
     /* Get current slot and bank */
     sol_slot_t slot = 0;
     sol_bank_t* bank = NULL;
-    if (rpc->bank_forks) {
-        bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -1192,8 +1258,9 @@ handle_get_token_account_balance(sol_rpc_t* rpc, sol_json_builder_t* b,
     /* Get current slot and bank */
     sol_slot_t slot = 0;
     sol_bank_t* bank = NULL;
-    if (rpc->bank_forks) {
-        bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -1274,8 +1341,9 @@ handle_get_slot_leader(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id
     sol_slot_t slot = 0;
     sol_pubkey_t leader = {0};
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             /* Get leader for current slot from leader schedule */
@@ -1332,8 +1400,9 @@ handle_get_leader_schedule(sol_rpc_t* rpc, sol_json_builder_t* b,
     }
 
     sol_bank_t* bank = NULL;
-    if (rpc->bank_forks) {
-        bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             if (slot == 0) {
                 slot = sol_bank_slot(bank);
@@ -1353,8 +1422,27 @@ handle_get_leader_schedule(sol_rpc_t* rpc, sol_json_builder_t* b,
     sol_epoch_schedule_t epoch_sched = SOL_EPOCH_SCHEDULE_DEFAULT;
     epoch = sol_epoch_schedule_get_epoch(&epoch_sched, slot);
 
-    /* Get leader schedule for this epoch */
-    sol_leader_schedule_t* schedule = sol_leader_schedule_from_bank(bank, epoch, NULL);
+    /* Get leader schedule for this epoch (prefer cached RPC copy) */
+    sol_leader_schedule_t* schedule = NULL;
+    bool schedule_cached = false;
+    if (rpc) {
+        schedule = rpc_leader_schedule_acquire(rpc);
+        if (schedule) {
+            sol_slot_t cached_first = sol_leader_schedule_first_slot(schedule);
+            sol_slot_t cached_last = sol_leader_schedule_last_slot(schedule);
+            if (slot < cached_first || slot > cached_last) {
+                rpc_leader_schedule_release(rpc);
+                schedule = NULL;
+            } else {
+                schedule_cached = true;
+            }
+        }
+    }
+
+    if (!schedule) {
+        schedule = sol_leader_schedule_from_bank(bank, epoch, NULL);
+    }
+
     if (!schedule) {
         rpc_result_begin(b, id);
         sol_json_builder_null(b);
@@ -1363,51 +1451,136 @@ handle_get_leader_schedule(sol_rpc_t* rpc, sol_json_builder_t* b,
     }
 
     sol_slot_t first_slot = sol_leader_schedule_first_slot(schedule);
+    sol_slot_t last_slot = sol_leader_schedule_last_slot(schedule);
+    size_t total_slots = (last_slot >= first_slot) ? (size_t)(last_slot - first_slot + 1) : 0;
 
     /* Build response - return leader schedule as object mapping pubkey -> slots */
     rpc_result_begin(b, id);
     sol_json_builder_object_begin(b);
 
-    /* Get all unique leaders */
-    #define MAX_LEADERS 5000
-    #define MAX_SLOTS_PER_LEADER 2000
-    sol_pubkey_t* leaders = sol_calloc(MAX_LEADERS, sizeof(sol_pubkey_t));
-    sol_slot_t* slots = sol_calloc(MAX_SLOTS_PER_LEADER, sizeof(sol_slot_t));
-
-    if (leaders && slots) {
-        size_t num_leaders = sol_leader_schedule_get_leaders(schedule, leaders, MAX_LEADERS);
-
-        for (size_t i = 0; i < num_leaders; i++) {
-            /* If filtering by identity, skip non-matching leaders */
-            if (has_filter && !sol_pubkey_eq(&leaders[i], &filter_pubkey)) {
-                continue;
+    if (has_filter) {
+        /* Fast path for identity filter */
+        if (total_slots > 0) {
+            sol_slot_t* slots = sol_calloc(total_slots, sizeof(sol_slot_t));
+            if (slots) {
+                size_t num_slots = sol_leader_schedule_get_slots(
+                    schedule, &filter_pubkey, slots, total_slots);
+                if (num_slots > 0) {
+                    char pk_str[64];
+                    sol_pubkey_to_base58(&filter_pubkey, pk_str, sizeof(pk_str));
+                    sol_json_builder_key(b, pk_str);
+                    sol_json_builder_array_begin(b);
+                    for (size_t j = 0; j < num_slots; j++) {
+                        sol_json_builder_uint(b, slots[j] - first_slot);
+                    }
+                    sol_json_builder_array_end(b);
+                }
+                sol_free(slots);
             }
-
-            /* Get all slots for this leader */
-            size_t num_slots = sol_leader_schedule_get_slots(schedule, &leaders[i], slots, MAX_SLOTS_PER_LEADER);
-            if (num_slots == 0) continue;
-
-            /* Add leader entry */
-            char pk_str[64];
-            sol_pubkey_to_base58(&leaders[i], pk_str, sizeof(pk_str));
-            sol_json_builder_key(b, pk_str);
-            sol_json_builder_array_begin(b);
-
-            for (size_t j = 0; j < num_slots; j++) {
-                /* Return slot indices relative to epoch start */
-                sol_json_builder_uint(b, slots[j] - first_slot);
-            }
-
-            sol_json_builder_array_end(b);
         }
+
+        if (schedule_cached) {
+            rpc_leader_schedule_release(rpc);
+        } else {
+            if (rpc) {
+                sol_rpc_set_leader_schedule(rpc, schedule);
+            }
+            sol_leader_schedule_destroy(schedule);
+        }
+        sol_json_builder_object_end(b);
+        rpc_result_end(b);
+        return;
     }
 
-    sol_free(leaders);
-    sol_free(slots);
-    #undef MAX_LEADERS
-    #undef MAX_SLOTS_PER_LEADER
+    /* Full schedule: build leader->slots in O(num_slots) */
+    if (total_slots > 0) {
+        size_t num_leaders = sol_leader_schedule_num_leaders(schedule);
+        sol_pubkey_t* leaders = sol_calloc(num_leaders, sizeof(sol_pubkey_t));
+        sol_pubkey_map_t* index_map = NULL;
+        size_t* counts = NULL;
+        size_t* offsets = NULL;
+        sol_slot_t** slots_by_leader = NULL;
 
-    sol_leader_schedule_destroy(schedule);
+        if (leaders && num_leaders > 0) {
+            num_leaders = sol_leader_schedule_get_leaders(schedule, leaders, num_leaders);
+        }
+
+        if (leaders && num_leaders > 0) {
+            index_map = sol_pubkey_map_new(sizeof(uint32_t), num_leaders * 2 + 1);
+            counts = sol_calloc(num_leaders, sizeof(size_t));
+            offsets = sol_calloc(num_leaders, sizeof(size_t));
+            slots_by_leader = sol_calloc(num_leaders, sizeof(sol_slot_t*));
+
+            if (index_map && counts && offsets && slots_by_leader) {
+                for (uint32_t i = 0; i < (uint32_t)num_leaders; i++) {
+                    (void)sol_pubkey_map_insert(index_map, &leaders[i], &i);
+                }
+
+                /* First pass: count slots per leader */
+                for (sol_slot_t s = first_slot; s <= last_slot; s++) {
+                    const sol_pubkey_t* leader = sol_leader_schedule_get_leader(schedule, s);
+                    if (!leader) continue;
+                    uint32_t* idx = (uint32_t*)sol_pubkey_map_get(index_map, leader);
+                    if (idx) {
+                        counts[*idx]++;
+                    }
+                }
+
+                /* Allocate slot arrays */
+                for (size_t i = 0; i < num_leaders; i++) {
+                    if (counts[i] > 0) {
+                        slots_by_leader[i] = sol_calloc(counts[i], sizeof(sol_slot_t));
+                    }
+                }
+
+                /* Second pass: fill slot arrays */
+                for (sol_slot_t s = first_slot; s <= last_slot; s++) {
+                    const sol_pubkey_t* leader = sol_leader_schedule_get_leader(schedule, s);
+                    if (!leader) continue;
+                    uint32_t* idx = (uint32_t*)sol_pubkey_map_get(index_map, leader);
+                    if (idx && slots_by_leader[*idx]) {
+                        size_t pos = offsets[*idx]++;
+                        if (pos < counts[*idx]) {
+                            slots_by_leader[*idx][pos] = s - first_slot;
+                        }
+                    }
+                }
+
+                /* Emit JSON */
+                for (size_t i = 0; i < num_leaders; i++) {
+                    if (counts[i] == 0 || !slots_by_leader[i]) continue;
+                    char pk_str[64];
+                    sol_pubkey_to_base58(&leaders[i], pk_str, sizeof(pk_str));
+                    sol_json_builder_key(b, pk_str);
+                    sol_json_builder_array_begin(b);
+                    for (size_t j = 0; j < counts[i]; j++) {
+                        sol_json_builder_uint(b, slots_by_leader[i][j]);
+                    }
+                    sol_json_builder_array_end(b);
+                }
+            }
+        }
+
+        if (slots_by_leader) {
+            for (size_t i = 0; i < num_leaders; i++) {
+                sol_free(slots_by_leader[i]);
+            }
+        }
+        sol_free(slots_by_leader);
+        sol_free(offsets);
+        sol_free(counts);
+        sol_pubkey_map_destroy(index_map);
+        sol_free(leaders);
+    }
+
+    if (schedule_cached) {
+        rpc_leader_schedule_release(rpc);
+    } else {
+        if (rpc) {
+            sol_rpc_set_leader_schedule(rpc, schedule);
+        }
+        sol_leader_schedule_destroy(schedule);
+    }
 
     sol_json_builder_object_end(b);
     rpc_result_end(b);
@@ -1551,8 +1724,9 @@ handle_get_vote_accounts(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* 
     sol_slot_t slot = 0;
     uint64_t epoch = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             epoch = sol_bank_epoch(bank);
@@ -1564,8 +1738,8 @@ handle_get_vote_accounts(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* 
     vote_account_info_t* accounts = sol_calloc(MAX_VOTE_ACCOUNTS, sizeof(vote_account_info_t));
     size_t count = 0;
 
-    if (accounts && rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    if (accounts && forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             sol_accounts_db_t* db = sol_bank_get_accounts_db(bank);
             if (db) {
@@ -1645,11 +1819,12 @@ handle_get_cluster_nodes(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* 
     rpc_result_begin(b, id);
     sol_json_builder_array_begin(b);
 
-    if (rpc->gossip) {
+    sol_gossip_t* gossip = rpc_gossip(rpc);
+    if (gossip) {
         /* Get cluster nodes from gossip */
         #define MAX_CLUSTER_NODES 1000
         const sol_contact_info_t* nodes[MAX_CLUSTER_NODES];
-        size_t num_nodes = sol_gossip_get_cluster_nodes(rpc->gossip, nodes, MAX_CLUSTER_NODES);
+        size_t num_nodes = sol_gossip_get_cluster_nodes(gossip, nodes, MAX_CLUSTER_NODES);
 
         for (size_t i = 0; i < num_nodes; i++) {
             const sol_contact_info_t* info = nodes[i];
@@ -1717,7 +1892,7 @@ handle_get_cluster_nodes(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* 
             sol_json_builder_uint(b, info->shred_version);
 
             /* Look up version info from CRDS */
-            const sol_crds_version_t* version = sol_gossip_get_version(rpc->gossip, &info->pubkey);
+            const sol_crds_version_t* version = sol_gossip_get_version(gossip, &info->pubkey);
 
             /* version */
             sol_json_builder_key(b, "version");
@@ -1759,8 +1934,9 @@ handle_get_inflation_rate(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t*
     uint64_t epoch = 0;
     sol_slot_t slot = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             epoch = sol_bank_epoch(bank);
@@ -1853,8 +2029,9 @@ handle_get_stake_activation(sol_rpc_t* rpc, sol_json_builder_t* b,
     uint64_t inactive = 0;
     const char* state = "inactive";
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             uint64_t current_epoch = sol_bank_epoch(bank);
 
@@ -1994,8 +2171,9 @@ handle_get_fee_for_message(sol_rpc_t* rpc, sol_json_builder_t* b,
     uint64_t lamports_per_signature = 5000;  /* Default */
     sol_slot_t slot = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             /* Could get lamports_per_signature from bank config */
@@ -2022,8 +2200,9 @@ static void
 handle_get_transaction_count(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id) {
     uint64_t count = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             sol_bank_stats_t stats;
             sol_bank_stats(bank, &stats);
@@ -2037,13 +2216,60 @@ handle_get_transaction_count(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id
 }
 
 static void
+handle_get_recent_performance_samples(sol_rpc_t* rpc, sol_json_builder_t* b,
+                                      const rpc_id_t* id, sol_json_parser_t* params) {
+    uint64_t limit = 1;
+    if (params && sol_json_parser_array_begin(params)) {
+        uint64_t tmp = 0;
+        if (sol_json_parser_uint(params, &tmp)) {
+            limit = tmp;
+        }
+    }
+
+    sol_slot_t slot = 0;
+    sol_bank_stats_t stats = {0};
+    bool has_bank = false;
+
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
+        if (bank) {
+            slot = sol_bank_slot(bank);
+            sol_bank_stats(bank, &stats);
+            has_bank = true;
+        }
+    }
+
+    rpc_result_begin(b, id);
+    sol_json_builder_array_begin(b);
+
+    if (has_bank && limit > 0) {
+        /* We only track one aggregate sample; return up to 1 entry. */
+        sol_json_builder_object_begin(b);
+        sol_json_builder_key(b, "slot");
+        sol_json_builder_uint(b, slot);
+        sol_json_builder_key(b, "numTransactions");
+        sol_json_builder_uint(b, stats.transactions_processed);
+        sol_json_builder_key(b, "numSlots");
+        sol_json_builder_uint(b, 1);
+        sol_json_builder_key(b, "samplePeriodSecs");
+        sol_json_builder_uint(b, 1);
+        sol_json_builder_object_end(b);
+    }
+
+    sol_json_builder_array_end(b);
+    rpc_result_end(b);
+}
+
+static void
 handle_get_recent_prioritization_fees(sol_rpc_t* rpc, sol_json_builder_t* b,
                                        const rpc_id_t* id, sol_json_parser_t* params) {
     (void)params;  /* Optional account addresses parameter */
 
     sol_slot_t slot = 0;
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -2118,12 +2344,13 @@ handle_get_signatures_for_address(sol_rpc_t* rpc, sol_json_builder_t* b,
     rpc_result_begin(b, id);
     sol_json_builder_array_begin(b);
 
-    if (rpc->blockstore && limit > 0) {
+    sol_blockstore_t* bs = rpc_blockstore(rpc);
+    if (bs && limit > 0) {
         sol_blockstore_address_signature_t* entries =
             sol_alloc(limit * sizeof(sol_blockstore_address_signature_t));
         if (entries) {
             size_t n = sol_blockstore_get_signatures_for_address(
-                rpc->blockstore, &address, limit, entries, limit
+                bs, &address, limit, entries, limit
             );
 
             for (size_t i = 0; i < n; i++) {
@@ -2168,8 +2395,9 @@ static void
 handle_get_first_available_block(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id) {
     sol_slot_t first_slot = 0;
 
-    if (rpc->blockstore) {
-        first_slot = sol_blockstore_lowest_slot(rpc->blockstore);
+    sol_blockstore_t* bs = rpc_blockstore(rpc);
+    if (bs) {
+        first_slot = sol_blockstore_lowest_slot(bs);
     }
 
     rpc_result_begin(b, id);
@@ -2201,8 +2429,9 @@ handle_is_blockhash_valid(sol_rpc_t* rpc, sol_json_builder_t* b,
     bool valid = false;
     sol_slot_t slot = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             valid = sol_bank_is_blockhash_valid(bank, &blockhash);
@@ -2247,8 +2476,10 @@ handle_get_token_largest_accounts(sol_rpc_t* rpc, sol_json_builder_t* b,
     }
 
     sol_slot_t slot = 0;
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_t* bank = NULL;
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -2265,66 +2496,60 @@ handle_get_token_largest_accounts(sol_rpc_t* rpc, sol_json_builder_t* b,
     sol_json_builder_array_begin(b);
 
     uint8_t decimals = 0;
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
-        if (bank) {
-            sol_account_t* mint_account = sol_bank_load_account(bank, &mint);
-            if (mint_account &&
-                sol_pubkey_eq(&mint_account->meta.owner, &SOL_TOKEN_PROGRAM_ID) &&
-                mint_account->meta.data_len >= SOL_TOKEN_MINT_SIZE) {
-                const sol_token_mint_t* mint_data = (const sol_token_mint_t*)mint_account->data;
-                if (mint_data->is_initialized) {
-                    decimals = mint_data->decimals;
-                }
+    if (bank) {
+        sol_account_t* mint_account = sol_bank_load_account(bank, &mint);
+        if (mint_account &&
+            sol_pubkey_eq(&mint_account->meta.owner, &SOL_TOKEN_PROGRAM_ID) &&
+            mint_account->meta.data_len >= SOL_TOKEN_MINT_SIZE) {
+            const sol_token_mint_t* mint_data = (const sol_token_mint_t*)mint_account->data;
+            if (mint_data->is_initialized) {
+                decimals = mint_data->decimals;
             }
-            if (mint_account) {
-                sol_account_destroy(mint_account);
-            }
+        }
+        if (mint_account) {
+            sol_account_destroy(mint_account);
         }
     }
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
-        if (bank) {
-            sol_accounts_db_t* db = sol_bank_get_accounts_db(bank);
-            if (db) {
-                token_largest_ctx_t ctx = {
-                    .mint = &mint,
-                    .count = 0,
-                };
-                sol_accounts_db_iterate_owner(db, &SOL_TOKEN_PROGRAM_ID, token_largest_iter_cb, &ctx);
+    if (bank) {
+        sol_accounts_db_t* db = sol_bank_get_accounts_db(bank);
+        if (db) {
+            token_largest_ctx_t ctx = {
+                .mint = &mint,
+                .count = 0,
+            };
+            sol_accounts_db_iterate_owner(db, &SOL_TOKEN_PROGRAM_ID, token_largest_iter_cb, &ctx);
 
-                for (size_t i = 0; i < ctx.count; i++) {
-                    char addr_str[64];
-                    sol_pubkey_to_base58(&ctx.top[i].pubkey, addr_str, sizeof(addr_str));
+            for (size_t i = 0; i < ctx.count; i++) {
+                char addr_str[64];
+                sol_pubkey_to_base58(&ctx.top[i].pubkey, addr_str, sizeof(addr_str));
 
-                    char amount_str[32];
-                    snprintf(amount_str, sizeof(amount_str), "%lu", (unsigned long)ctx.top[i].amount);
+                char amount_str[32];
+                snprintf(amount_str, sizeof(amount_str), "%lu", (unsigned long)ctx.top[i].amount);
 
-                    double ui_amount = (double)ctx.top[i].amount;
-                    for (uint8_t d = 0; d < decimals; d++) {
-                        ui_amount /= 10.0;
-                    }
-
-                    char ui_amount_str[64];
-                    snprintf(ui_amount_str, sizeof(ui_amount_str), "%.9g", ui_amount);
-
-                    sol_json_builder_object_begin(b);
-                    sol_json_builder_key(b, "address");
-                    sol_json_builder_string(b, addr_str);
-                    sol_json_builder_key(b, "amount");
-                    sol_json_builder_object_begin(b);
-                    sol_json_builder_key(b, "amount");
-                    sol_json_builder_string(b, amount_str);
-                    sol_json_builder_key(b, "decimals");
-                    sol_json_builder_uint(b, decimals);
-                    sol_json_builder_key(b, "uiAmount");
-                    sol_json_builder_double(b, ui_amount);
-                    sol_json_builder_key(b, "uiAmountString");
-                    sol_json_builder_string(b, ui_amount_str);
-                    sol_json_builder_object_end(b);
-                    sol_json_builder_object_end(b);
+                double ui_amount = (double)ctx.top[i].amount;
+                for (uint8_t d = 0; d < decimals; d++) {
+                    ui_amount /= 10.0;
                 }
+
+                char ui_amount_str[64];
+                snprintf(ui_amount_str, sizeof(ui_amount_str), "%.9g", ui_amount);
+
+                sol_json_builder_object_begin(b);
+                sol_json_builder_key(b, "address");
+                sol_json_builder_string(b, addr_str);
+                sol_json_builder_key(b, "amount");
+                sol_json_builder_object_begin(b);
+                sol_json_builder_key(b, "amount");
+                sol_json_builder_string(b, amount_str);
+                sol_json_builder_key(b, "decimals");
+                sol_json_builder_uint(b, decimals);
+                sol_json_builder_key(b, "uiAmount");
+                sol_json_builder_double(b, ui_amount);
+                sol_json_builder_key(b, "uiAmountString");
+                sol_json_builder_string(b, ui_amount_str);
+                sol_json_builder_object_end(b);
+                sol_json_builder_object_end(b);
             }
         }
     }
@@ -2372,8 +2597,9 @@ handle_request_airdrop(sol_rpc_t* rpc, sol_json_builder_t* b,
 
     sol_signature_t signature = {0};
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             /* Credit the account directly (faucet mode) */
             sol_account_t* account = sol_bank_load_account(bank, &pubkey);
@@ -2421,8 +2647,9 @@ handle_get_block_production(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_
     sol_slot_t first_slot = 0;
     sol_slot_t last_slot = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             first_slot = slot > 1000 ? slot - 1000 : 0;
@@ -2463,8 +2690,9 @@ handle_get_highest_snapshot_slot(sol_rpc_t* rpc, sol_json_builder_t* b, const rp
     uint64_t full = 0;
     uint64_t incremental = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             /* Would get actual snapshot slot from snapshot manager */
             full = sol_bank_slot(bank);
@@ -2498,8 +2726,9 @@ handle_get_supply(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id) {
     uint64_t circulating = 0;
     uint64_t non_circulating = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             total = sol_bank_capitalization(bank);
@@ -2551,10 +2780,11 @@ handle_get_block_time(sol_rpc_t* rpc, sol_json_builder_t* b,
 
     int64_t block_time = 0;
 
-    if (rpc->blockstore) {
+    sol_blockstore_t* bs = rpc_blockstore(rpc);
+    if (bs) {
         /* Try to get actual block time from slot metadata */
         sol_slot_meta_t meta;
-        if (sol_blockstore_get_slot_meta(rpc->blockstore, target_slot, &meta) == SOL_OK) {
+        if (sol_blockstore_get_slot_meta(bs, target_slot, &meta) == SOL_OK) {
             /* Use completion time if available (ms since epoch) */
             if (meta.completed_time > 0) {
                 block_time = (int64_t)(meta.completed_time / 1000);
@@ -2603,8 +2833,9 @@ handle_get_block_commitment(sol_rpc_t* rpc, sol_json_builder_t* b,
     }
 
     uint64_t total_stake = 0;
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             total_stake = sol_bank_capitalization(bank) / 10;  /* Approximate stake */
         }
@@ -2633,8 +2864,9 @@ static void
 handle_get_genesis_hash(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id) {
     sol_hash_t genesis_hash = {0};
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             /* Get actual genesis hash from bank */
             const sol_hash_t* hash = sol_bank_genesis_hash(bank);
@@ -2680,8 +2912,9 @@ handle_get_latest_blockhash(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_
     sol_slot_t slot = 0;
     uint64_t last_valid_block_height = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             const sol_hash_t* bh = sol_bank_blockhash(bank);
@@ -2737,8 +2970,9 @@ handle_get_transaction(sol_rpc_t* rpc, sol_json_builder_t* b,
 
     /* Get current bank */
     sol_bank_t* bank = NULL;
-    if (rpc->bank_forks) {
-        bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
     }
 
     /* Look up transaction status in bank's cache */
@@ -2830,8 +3064,9 @@ handle_get_signature_statuses(sol_rpc_t* rpc, sol_json_builder_t* b,
     /* Get current slot and bank */
     sol_slot_t slot = 0;
     sol_bank_t* bank = NULL;
-    if (rpc->bank_forks) {
-        bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -2960,8 +3195,9 @@ handle_simulate_transaction(sol_rpc_t* rpc, sol_json_builder_t* b,
     /* Get current slot and bank */
     sol_slot_t slot = 0;
     sol_bank_t* bank = NULL;
-    if (rpc->bank_forks) {
-        bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
         }
@@ -3036,25 +3272,26 @@ handle_get_block(sol_rpc_t* rpc, sol_json_builder_t* b,
     }
 
     /* Check if we have a blockstore */
-    if (!rpc->blockstore) {
+    sol_blockstore_t* bs = rpc_blockstore(rpc);
+    if (!bs) {
         rpc_error_response(b, id, SOL_RPC_ERR_BLOCK_NOT_AVAILABLE,
                           "Blockstore not available");
         return;
     }
 
     /* Prefer a complete duplicate-slot variant if needed */
-    if (!sol_blockstore_is_slot_complete(rpc->blockstore, slot)) {
+    if (!sol_blockstore_is_slot_complete(bs, slot)) {
         rpc_error_response(b, id, SOL_RPC_ERR_BLOCK_NOT_AVAILABLE,
                           "Block not complete");
         return;
     }
 
     uint32_t chosen_variant = 0;
-    sol_block_t* block = sol_blockstore_get_block_variant(rpc->blockstore, slot, 0);
+    sol_block_t* block = sol_blockstore_get_block_variant(bs, slot, 0);
     if (!block) {
-        size_t variants = sol_blockstore_num_variants(rpc->blockstore, slot);
+        size_t variants = sol_blockstore_num_variants(bs, slot);
         for (uint32_t v = 1; v < variants; v++) {
-            block = sol_blockstore_get_block_variant(rpc->blockstore, slot, v);
+            block = sol_blockstore_get_block_variant(bs, slot, v);
             if (block) {
                 chosen_variant = v;
                 break;
@@ -3072,7 +3309,7 @@ handle_get_block(sol_rpc_t* rpc, sol_json_builder_t* b,
 
     /* Best-effort slot metadata (timestamps, etc) */
     sol_slot_meta_t meta = {0};
-    (void)sol_blockstore_get_slot_meta(rpc->blockstore, slot, &meta);
+    (void)sol_blockstore_get_slot_meta(bs, slot, &meta);
     meta.parent_slot = parent_slot;
 
     /* Parse entries up-front (also used to derive the blockhash) */
@@ -3096,7 +3333,7 @@ handle_get_block(sol_rpc_t* rpc, sol_json_builder_t* b,
     /* Get parent block hash (best-effort) */
     sol_hash_t parent_hash = {0};
     if (parent_slot > 0) {
-        sol_blockstore_get_block_hash(rpc->blockstore, parent_slot, &parent_hash);
+        sol_blockstore_get_block_hash(bs, parent_slot, &parent_hash);
     }
 
     /* Build response */
@@ -3229,8 +3466,9 @@ handle_get_blocks(sol_rpc_t* rpc, sol_json_builder_t* b,
 
     /* Get current slot as upper bound */
     sol_slot_t current_slot = 0;
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             current_slot = sol_bank_slot(bank);
         }
@@ -3244,9 +3482,10 @@ handle_get_blocks(sol_rpc_t* rpc, sol_json_builder_t* b,
     rpc_result_begin(b, id);
     sol_json_builder_array_begin(b);
 
-    if (rpc->blockstore) {
+    sol_blockstore_t* bs = rpc_blockstore(rpc);
+    if (bs) {
         for (uint64_t slot = start_slot; slot <= end_slot; slot++) {
-            if (sol_blockstore_is_slot_complete(rpc->blockstore, slot)) {
+            if (sol_blockstore_is_slot_complete(bs, slot)) {
                 sol_json_builder_uint(b, slot);
             }
         }
@@ -3286,8 +3525,9 @@ handle_get_blocks_with_limit(sol_rpc_t* rpc, sol_json_builder_t* b,
 
     /* Get current slot as upper bound */
     sol_slot_t current_slot = 0;
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             current_slot = sol_bank_slot(bank);
         }
@@ -3301,12 +3541,13 @@ handle_get_blocks_with_limit(sol_rpc_t* rpc, sol_json_builder_t* b,
     rpc_result_begin(b, id);
     sol_json_builder_array_begin(b);
 
-    if (rpc->blockstore && limit > 0) {
+    sol_blockstore_t* bs = rpc_blockstore(rpc);
+    if (bs && limit > 0) {
         uint64_t out_count = 0;
         for (uint64_t slot = start_slot; slot <= scan_end; slot++) {
             if (out_count >= limit) break;
 
-            if (sol_blockstore_is_slot_complete(rpc->blockstore, slot)) {
+            if (sol_blockstore_is_slot_complete(bs, slot)) {
                 sol_json_builder_uint(b, slot);
                 out_count++;
             }
@@ -3327,8 +3568,9 @@ handle_get_epoch_info(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t* id)
     uint64_t block_height = 0;
     uint64_t transaction_count = 0;
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             slot = sol_bank_slot(bank);
             absolute_slot = slot;
@@ -3364,8 +3606,9 @@ handle_get_epoch_schedule(sol_rpc_t* rpc, sol_json_builder_t* b, const rpc_id_t*
     sol_epoch_schedule_t schedule;
     sol_epoch_schedule_init(&schedule);
 
-    if (rpc->bank_forks) {
-        sol_bank_t* bank = sol_bank_forks_working_bank(rpc->bank_forks);
+    sol_bank_forks_t* forks = rpc_bank_forks(rpc);
+    if (forks) {
+        sol_bank_t* bank = sol_bank_forks_working_bank(forks);
         if (bank) {
             sol_account_t* account = sol_bank_load_account(bank, &SOL_SYSVAR_EPOCH_SCHEDULE_ID);
             if (account && account->meta.data_len >= SOL_EPOCH_SCHEDULE_SERIALIZED_SIZE) {
@@ -3699,6 +3942,9 @@ sol_rpc_handle_request_json(sol_rpc_t* rpc, const char* body, size_t body_len,
         handle_get_fee_for_message(rpc, response, &id, has_params ? &params_parser : NULL);
     } else if (strcmp(method, "getTransactionCount") == 0) {
         handle_get_transaction_count(rpc, response, &id);
+    } else if (strcmp(method, "getRecentPerformanceSamples") == 0) {
+        handle_get_recent_performance_samples(rpc, response, &id,
+                                              has_params ? &params_parser : NULL);
     } else if (strcmp(method, "getRecentPrioritizationFees") == 0) {
         handle_get_recent_prioritization_fees(rpc, response, &id, has_params ? &params_parser : NULL);
     } else if (strcmp(method, "getSignaturesForAddress") == 0) {
@@ -3736,6 +3982,36 @@ sol_rpc_handle_request_json(sol_rpc_t* rpc, const char* body, size_t body_len,
 /*
  * HTTP handling
  */
+static inline ssize_t
+rpc_send_once(int fd, const void* buf, size_t len) {
+#ifdef MSG_NOSIGNAL
+    return send(fd, buf, len, MSG_NOSIGNAL);
+#else
+    return send(fd, buf, len, 0);
+#endif
+}
+
+static size_t
+rpc_send_all(int fd, const void* buf, size_t len) {
+    const char* p = (const char*)buf;
+    size_t sent = 0;
+
+    while (sent < len) {
+        ssize_t n = rpc_send_once(fd, p + sent, len - sent);
+        if (n > 0) {
+            sent += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        /* Treat EAGAIN/EWOULDBLOCK as a timeout (SO_SNDTIMEO). */
+        break;
+    }
+
+    return sent;
+}
+
 static size_t
 rpc_http_send_response(int client_fd,
                        int status_code,
@@ -3758,14 +4034,16 @@ rpc_http_send_response(int client_fd,
     );
 
     size_t bytes_sent = 0;
+
     if (header_len > 0) {
-        ssize_t n = send(client_fd, header, (size_t)header_len, 0);
-        if (n > 0) bytes_sent += (size_t)n;
+        size_t hdr_len = (size_t)header_len;
+        if (hdr_len > sizeof(header)) hdr_len = sizeof(header);
+        bytes_sent += rpc_send_all(client_fd, header, hdr_len);
     }
     if (send_body && body && body_len > 0) {
-        ssize_t n = send(client_fd, body, body_len, 0);
-        if (n > 0) bytes_sent += (size_t)n;
+        bytes_sent += rpc_send_all(client_fd, body, body_len);
     }
+
     return bytes_sent;
 }
 
@@ -3873,10 +4151,20 @@ rpc_http_handle_health(sol_rpc_t* rpc, int client_fd, const char* method, const 
 
 static void
 handle_client(sol_rpc_t* rpc, int client_fd) {
+    /* Enforce a bounded lifetime per request so untrusted clients can't pin
+     * per-connection threads indefinitely. */
+    uint32_t timeout_ms = rpc ? (uint32_t)rpc->config.request_timeout_ms : 2000u;
+    if (timeout_ms == 0) timeout_ms = 30000u;
+    struct timeval tv = {
+        .tv_sec = (time_t)(timeout_ms / 1000u),
+        .tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u),
+    };
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     char buffer[65536];
     ssize_t n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
     if (n <= 0) {
-        close(client_fd);
         return;
     }
     buffer[n] = '\0';
@@ -3887,28 +4175,24 @@ handle_client(sol_rpc_t* rpc, int client_fd) {
     char path[256] = {0};
     if (rpc_http_parse_request_line(buffer, method, sizeof(method), path, sizeof(path))) {
         if (rpc_http_handle_health(rpc, client_fd, method, path)) {
-            close(client_fd);
             return;
         }
         if (strcmp(method, "GET") == 0 || strcmp(method, "HEAD") == 0) {
             size_t bytes_sent = rpc_http_send_response(
                 client_fd, 404, "Not Found", "text/plain", "Not Found\n", 10, true);
             __atomic_fetch_add(&rpc->stats.bytes_sent, bytes_sent, __ATOMIC_RELAXED);
-            close(client_fd);
             return;
         }
         if (strcmp(method, "POST") != 0) {
             size_t bytes_sent = rpc_http_send_response(
                 client_fd, 405, "Method Not Allowed", "text/plain", "Method Not Allowed\n", 19, true);
             __atomic_fetch_add(&rpc->stats.bytes_sent, bytes_sent, __ATOMIC_RELAXED);
-            close(client_fd);
             return;
         }
     } else {
         size_t bytes_sent = rpc_http_send_response(
             client_fd, 400, "Bad Request", "text/plain", "Bad Request\n", 12, true);
         __atomic_fetch_add(&rpc->stats.bytes_sent, bytes_sent, __ATOMIC_RELAXED);
-        close(client_fd);
         return;
     }
 
@@ -3918,7 +4202,6 @@ handle_client(sol_rpc_t* rpc, int client_fd) {
         size_t bytes_sent = rpc_http_send_response(client_fd, 400, "Bad Request",
                                                    "text/plain", "Bad Request\n", 12, true);
         __atomic_fetch_add(&rpc->stats.bytes_sent, bytes_sent, __ATOMIC_RELAXED);
-        close(client_fd);
         return;
     }
     body += 4;
@@ -3936,7 +4219,69 @@ handle_client(sol_rpc_t* rpc, int client_fd) {
     __atomic_fetch_add(&rpc->stats.bytes_sent, bytes_sent, __ATOMIC_RELAXED);
 
     sol_json_builder_destroy(response);
-    close(client_fd);
+}
+
+typedef struct {
+    sol_rpc_t* rpc;
+    int        client_fd;
+} rpc_client_ctx_t;
+
+static bool
+rpc_track_http_client_fd(sol_rpc_t* rpc, int client_fd) {
+    if (!rpc || client_fd < 0) return false;
+
+    pthread_mutex_lock(&rpc->lock);
+    for (int i = 0; i < MAX_HTTP_CLIENTS; i++) {
+        if (!rpc->http_clients[i].active) {
+            rpc->http_clients[i].active = true;
+            rpc->http_clients[i].fd = client_fd;
+            pthread_mutex_unlock(&rpc->lock);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&rpc->lock);
+    return false;
+}
+
+static void
+rpc_untrack_http_client_fd(sol_rpc_t* rpc, int client_fd) {
+    if (!rpc || client_fd < 0) return;
+
+    pthread_mutex_lock(&rpc->lock);
+    for (int i = 0; i < MAX_HTTP_CLIENTS; i++) {
+        if (rpc->http_clients[i].active && rpc->http_clients[i].fd == client_fd) {
+            rpc->http_clients[i].active = false;
+            rpc->http_clients[i].fd = -1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&rpc->lock);
+}
+
+static void
+rpc_shutdown_http_clients(sol_rpc_t* rpc) {
+    if (!rpc) return;
+
+    pthread_mutex_lock(&rpc->lock);
+    for (int i = 0; i < MAX_HTTP_CLIENTS; i++) {
+        if (!rpc->http_clients[i].active) continue;
+        if (rpc->http_clients[i].fd >= 0) {
+            (void)shutdown(rpc->http_clients[i].fd, SHUT_RDWR);
+        }
+    }
+    pthread_mutex_unlock(&rpc->lock);
+}
+
+static void*
+rpc_client_thread_fn(void* arg) {
+    rpc_client_ctx_t* ctx = (rpc_client_ctx_t*)arg;
+    if (!ctx) return NULL;
+    handle_client(ctx->rpc, ctx->client_fd);
+    rpc_untrack_http_client_fd(ctx->rpc, ctx->client_fd);
+    close(ctx->client_fd);
+    __atomic_fetch_sub(&ctx->rpc->stats.active_connections, 1, __ATOMIC_RELAXED);
+    sol_free(ctx);
+    return NULL;
 }
 
 /*
@@ -3963,9 +4308,49 @@ accept_thread_fn(void* arg) {
             continue;
         }
 
+        /* Don't leak client sockets into snapshot helper processes (curl/zstd). */
+        {
+            int fd_flags = fcntl(client_fd, F_GETFD, 0);
+            if (fd_flags >= 0) {
+                (void)fcntl(client_fd, F_SETFD, fd_flags | FD_CLOEXEC);
+            }
+        }
+
+        size_t max_conn = rpc->config.max_connections;
+        if (max_conn > 0) {
+            uint64_t active = __atomic_load_n(&rpc->stats.active_connections, __ATOMIC_RELAXED);
+            if (active >= (uint64_t)max_conn) {
+                close(client_fd);
+                continue;
+            }
+        }
+
         __atomic_fetch_add(&rpc->stats.active_connections, 1, __ATOMIC_RELAXED);
-        handle_client(rpc, client_fd);
-        __atomic_fetch_sub(&rpc->stats.active_connections, 1, __ATOMIC_RELAXED);
+        rpc_client_ctx_t* ctx = sol_calloc(1, sizeof(*ctx));
+        if (!ctx) {
+            __atomic_fetch_sub(&rpc->stats.active_connections, 1, __ATOMIC_RELAXED);
+            close(client_fd);
+            continue;
+        }
+        ctx->rpc = rpc;
+        ctx->client_fd = client_fd;
+
+        if (!rpc_track_http_client_fd(rpc, client_fd)) {
+            __atomic_fetch_sub(&rpc->stats.active_connections, 1, __ATOMIC_RELAXED);
+            close(client_fd);
+            sol_free(ctx);
+            continue;
+        }
+
+        pthread_t thr;
+        if (pthread_create(&thr, NULL, rpc_client_thread_fn, ctx) != 0) {
+            rpc_untrack_http_client_fd(rpc, client_fd);
+            __atomic_fetch_sub(&rpc->stats.active_connections, 1, __ATOMIC_RELAXED);
+            close(client_fd);
+            sol_free(ctx);
+            continue;
+        }
+        pthread_detach(thr);
     }
 
     return NULL;
@@ -4060,7 +4445,7 @@ ws_handshake(int client_fd, const char* request, size_t request_len) {
         "Sec-WebSocket-Accept: %s\r\n"
         "\r\n", accept);
 
-    send(client_fd, response, len, 0);
+    (void)rpc_send_all(client_fd, response, (size_t)len);
     return true;
 }
 
@@ -4090,7 +4475,7 @@ ws_handle_subscribe(sol_rpc_t* rpc, int client_fd, const char* method,
             id);
         uint8_t frame[512];
         size_t frame_len = ws_encode_frame(frame, sizeof(frame), error, strlen(error));
-        send(client_fd, frame, frame_len, 0);
+        (void)rpc_send_all(client_fd, frame, frame_len);
         return;
     }
 
@@ -4150,7 +4535,7 @@ ws_handle_subscribe(sol_rpc_t* rpc, int client_fd, const char* method,
 
     uint8_t frame[512];
     size_t frame_len = ws_encode_frame(frame, sizeof(frame), response, strlen(response));
-    send(client_fd, frame, frame_len, 0);
+    (void)rpc_send_all(client_fd, frame, frame_len);
 }
 
 /*
@@ -4185,7 +4570,7 @@ ws_handle_unsubscribe(sol_rpc_t* rpc, int client_fd, sol_json_parser_t* params, 
 
     uint8_t frame[512];
     size_t frame_len = ws_encode_frame(frame, sizeof(frame), response, strlen(response));
-    send(client_fd, frame, frame_len, 0);
+    (void)rpc_send_all(client_fd, frame, frame_len);
 }
 
 /*
@@ -4238,10 +4623,13 @@ ws_handle_message(sol_rpc_t* rpc, int client_fd, const char* message, size_t len
  */
 static void
 ws_handle_client(sol_rpc_t* rpc, int client_fd) {
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     char buffer[65536];
     ssize_t n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
     if (n <= 0) {
-        close(client_fd);
         return;
     }
     buffer[n] = '\0';
@@ -4250,7 +4638,6 @@ ws_handle_client(sol_rpc_t* rpc, int client_fd) {
     if (strstr(buffer, "Upgrade: websocket") != NULL ||
         strstr(buffer, "upgrade: websocket") != NULL) {
         if (!ws_handshake(client_fd, buffer, n)) {
-            close(client_fd);
             return;
         }
 
@@ -4312,7 +4699,7 @@ ws_handle_client(sol_rpc_t* rpc, int client_fd) {
             } else if (opcode == 0x09) {
                 /* Ping - send pong */
                 uint8_t pong[2] = {0x8A, 0x00};
-                send(client_fd, pong, 2, 0);
+                (void)rpc_send_all(client_fd, pong, 2);
             } else if (opcode == 0x01) {
                 /* Text frame */
                 ws_handle_message(rpc, client_fd, payload, payload_len);
@@ -4338,8 +4725,21 @@ ws_handle_client(sol_rpc_t* rpc, int client_fd) {
         }
         pthread_mutex_unlock(&rpc->ws_lock);
     }
+}
 
-    close(client_fd);
+typedef struct {
+    sol_rpc_t* rpc;
+    int        client_fd;
+} ws_client_ctx_t;
+
+static void*
+ws_client_thread_fn(void* arg) {
+    ws_client_ctx_t* ctx = (ws_client_ctx_t*)arg;
+    if (!ctx) return NULL;
+    ws_handle_client(ctx->rpc, ctx->client_fd);
+    close(ctx->client_fd);
+    sol_free(ctx);
+    return NULL;
 }
 
 /*
@@ -4366,8 +4766,29 @@ ws_accept_thread_fn(void* arg) {
             continue;
         }
 
-        /* Handle WebSocket client in a simple blocking way */
-        ws_handle_client(rpc, client_fd);
+        /* Don't leak client sockets into snapshot helper processes (curl/zstd). */
+        {
+            int fd_flags = fcntl(client_fd, F_GETFD, 0);
+            if (fd_flags >= 0) {
+                (void)fcntl(client_fd, F_SETFD, fd_flags | FD_CLOEXEC);
+            }
+        }
+
+        ws_client_ctx_t* ctx = sol_calloc(1, sizeof(*ctx));
+        if (!ctx) {
+            close(client_fd);
+            continue;
+        }
+        ctx->rpc = rpc;
+        ctx->client_fd = client_fd;
+
+        pthread_t thr;
+        if (pthread_create(&thr, NULL, ws_client_thread_fn, ctx) != 0) {
+            close(client_fd);
+            sol_free(ctx);
+            continue;
+        }
+        pthread_detach(thr);
     }
 
     return NULL;
@@ -4406,7 +4827,7 @@ sol_rpc_notify_account(sol_rpc_t* rpc, const sol_pubkey_t* pubkey,
 
         uint8_t frame[8192];
         size_t frame_len = ws_encode_frame(frame, sizeof(frame), notification, len);
-        send(sub->client_fd, frame, frame_len, 0);
+        (void)rpc_send_all(sub->client_fd, frame, frame_len);
     }
 
     pthread_mutex_unlock(&rpc->ws_lock);
@@ -4431,7 +4852,7 @@ sol_rpc_notify_slot(sol_rpc_t* rpc, sol_slot_t slot, sol_slot_t parent, const ch
 
         uint8_t frame[1024];
         size_t frame_len = ws_encode_frame(frame, sizeof(frame), notification, len);
-        send(sub->client_fd, frame, frame_len, 0);
+        (void)rpc_send_all(sub->client_fd, frame, frame_len);
     }
 
     pthread_mutex_unlock(&rpc->ws_lock);
@@ -4468,7 +4889,7 @@ sol_rpc_notify_signature(sol_rpc_t* rpc, const sol_signature_t* signature,
 
         uint8_t frame[1024];
         size_t frame_len = ws_encode_frame(frame, sizeof(frame), notification, len);
-        send(sub->client_fd, frame, frame_len, 0);
+        (void)rpc_send_all(sub->client_fd, frame, frame_len);
 
         /* Auto-unsubscribe after notification */
         sub->active = false;
@@ -4515,7 +4936,7 @@ sol_rpc_notify_logs(sol_rpc_t* rpc, const sol_signature_t* signature,
 
         uint8_t frame[16384];
         size_t frame_len = ws_encode_frame(frame, sizeof(frame), notification, len);
-        send(sub->client_fd, frame, frame_len, 0);
+        (void)rpc_send_all(sub->client_fd, frame, frame_len);
     }
 
     pthread_mutex_unlock(&rpc->ws_lock);
@@ -4562,6 +4983,19 @@ sol_rpc_destroy(sol_rpc_t* rpc) {
         sol_rpc_stop(rpc);
     }
 
+    if (rpc->leader_schedule) {
+        /* Wait for any in-flight readers before destroying. */
+        for (;;) {
+            pthread_mutex_lock(&rpc->lock);
+            uint32_t readers = rpc->leader_schedule_readers;
+            pthread_mutex_unlock(&rpc->lock);
+            if (readers == 0) break;
+            usleep(1000);
+        }
+        sol_leader_schedule_destroy(rpc->leader_schedule);
+        rpc->leader_schedule = NULL;
+    }
+
     pthread_mutex_destroy(&rpc->lock);
     pthread_mutex_destroy(&rpc->ws_lock);
     sol_free(rpc);
@@ -4576,6 +5010,14 @@ sol_rpc_start(sol_rpc_t* rpc) {
     if (rpc->listen_fd < 0) {
         sol_log_error("RPC socket creation failed: %s", strerror(errno));
         return SOL_ERR_IO;
+    }
+
+    /* Ensure listen socket isn't inherited by snapshot helper processes (curl/zstd). */
+    {
+        int fd_flags = fcntl(rpc->listen_fd, F_GETFD, 0);
+        if (fd_flags < 0 || fcntl(rpc->listen_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+            sol_log_warn("RPC fcntl(FD_CLOEXEC) failed: %s", strerror(errno));
+        }
     }
 
     /* Allow address reuse */
@@ -4626,6 +5068,12 @@ sol_rpc_start(sol_rpc_t* rpc) {
         if (rpc->ws_listen_fd < 0) {
             sol_log_warn("WebSocket socket creation failed: %s", strerror(errno));
         } else {
+            /* Ensure listen socket isn't inherited by snapshot helper processes (curl/zstd). */
+            int fd_flags = fcntl(rpc->ws_listen_fd, F_GETFD, 0);
+            if (fd_flags < 0 || fcntl(rpc->ws_listen_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+                sol_log_warn("WebSocket fcntl(FD_CLOEXEC) failed: %s", strerror(errno));
+            }
+
             int opt = 1;
             setsockopt(rpc->ws_listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -4683,15 +5131,35 @@ sol_rpc_stop(sol_rpc_t* rpc) {
         pthread_join(rpc->ws_accept_thread, NULL);
     }
 
+    /* Force any active client threads to wake up and exit promptly. */
+    rpc_shutdown_http_clients(rpc);
+
     /* Close any active WebSocket client connections */
     pthread_mutex_lock(&rpc->ws_lock);
     for (int i = 0; i < MAX_WS_CLIENTS; i++) {
         if (rpc->ws_clients[i].active) {
-            close(rpc->ws_clients[i].fd);
-            rpc->ws_clients[i].active = false;
+            (void)shutdown(rpc->ws_clients[i].fd, SHUT_RDWR);
         }
     }
     pthread_mutex_unlock(&rpc->ws_lock);
+
+    /* Client handler threads are detached; wait for them to drain so upstream
+     * shutdown can safely destroy shared state (accounts DB / blockstore). */
+    const uint64_t wait_start = sol_gossip_now_ms();
+    for (;;) {
+        uint64_t http_active = __atomic_load_n(&rpc->stats.active_connections, __ATOMIC_RELAXED);
+        uint64_t ws_active = __atomic_load_n(&rpc->stats.ws_connections, __ATOMIC_RELAXED);
+        if (http_active == 0 && ws_active == 0) {
+            break;
+        }
+        if (sol_gossip_now_ms() - wait_start > 30000) {
+            sol_log_warn("RPC stop: timed out waiting for client threads to drain (http=%lu ws=%lu)",
+                         (unsigned long)http_active,
+                         (unsigned long)ws_active);
+            break;
+        }
+        usleep(1000);
+    }
 
     sol_log_info("RPC server stopped");
 
@@ -4720,16 +5188,23 @@ sol_rpc_stats(const sol_rpc_t* rpc) {
 }
 
 void
+sol_rpc_set_bank_forks(sol_rpc_t* rpc, sol_bank_forks_t* bank_forks) {
+    if (rpc) {
+        __atomic_store_n(&rpc->bank_forks, bank_forks, __ATOMIC_RELEASE);
+    }
+}
+
+void
 sol_rpc_set_blockstore(sol_rpc_t* rpc, void* blockstore) {
     if (rpc) {
-        rpc->blockstore = (sol_blockstore_t*)blockstore;
+        __atomic_store_n(&rpc->blockstore, (sol_blockstore_t*)blockstore, __ATOMIC_RELEASE);
     }
 }
 
 void
 sol_rpc_set_gossip(sol_rpc_t* rpc, void* gossip) {
     if (rpc) {
-        rpc->gossip = (sol_gossip_t*)gossip;
+        __atomic_store_n(&rpc->gossip, (sol_gossip_t*)gossip, __ATOMIC_RELEASE);
     }
 }
 
@@ -4738,6 +5213,33 @@ sol_rpc_set_identity(sol_rpc_t* rpc, const sol_pubkey_t* identity) {
     if (rpc && identity) {
         memcpy(&rpc->identity, identity, sizeof(sol_pubkey_t));
         rpc->identity_set = true;
+    }
+}
+
+void
+sol_rpc_set_leader_schedule(sol_rpc_t* rpc, const sol_leader_schedule_t* schedule) {
+    if (!rpc) return;
+
+    sol_leader_schedule_t* copy = NULL;
+    if (schedule) {
+        copy = sol_leader_schedule_clone(schedule);
+    }
+
+    pthread_mutex_lock(&rpc->lock);
+    sol_leader_schedule_t* old = rpc->leader_schedule;
+    rpc->leader_schedule = copy;
+    pthread_mutex_unlock(&rpc->lock);
+
+    if (old) {
+        /* Wait for any in-flight readers before destroying. */
+        for (;;) {
+            pthread_mutex_lock(&rpc->lock);
+            uint32_t readers = rpc->leader_schedule_readers;
+            pthread_mutex_unlock(&rpc->lock);
+            if (readers == 0) break;
+            usleep(1000);
+        }
+        sol_leader_schedule_destroy(old);
     }
 }
 

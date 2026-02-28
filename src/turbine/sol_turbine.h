@@ -140,6 +140,18 @@ typedef void (*sol_turbine_shred_cb)(
 );
 
 /*
+ * Callback for a batch of received shreds (after basic parsing/dedup)
+ *
+ * For high packet rates, batching avoids per-shred callback overhead and
+ * enables downstream stages (e.g. TVU ingress queues) to amortize locking.
+ */
+typedef void (*sol_turbine_shred_batch_cb)(
+    void*                   ctx,
+    const sol_udp_pkt_t*    pkts,
+    int                     count
+);
+
+/*
  * Create turbine service
  */
 sol_turbine_t* sol_turbine_new(
@@ -231,6 +243,18 @@ void sol_turbine_set_shred_callback(
     sol_turbine_t*          turbine,
     sol_turbine_shred_cb    callback,
     void*                   ctx
+);
+
+/*
+ * Set batched shred callback
+ *
+ * When set, turbine may invoke this callback in place of the per-shred
+ * callback for fast-ingress configurations.
+ */
+void sol_turbine_set_shred_batch_callback(
+    sol_turbine_t*               turbine,
+    sol_turbine_shred_batch_cb   callback,
+    void*                        ctx
 );
 
 /*

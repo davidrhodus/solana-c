@@ -219,6 +219,31 @@ TEST(repair_request_highest_no_peers) {
     sol_repair_destroy(repair);
 }
 
+TEST(repair_request_highest_fanout_no_peers) {
+    int udp = udp_available();
+    if (udp == 0) {
+        TEST_SKIP("UDP sockets not permitted in this environment");
+    }
+    TEST_ASSERT_MSG(udp > 0, "Failed to create UDP socket for repair tests");
+
+    sol_repair_config_t config = SOL_REPAIR_CONFIG_DEFAULT;
+
+    sol_keypair_t identity;
+    sol_ed25519_keypair_generate(&identity);
+
+    sol_repair_t* repair = sol_repair_new(&config, NULL, &identity);
+    TEST_ASSERT(repair != NULL);
+
+    sol_err_t err = sol_repair_start(repair, 0);
+    TEST_ASSERT_EQ(err, SOL_OK);
+
+    /* Request should fail - no peers available */
+    err = sol_repair_request_highest_fanout(repair, 1000, 0, 4);
+    TEST_ASSERT_EQ(err, SOL_ERR_PEER_UNAVAILABLE);
+
+    sol_repair_destroy(repair);
+}
+
 TEST(repair_request_orphan_no_peers) {
     int udp = udp_available();
     if (udp == 0) {
@@ -681,6 +706,9 @@ TEST(repair_null_handling) {
     err = sol_repair_request_highest(NULL, 1000, 0);
     TEST_ASSERT_EQ(err, SOL_ERR_INVAL);
 
+    err = sol_repair_request_highest_fanout(NULL, 1000, 0, 4);
+    TEST_ASSERT_EQ(err, SOL_ERR_INVAL);
+
     err = sol_repair_request_orphan(NULL, 1000);
     TEST_ASSERT_EQ(err, SOL_ERR_INVAL);
 
@@ -703,6 +731,7 @@ static test_case_t repair_tests[] = {
     TEST_CASE(repair_double_start),
     TEST_CASE(repair_request_shred_no_peers),
     TEST_CASE(repair_request_highest_no_peers),
+    TEST_CASE(repair_request_highest_fanout_no_peers),
     TEST_CASE(repair_request_orphan_no_peers),
     TEST_CASE(repair_response_bincode_shred_unwrap),
     TEST_CASE(repair_prioritization_evict_low_priority),

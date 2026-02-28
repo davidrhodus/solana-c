@@ -939,6 +939,7 @@ sol_error_t sol_rpc_server_stop(sol_rpc_server_t* server);
 - `getInflationGovernor`
 - `getInflationRate`
 - `getLeaderSchedule`
+- `getRecentPerformanceSamples`
 - `getSlot`
 - `getSlotLeader`
 - `getStakeActivation`

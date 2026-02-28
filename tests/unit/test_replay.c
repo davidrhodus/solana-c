@@ -260,6 +260,9 @@ TEST(bank_forks_set_root) {
     TEST_ASSERT_NOT_NULL(bank1);
     sol_bank_t* bank2 = sol_bank_forks_new_from_parent(forks, 1, 2);
     TEST_ASSERT_NOT_NULL(bank2);
+    /* Create a competing branch off the old root */
+    sol_bank_t* bank3 = sol_bank_forks_new_from_parent(forks, 0, 3);
+    TEST_ASSERT_NOT_NULL(bank3);
 
     /* Modify the account on each forked bank */
     sol_account_t* acc1 = sol_account_new(90, 0, NULL);
@@ -269,7 +272,7 @@ TEST(bank_forks_set_root) {
     TEST_ASSERT_EQ(sol_bank_store_account(bank1, &key, acc1), SOL_OK);
     TEST_ASSERT_EQ(sol_bank_store_account(bank2, &key, acc2), SOL_OK);
 
-    TEST_ASSERT_EQ(sol_bank_forks_count(forks), 3);
+    TEST_ASSERT_EQ(sol_bank_forks_count(forks), 4);
 
     /* Set root to slot 1 */
     sol_err_t err = sol_bank_forks_set_root(forks, 1);
@@ -290,6 +293,8 @@ TEST(bank_forks_set_root) {
     TEST_ASSERT(!sol_bank_forks_contains(forks, 0));
     TEST_ASSERT(sol_bank_forks_contains(forks, 1));
     TEST_ASSERT(sol_bank_forks_contains(forks, 2));
+    TEST_ASSERT(!sol_bank_forks_contains(forks, 3));
+    TEST_ASSERT_EQ(sol_bank_forks_highest_slot(forks), 2);
 
     sol_account_destroy(acc0);
     sol_account_destroy(acc1);

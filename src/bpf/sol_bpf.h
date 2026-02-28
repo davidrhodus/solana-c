@@ -230,6 +230,17 @@ typedef struct {
 } sol_bpf_syscall_t;
 
 /*
+ * Fast syscall lookup table entry (open addressing).
+ *
+ * Stores a pointer to the syscall definition so callers can access both
+ * handler and name when needed.
+ */
+typedef struct {
+    uint32_t         hash;
+    sol_bpf_syscall_t* syscall; /* NULL => empty slot */
+} sol_bpf_syscall_lut_entry_t;
+
+/*
  * CPI account meta
  */
 typedef struct {
@@ -250,6 +261,10 @@ typedef struct {
     uint64_t                            account_infos_ptr;
     uint64_t                            account_infos_len;
     bool                                account_infos_are_rust;
+    /* Optional: pre-parsed account_infos pubkeys from the invoke syscall path.
+     * When non-NULL, this avoids re-translating pubkey pointers in the CPI
+     * dispatch path. Lifetime is the duration of the syscall handler call. */
+    const sol_pubkey_t*                 account_infos_pubkeys;
 } sol_bpf_cpi_instruction_t;
 
 /*
@@ -293,6 +308,11 @@ typedef struct {
     sol_bpf_region_t*   regions;
     size_t              region_count;
     size_t              region_cap;
+    size_t              last_region_idx; /* Small cache for translate() hot path */
+    /* Fast lookup for the canonical Solana SBPF regions keyed by (vaddr >> 32):
+     *   1=program, 2=stack, 3=heap, 4=input.
+     * Stored as region_index+1 so 0 means "unset". */
+    uint16_t            fixed_region_idx[5];
 } sol_bpf_memory_t;
 
 /*
@@ -396,14 +416,18 @@ struct sol_bpf_vm {
     /* Stack memory */
     uint8_t*            stack;
     size_t              stack_size;
+    size_t              stack_alloc_size; /* underlying allocation length (may be page-aligned) */
     uint64_t            stack_frame_size;
     uint64_t            stack_gap_size;
     uint64_t            stack_virt_size;
+    bool                stack_is_mmap;    /* stack was allocated via mmap() */
 
     /* Heap memory */
     uint8_t*            heap;
     size_t              heap_size;
+    size_t              heap_alloc_size;  /* underlying allocation length (may be page-aligned) */
     size_t              heap_pos;   /* Bump allocator position */
+    bool                heap_is_mmap;     /* heap was allocated via mmap() */
 
     /* Program */
     sol_bpf_program_t*  program;
@@ -413,6 +437,10 @@ struct sol_bpf_vm {
     size_t              syscall_count;
     size_t              syscall_cap;
     sol_bpf_cpi_handler_t cpi_handler;
+
+    /* Open-addressing lookup table for syscall hash -> syscall def. */
+    sol_bpf_syscall_lut_entry_t* syscall_lut;
+    size_t                       syscall_lut_cap;
 
     /* Compute budget */
     uint64_t            compute_units;
@@ -449,6 +477,13 @@ struct sol_bpf_vm {
      * When true, heap allocation uses alignment=1 (no alignment)
      * instead of BPF_ALIGN_OF_U128=8 for v2/upgradeable loaders. */
     bool                loader_deprecated;
+
+    /* Optional counters (debug/perf). */
+    uint64_t            syscall_exec_count;
+
+    /* Monotonically increasing ID bumped on vm_reset(). Used to safely key
+     * per-invocation syscall caches (e.g., CPI account_info decoding). */
+    uint64_t            invocation_id;
 };
 
 /*
@@ -472,6 +507,16 @@ typedef struct {
  * Create a new VM
  */
 sol_bpf_vm_t* sol_bpf_vm_new(const sol_bpf_config_t* config);
+
+/*
+ * Reset a VM for reuse without re-registering syscalls or reallocating
+ * stack/heap.
+ *
+ * This is intended for high-throughput execution paths where creating a new
+ * VM per invocation is too expensive. It preserves the syscall registry but
+ * clears all execution state and resets memory mappings to stack+heap only.
+ */
+sol_err_t sol_bpf_vm_reset(sol_bpf_vm_t* vm, uint64_t compute_units);
 
 /*
  * Destroy VM
@@ -561,7 +606,7 @@ sol_err_t sol_bpf_memory_add_region(
 );
 
 uint8_t* sol_bpf_memory_translate(
-    const sol_bpf_memory_t* mem,
+    sol_bpf_memory_t* mem,
     uint64_t vaddr,
     size_t len,
     bool write

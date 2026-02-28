@@ -39,17 +39,21 @@ typedef struct {
     uint32_t    max_shreds_per_slot;    /* Max shreds per slot */
     uint32_t    shred_verify_threads;   /* Shred verification threads */
     uint32_t    replay_threads;         /* Replay threads */
+    uint32_t    repair_threads;         /* Repair threads */
     bool        enable_repair;          /* Enable repair requests */
     uint64_t    repair_timeout_ms;      /* Repair request timeout */
+    bool        skip_shred_verify;      /* Skip shred signature verification (unsafe) */
 } sol_tvu_config_t;
 
 #define SOL_TVU_CONFIG_DEFAULT {            \
     .base_port = 8000,                      \
     .max_shreds_per_slot = 32768,           \
-    .shred_verify_threads = 2,              \
-    .replay_threads = 4,                    \
+    .shred_verify_threads = 0,              \
+    .replay_threads = 0,                    \
+    .repair_threads = 0,                    \
     .enable_repair = true,                  \
-    .repair_timeout_ms = 400,               \
+    .repair_timeout_ms = 50,                \
+    .skip_shred_verify = false,             \
 }
 
 /*
@@ -132,6 +136,18 @@ sol_err_t sol_tvu_process_shred(
     sol_tvu_t*          tvu,
     const uint8_t*      shred,
     size_t              len
+);
+
+/*
+ * Process a batch of received shreds
+ *
+ * Used for high-throughput ingress paths to amortize locking and per-shred
+ * overhead. Semantics match sol_tvu_process_shred() for each packet.
+ */
+sol_err_t sol_tvu_process_shreds_batch(
+    sol_tvu_t*          tvu,
+    const sol_udp_pkt_t* pkts,
+    int                 count
 );
 
 /*

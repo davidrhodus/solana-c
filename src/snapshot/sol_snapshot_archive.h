@@ -84,6 +84,7 @@ typedef struct {
     bool                    verify;             /* Verify after extraction */
     bool                    preserve_paths;     /* Preserve directory structure */
     uint64_t                max_memory;         /* Max memory for decompression (0=default) */
+    sol_io_ctx_t*           io_ctx;             /* Optional IO context for archive reads */
 
     /* Optional in-memory streaming for matching regular files. */
     const char*                stream_prefix;         /* e.g. "accounts/" */
@@ -104,6 +105,7 @@ typedef struct {
     .verify = false,                            \
     .preserve_paths = true,                     \
     .max_memory = 0,                            \
+    .io_ctx = NULL,                             \
     .stream_prefix = NULL,                      \
     .stream_file_callback = NULL,               \
     .stream_chunk_callback = NULL,              \

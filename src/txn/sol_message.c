@@ -51,7 +51,8 @@ sol_message_decode_legacy(
     uint16_t num_instructions;
     SOL_DECODE_TRY(sol_decode_compact_u16(dec, &num_instructions));
 
-    if (num_instructions == 0 || num_instructions > SOL_MAX_MESSAGE_INSTRUCTIONS) {
+    /* Legacy messages can legally contain 0 instructions (they still pay fees). */
+    if (num_instructions > SOL_MAX_MESSAGE_INSTRUCTIONS) {
         return SOL_ERR_TX_MALFORMED;
     }
 
@@ -145,9 +146,13 @@ sol_message_decode_v0(
     msg->address_lookups_len = (uint8_t)num_lookups;
 
     /* Parse lookup tables (zero-copy) */
-    for (uint8_t i = 0; i < num_lookups; i++) {
-        sol_address_lookup_t tmp;
-        SOL_DECODE_TRY(sol_address_lookup_decode(dec, &tmp));
+    if (num_lookups > 0) {
+        msg->address_lookups = msg->address_lookups_storage;
+        for (uint8_t i = 0; i < num_lookups; i++) {
+            SOL_DECODE_TRY(sol_address_lookup_decode(dec, &msg->address_lookups_storage[i]));
+        }
+    } else {
+        msg->address_lookups = NULL;
     }
 
     /* Note: Address lookup table resolution requires external account data
@@ -270,6 +275,11 @@ sol_message_encode_v0(
     sol_encoder_t*        enc,
     const sol_message_t*  msg
 ) {
+    if (!enc || !msg) return SOL_ERR_INVAL;
+    if (msg->account_keys_len > 0 && msg->account_keys == NULL) return SOL_ERR_INVAL;
+    if (msg->instructions_len > 0 && msg->instructions == NULL) return SOL_ERR_INVAL;
+    if (msg->address_lookups_len > 0 && msg->address_lookups == NULL) return SOL_ERR_INVAL;
+
     /* Header */
     SOL_ENCODE_TRY(sol_message_header_encode(enc, &msg->header));
 
@@ -305,6 +315,10 @@ sol_message_encode_legacy(
     sol_encoder_t*        enc,
     const sol_message_t*  msg
 ) {
+    if (!enc || !msg) return SOL_ERR_INVAL;
+    if (msg->account_keys_len > 0 && msg->account_keys == NULL) return SOL_ERR_INVAL;
+    if (msg->instructions_len > 0 && msg->instructions == NULL) return SOL_ERR_INVAL;
+
     /* Header */
     SOL_ENCODE_TRY(sol_message_header_encode(enc, &msg->header));
 

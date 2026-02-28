@@ -16,6 +16,7 @@
 #include "../crypto/sol_lt_hash.h"
 #include "../util/sol_types.h"
 #include "../util/sol_err.h"
+#include "../util/sol_map.h"
 #include "../txn/sol_transaction.h"
 #include "../entry/sol_entry.h"
 
@@ -103,6 +104,58 @@ sol_bank_t* sol_bank_new_from_parent(
     sol_bank_t*     parent,
     sol_slot_t      slot
 );
+
+/*
+ * Seed the internal epoch vote-stakes cache used for Clock sysvar median
+ * timestamp computation.
+ *
+ * The validator already builds a vote-stake map for leader schedule and fork
+ * choice. Without seeding, the first replayed slot may spend many seconds
+ * rebuilding the same map inside bank sysvar refresh. Seeding avoids that
+ * duplicate work.
+ *
+ * The provided map is cloned; callers retain ownership of `vote_stakes`.
+ */
+sol_err_t sol_bank_seed_vote_stakes_cache(
+    sol_accounts_db_t*          accounts_db,
+    uint64_t                    epoch,
+    const sol_pubkey_map_t*     vote_stakes,
+    uint64_t                    total_stake
+);
+
+/*
+ * Seed the internal vote timestamp cache used for Clock sysvar median timestamp
+ * computation.
+ *
+ * Without this cache, bank creation may spend hundreds of milliseconds per slot
+ * loading+deserializing every vote account to extract last_timestamp fields.
+ * Seeding is typically done once per epoch during validator bootstrap.
+ */
+sol_err_t sol_bank_seed_vote_timestamp_cache(
+    sol_accounts_db_t*          accounts_db,
+    const sol_pubkey_map_t*     vote_stakes
+);
+
+/*
+ * Update the cached last_timestamp fields for a single vote account.
+ *
+ * The vote program can call this after mutating VoteState so Clock sysvar
+ * refresh avoids re-loading the account from storage.
+ */
+void sol_bank_vote_timestamp_cache_update(
+    sol_bank_t*                 bank,
+    const sol_pubkey_t*         vote_pubkey,
+    uint64_t                    last_timestamp_slot,
+    int64_t                     last_timestamp
+);
+
+/*
+ * Parallel scheduling helper: cache/invalidate upgradeable ProgramData
+ * pubkeys (derived from program accounts) to avoid repeated AccountsDB loads
+ * when building lock-sets.
+ */
+void sol_bank_programdata_cache_invalidate_program(const sol_pubkey_t* program_id);
+void sol_bank_programdata_cache_invalidate_programdata(const sol_pubkey_t* programdata_id);
 
 /*
  * Destroy bank
@@ -233,11 +286,39 @@ void sol_bank_set_accounts_lt_hash(
 );
 
 /*
+ * Apply a delta to the bank's accounts LtHash for a single account update.
+ *
+ * This is used when a known account fixup is applied after snapshot/boot
+ * (e.g. System Program). It avoids recomputing the full LtHash over the
+ * entire accounts set.
+ *
+ * @param bank   Bank to update
+ * @param pubkey Account public key
+ * @param prev   Previous account state (NULL = missing/zero)
+ * @param curr   Current account state (NULL = missing/zero)
+ * @return       true if the LtHash was updated, false otherwise
+ */
+bool sol_bank_apply_accounts_lt_hash_delta(
+    sol_bank_t*             bank,
+    const sol_pubkey_t*     pubkey,
+    const sol_account_t*    prev,
+    const sol_account_t*    curr
+);
+
+/*
  * Compute the accounts LtHash checksum (BLAKE3 digest of LtHash bytes).
  *
  * Useful for logging and parity checks against Agave.
  */
 void sol_bank_accounts_lt_hash_checksum(sol_bank_t* bank, sol_blake3_t* out_checksum);
+
+/*
+ * Copy the bank's accounts LtHash.
+ *
+ * This is the raw LtHash bytes hashed into the frozen bank hash.
+ * Returns false on invalid args.
+ */
+bool sol_bank_get_accounts_lt_hash(sol_bank_t* bank, sol_lt_hash_t* out_lt_hash);
 
 /*
  * Get genesis hash (returns NULL if not set)
@@ -298,6 +379,60 @@ sol_account_t* sol_bank_load_account_ex(
     const sol_pubkey_t*     pubkey,
     sol_slot_t*             out_stored_slot
 );
+
+/*
+ * Load a read-only "view" of an account from the bank.
+ *
+ * For AppendVec-backed AccountsDB this borrows the account data from the mmap'd
+ * file (data_borrowed=true) to avoid copying. Callers must destroy.
+ */
+sol_account_t* sol_bank_load_account_view(
+    sol_bank_t*             bank,
+    const sol_pubkey_t*     pubkey
+);
+
+/*
+ * Load a read-only "view" of an account from the bank, optionally returning the
+ * stored slot.
+ */
+sol_account_t* sol_bank_load_account_view_ex(
+    sol_bank_t*             bank,
+    const sol_pubkey_t*     pubkey,
+    sol_slot_t*             out_stored_slot
+);
+
+/*
+ * CPI-Time Account Overrides (performance + correctness)
+ *
+ * During CPI, the caller may have modified account state in its in-VM
+ * AccountInfo buffers (lamports/data/owner) that has not yet been written back
+ * to the bank.  Agave exposes these changes to the callee via a shared
+ * transaction context.
+ *
+ * In this codebase, we support an equivalent view by allowing the CPI dispatcher
+ * to push a short-lived TLS override table. Bank account loads consult the
+ * override table first, until the callee writes a given account (then the bank
+ * state becomes authoritative for that pubkey within the CPI).
+ *
+ * The override table is stack-friendly: callers build it on the stack and pass
+ * pointers valid for the duration of the CPI call. Nested CPIs push/pop
+ * overrides, forming a per-thread stack.
+ */
+typedef struct sol_bank_account_overrides {
+    const sol_pubkey_t* keys;       /* override pubkeys (len entries) */
+    const sol_account_t* accounts;  /* account snapshots (parallel to keys) */
+    uint8_t* written;              /* 0/1 flags, set to 1 when callee writes */
+    size_t len;
+
+    /* Linked list for nested CPI: top-of-stack is the innermost CPI. */
+    struct sol_bank_account_overrides* prev;
+} sol_bank_account_overrides_t;
+
+/* Push CPI account overrides for the current thread; returns previous pointer. */
+sol_bank_account_overrides_t* sol_bank_overrides_push(sol_bank_account_overrides_t* overrides);
+
+/* Restore previous CPI account overrides pointer (as returned from push). */
+void sol_bank_overrides_pop(sol_bank_account_overrides_t* prev);
 
 /*
  * Set/get the zombie filter slot.  Accounts with lamports==0 and
@@ -416,6 +551,20 @@ uint64_t sol_bank_calculate_fee(
 bool sol_bank_is_blockhash_valid(
     const sol_bank_t*   bank,
     const sol_hash_t*   blockhash
+);
+
+/*
+ * Verify a (slot, hash) pair against the bank's cached SlotHashes sysvar.
+ *
+ * This is used heavily by the Vote program; caching avoids repeatedly loading
+ * and deserializing the SlotHashes sysvar for every vote transaction.
+ *
+ * @return SOL_OK on match, SOL_ERR_SLOT_HASH_MISMATCH on mismatch.
+ */
+sol_err_t sol_bank_verify_hash_against_slot_hashes(
+    sol_bank_t*         bank,
+    sol_slot_t          slot,
+    const sol_hash_t*   hash
 );
 
 /*

@@ -507,7 +507,18 @@ encode_contact_info(sol_encoder_t* enc, const sol_contact_info_t* ci) {
     sol_socket_enc_t sockets[SOL_MAX_SOCKETS];
     size_t sockets_len = 0;
 
-    for (uint8_t i = 0; i < ci->num_sockets; i++) {
+    /* Defensive: treat corrupted/invalid num_sockets as at most SOL_MAX_SOCKETS.
+     * This avoids stack overflows in the encoding fast path and keeps gossip
+     * from crashing if a buggy caller produces malformed contact-info. */
+    uint8_t num_sockets = ci->num_sockets;
+    if (num_sockets > SOL_MAX_SOCKETS) {
+        num_sockets = SOL_MAX_SOCKETS;
+    }
+
+    for (uint8_t i = 0; i < num_sockets; i++) {
+        if (sockets_len >= SOL_MAX_SOCKETS) {
+            break;
+        }
         const sol_sockaddr_t* addr = &ci->sockets[i].addr;
         if (addr->addr.sa.sa_family != AF_INET && addr->addr.sa.sa_family != AF_INET6) {
             continue;
@@ -667,14 +678,180 @@ skip_vec_slots(sol_decoder_t* dec, uint64_t len) {
     return SOL_OK;
 }
 
+/* Minimal vote instruction decoder for gossip vote CRDS values.
+ *
+ * The CRDS Vote payload includes a full vote transaction, but it does not
+ * redundantly encode the slot/hash. We extract the last voted slot and bank
+ * hash from the vote program instruction data.
+ *
+ * Supports the mainnet-dominant compact vote-state updates (13/14) as well as
+ * legacy vote instructions (2/6). */
 static sol_err_t
-decode_transaction_skip(sol_decoder_t* dec) {
+decode_vote_instruction_last_vote(const uint8_t* data,
+                                  size_t data_len,
+                                  sol_slot_t* out_slot,
+                                  sol_hash_t* out_hash,
+                                  uint64_t* out_timestamp,
+                                  bool* out_has_timestamp) {
+    if (!data || data_len < 4 || !out_slot || !out_hash) {
+        return SOL_ERR_INVAL;
+    }
+
+    if (out_timestamp) *out_timestamp = 0;
+    if (out_has_timestamp) *out_has_timestamp = false;
+    *out_slot = 0;
+    memset(out_hash, 0, sizeof(*out_hash));
+
+    sol_decoder_t dec;
+    sol_decoder_init(&dec, data, data_len);
+
+    uint32_t instr_type = 0;
+    SOL_DECODE_TRY(sol_decode_u32(&dec, &instr_type));
+
+    /* Vote / VoteSwitch (legacy format) */
+    if (instr_type == 2u /* SOL_VOTE_INSTR_VOTE */ ||
+        instr_type == 6u /* SOL_VOTE_INSTR_VOTE_SWITCH */) {
+        uint64_t slots_len_u64 = 0;
+        SOL_DECODE_TRY(sol_decode_u64(&dec, &slots_len_u64));
+        if (slots_len_u64 == 0 || slots_len_u64 > 1024u) {
+            return SOL_ERR_MALFORMED;
+        }
+
+        sol_slot_t last_slot = 0;
+        for (uint64_t i = 0; i < slots_len_u64; i++) {
+            uint64_t slot_u64 = 0;
+            SOL_DECODE_TRY(sol_decode_u64(&dec, &slot_u64));
+            last_slot = (sol_slot_t)slot_u64;
+        }
+
+        const uint8_t* hash_bytes = NULL;
+        SOL_DECODE_TRY(sol_decode_bytes(&dec, 32, &hash_bytes));
+        memcpy(out_hash->bytes, hash_bytes, 32);
+
+        uint8_t ts_tag = 0;
+        SOL_DECODE_TRY(sol_decode_u8(&dec, &ts_tag));
+        if (ts_tag == 1) {
+            int64_t timestamp = 0;
+            SOL_DECODE_TRY(sol_decode_i64(&dec, &timestamp));
+            if (out_timestamp) *out_timestamp = (uint64_t)timestamp;
+            if (out_has_timestamp) *out_has_timestamp = true;
+        } else if (ts_tag != 0) {
+            return SOL_ERR_MALFORMED;
+        }
+
+        if (instr_type == 6u) {
+            const uint8_t* switch_proof = NULL;
+            SOL_DECODE_TRY(sol_decode_bytes(&dec, 32, &switch_proof));
+            (void)switch_proof;
+        }
+
+        *out_slot = last_slot;
+        return SOL_OK;
+    }
+
+    /* CompactUpdateVoteState / CompactUpdateVoteStateSwitch */
+    if (instr_type == 13u /* SOL_VOTE_INSTR_COMPACT_UPDATE_VOTE_STATE */ ||
+        instr_type == 14u /* SOL_VOTE_INSTR_COMPACT_UPDATE_VOTE_STATE_SWITCH */) {
+        uint64_t root_u64 = 0;
+        SOL_DECODE_TRY(sol_decode_u64(&dec, &root_u64));
+        sol_slot_t cursor = (sol_slot_t)root_u64;
+
+        uint16_t lockouts_len = 0;
+        SOL_DECODE_TRY(sol_decode_compact_u16(&dec, &lockouts_len));
+        if (lockouts_len == 0 || lockouts_len > 1024u) {
+            return SOL_ERR_MALFORMED;
+        }
+
+        sol_slot_t last_slot = 0;
+        for (uint16_t i = 0; i < lockouts_len; i++) {
+            uint8_t slot_offset = 0;
+            uint8_t conf_u8 = 0;
+            SOL_DECODE_TRY(sol_decode_u8(&dec, &slot_offset));
+            SOL_DECODE_TRY(sol_decode_u8(&dec, &conf_u8));
+            (void)conf_u8;
+
+            cursor = (sol_slot_t)(cursor + (sol_slot_t)slot_offset);
+            last_slot = cursor;
+        }
+
+        const uint8_t* hash_bytes = NULL;
+        SOL_DECODE_TRY(sol_decode_bytes(&dec, 32, &hash_bytes));
+        memcpy(out_hash->bytes, hash_bytes, 32);
+
+        uint8_t ts_tag = 0;
+        SOL_DECODE_TRY(sol_decode_u8(&dec, &ts_tag));
+        if (ts_tag == 1) {
+            int64_t timestamp = 0;
+            SOL_DECODE_TRY(sol_decode_i64(&dec, &timestamp));
+            if (out_timestamp) *out_timestamp = (uint64_t)timestamp;
+            if (out_has_timestamp) *out_has_timestamp = true;
+        } else if (ts_tag != 0) {
+            return SOL_ERR_MALFORMED;
+        }
+
+        if (instr_type == 14u) {
+            const uint8_t* switch_hash = NULL;
+            SOL_DECODE_TRY(sol_decode_bytes(&dec, 32, &switch_hash));
+            (void)switch_hash;
+        }
+
+        *out_slot = last_slot;
+        return SOL_OK;
+    }
+
+    return SOL_ERR_UNSUPPORTED;
+}
+
+static sol_err_t
+decode_transaction_vote(sol_decoder_t* dec, sol_crds_vote_t* vote) {
+    if (!dec || !vote) return SOL_ERR_INVAL;
+
     sol_transaction_t tx;
     sol_err_t err = sol_transaction_decode(dec->data + dec->pos,
                                            dec->len - dec->pos,
                                            &tx);
     if (err != SOL_OK) return err;
     if (!sol_decoder_has(dec, tx.encoded_len)) return SOL_ERR_DECODE;
+
+    /* Default: leave slot/hash zeroed if we can't decode the vote instruction. */
+    vote->slot = 0;
+    memset(vote->hash.bytes, 0, sizeof(vote->hash.bytes));
+    vote->timestamp = 0;
+
+    const sol_message_t* msg = &tx.message;
+    const sol_pubkey_t* accounts = msg->resolved_accounts ? msg->resolved_accounts : msg->account_keys;
+    size_t accounts_len = msg->resolved_accounts ? (size_t)msg->resolved_accounts_len : (size_t)msg->account_keys_len;
+
+    if (accounts && accounts_len > 0 && msg->instructions_len > 0 && msg->instructions) {
+        for (uint8_t i = 0; i < msg->instructions_len; i++) {
+            const sol_compiled_instruction_t* ix = &msg->instructions[i];
+            if (!ix) continue;
+            if ((size_t)ix->program_id_index >= accounts_len) continue;
+
+            const sol_pubkey_t* program_id = &accounts[ix->program_id_index];
+            if (!sol_pubkey_eq(program_id, &SOL_VOTE_PROGRAM_ID)) continue;
+
+            sol_slot_t voted_slot = 0;
+            sol_hash_t voted_hash = {0};
+            uint64_t ts = 0;
+            bool has_ts = false;
+            sol_err_t verr = decode_vote_instruction_last_vote(ix->data,
+                                                              (size_t)ix->data_len,
+                                                              &voted_slot,
+                                                              &voted_hash,
+                                                              &ts,
+                                                              &has_ts);
+            if (verr == SOL_OK && voted_slot != 0 && !sol_hash_is_zero(&voted_hash)) {
+                vote->slot = voted_slot;
+                vote->hash = voted_hash;
+                if (has_ts) {
+                    vote->timestamp = ts;
+                }
+                break;
+            }
+        }
+    }
+
     dec->pos += tx.encoded_len;
     return SOL_OK;
 }
@@ -704,11 +881,8 @@ decode_bitvec_u8_lsb0_skip(sol_decoder_t* dec) {
 static sol_err_t
 decode_crds_vote(sol_decoder_t* dec, sol_crds_vote_t* vote) {
     SOL_DECODE_TRY(sol_pubkey_decode(dec, &vote->from));
-    SOL_DECODE_TRY(decode_transaction_skip(dec));
+    SOL_DECODE_TRY(decode_transaction_vote(dec, vote));
     SOL_DECODE_TRY(sol_decode_u64(dec, &vote->wallclock));
-    vote->slot = 0;
-    memset(vote->hash.bytes, 0, sizeof(vote->hash.bytes));
-    vote->timestamp = 0;
     return SOL_OK;
 }
 
@@ -1009,6 +1183,25 @@ encode_crds_value_data(sol_encoder_t* enc, const sol_crds_value_t* value) {
         return SOL_ERR_UNSUPPORTED;
     }
     return SOL_ERR_UNSUPPORTED;
+}
+
+sol_err_t
+sol_gossip_crds_value_sign(sol_crds_value_t* value, const sol_keypair_t* keypair) {
+    if (!value || !keypair) {
+        return SOL_ERR_INVAL;
+    }
+
+    uint8_t buf[4096];
+    sol_encoder_t enc;
+    sol_encoder_init(&enc, buf, sizeof(buf));
+
+    sol_err_t err = encode_crds_value_data(&enc, value);
+    if (err != SOL_OK) {
+        return err;
+    }
+
+    sol_ed25519_sign(keypair, buf, sol_encoder_len(&enc), &value->signature);
+    return SOL_OK;
 }
 
 /*

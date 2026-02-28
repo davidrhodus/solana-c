@@ -14,6 +14,10 @@
 #include "util/sol_arena.h"
 #include "util/sol_slab.h"
 #include "util/sol_rpc_client.h"
+#include "util/sol_io.h"
+
+#include <fcntl.h>
+#include <unistd.h>
 
 /*
  * sol_bits tests
@@ -382,6 +386,65 @@ TEST(rpc_parse_genesis_hash_base58) {
     TEST_ASSERT_STR_EQ(out, "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp");
 }
 
+TEST(io_pread_pwrite_uring) {
+#ifdef __linux__
+    char path[] = "/tmp/solana-c-io-XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT_MSG(fd >= 0, "mkstemp failed");
+    (void)unlink(path);
+
+    sol_io_options_t opts = SOL_IO_OPTIONS_DEFAULT;
+    opts.backend = SOL_IO_BACKEND_URING;
+    opts.queue_depth = 32;
+    opts.sqpoll = false;
+
+    sol_io_ctx_t* ctx = sol_io_ctx_new(&opts);
+    TEST_ASSERT_NOT_NULL(ctx);
+
+    if (sol_io_ctx_backend(ctx) != SOL_IO_BACKEND_URING) {
+        sol_io_ctx_destroy(ctx);
+        (void)close(fd);
+        TEST_SKIP("io_uring unavailable on this host");
+    }
+
+    uint8_t w1[4096];
+    for (size_t i = 0; i < sizeof(w1); i++) {
+        w1[i] = (uint8_t)(i & 0xFFu);
+    }
+    sol_err_t err = sol_io_pwrite_all(ctx, fd, w1, sizeof(w1), 0);
+    TEST_ASSERT_EQ(err, SOL_OK);
+
+    uint8_t r1[4096];
+    memset(r1, 0, sizeof(r1));
+    err = sol_io_pread_all(ctx, fd, r1, sizeof(r1), 0);
+    TEST_ASSERT_EQ(err, SOL_OK);
+    TEST_ASSERT_MEM_EQ(r1, w1, sizeof(w1));
+
+    char a[] = "hello";
+    char b[] = "world";
+    struct iovec iov[2];
+    iov[0] = (struct iovec){ .iov_base = a, .iov_len = strlen(a) };
+    iov[1] = (struct iovec){ .iov_base = b, .iov_len = strlen(b) };
+
+    err = sol_io_pwritev_all(ctx, fd, iov, 2, 4096);
+    TEST_ASSERT_EQ(err, SOL_OK);
+
+    char out[11] = {0};
+    err = sol_io_pread_all(ctx, fd, out, 10, 4096);
+    TEST_ASSERT_EQ(err, SOL_OK);
+    TEST_ASSERT_MEM_EQ(out, "helloworld", 10);
+
+    char trunc[1];
+    err = sol_io_pread_all(ctx, fd, trunc, sizeof(trunc), 4096 + 10 + 12345);
+    TEST_ASSERT_EQ(err, SOL_ERR_TRUNCATED);
+
+    sol_io_ctx_destroy(ctx);
+    (void)close(fd);
+#else
+    TEST_SKIP("io_uring test is Linux-only");
+#endif
+}
+
 /*
  * Test suite
  */
@@ -411,6 +474,7 @@ static test_case_t util_tests[] = {
     TEST_CASE(slab_many),
     TEST_CASE(rpc_parse_cluster_nodes_shred_version),
     TEST_CASE(rpc_parse_genesis_hash_base58),
+    TEST_CASE(io_pread_pwrite_uring),
 };
 
 int main(void) {

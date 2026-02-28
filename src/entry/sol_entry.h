@@ -42,6 +42,7 @@ typedef struct {
     /* Raw transaction data (needed because transactions use zero-copy) */
     uint8_t*            raw_data;               /* Owned copy of transaction data */
     size_t              raw_data_len;
+    bool                raw_data_borrowed;      /* raw_data points into caller buffer; do not free */
 } sol_entry_t;
 
 /*
@@ -87,6 +88,20 @@ sol_err_t sol_entry_parse(
     const uint8_t*  data,
     size_t          len,
     size_t*         bytes_consumed
+);
+
+/*
+ * Parse entry from binary data, optionally borrowing transaction bytes.
+ *
+ * When copy_tx_bytes is false, transaction pointers reference the caller's
+ * buffer and the caller must keep `data` valid until sol_entry_cleanup().
+ */
+sol_err_t sol_entry_parse_ex(
+    sol_entry_t*    entry,
+    const uint8_t*  data,
+    size_t          len,
+    size_t*         bytes_consumed,
+    bool            copy_tx_bytes
 );
 
 /*
@@ -149,6 +164,19 @@ sol_err_t sol_entry_batch_parse(
     sol_entry_batch_t*  batch,
     const uint8_t*      data,
     size_t              len
+);
+
+/*
+ * Parse entries from block data, optionally borrowing transaction bytes.
+ *
+ * When copy_tx_bytes is false, transaction pointers reference the caller's
+ * buffer and the caller must keep `data` valid until sol_entry_batch_destroy().
+ */
+sol_err_t sol_entry_batch_parse_ex(
+    sol_entry_batch_t*  batch,
+    const uint8_t*      data,
+    size_t              len,
+    bool                copy_tx_bytes
 );
 
 /*

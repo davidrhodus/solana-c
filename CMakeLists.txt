@@ -55,6 +55,8 @@ add_library(sol_util STATIC
     src/util/sol_config.c
     src/util/sol_crash.c
     src/util/sol_err.c
+    src/util/sol_io.c
+    src/util/sol_io_uring.c
     src/util/sol_json.c
     src/util/sol_log.c
     src/util/sol_map.c
@@ -78,6 +80,10 @@ add_library(sol_crypto STATIC
     src/crypto/sol_sha512.c
     src/crypto/sol_ed25519.c
     src/crypto/sol_blake3.c
+    external/fd-src/src/ballet/blake3/fd_blake3.c
+    external/fd-src/src/ballet/blake3/fd_blake3_ref.c
+    external/fd-src/src/ballet/blake3/fd_blake3_sse41.c
+    external/fd-src/src/ballet/blake3/fd_blake3_avx2.c
     src/crypto/sol_lt_hash.c
     src/crypto/sol_keccak256.c
     src/crypto/sol_secp256k1.c
@@ -85,6 +91,7 @@ add_library(sol_crypto STATIC
 
 target_include_directories(sol_crypto PUBLIC
     ${CMAKE_SOURCE_DIR}/src/crypto
+    ${CMAKE_SOURCE_DIR}/external/fd-src/src/ballet
     ${SODIUM_INCLUDE_DIRS}
 )
 
@@ -318,6 +325,7 @@ endif()
 add_library(sol_runtime STATIC
     src/runtime/sol_account.c
     src/runtime/sol_accounts_db.c
+    src/runtime/sol_appendvec_index.c
     src/runtime/sol_accounts_hash.c
     src/runtime/sol_bank.c
     src/runtime/sol_compute_budget.c
@@ -645,6 +653,23 @@ target_link_libraries(sol-slot-replay PRIVATE
 )
 
 set_target_properties(sol-slot-replay PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+add_executable(sol-tx-decode
+    src/tools/sol_tx_decode_tool.c
+)
+
+target_include_directories(sol-tx-decode PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(sol-tx-decode PRIVATE
+    sol_txn
+    sol_util
+)
+
+set_target_properties(sol-tx-decode PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 

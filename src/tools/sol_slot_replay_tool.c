@@ -73,6 +73,7 @@ usage(const char* argv0) {
             "  --rocksdb-path PATH  RocksDB base dir (contains blockstore/ and accounts/)\\n"
             "  --slot SLOT          Slot to replay\\n"
             "  --variant ID         Block variant id (default: 0)\\n"
+            "  --fast               Replay using sol_bank_process_entries (parallel-capable); disables per-tx diagnostics\\n"
             "  --print N            Print up to N signature_count-miss txs (default: 20)\\n"
             "  --print-failed N     Print up to N failed vote tx summaries (default: 0)\\n"
             "  --print-failures N   Print up to N failed txs with counted sigs (default: 0)\\n"
@@ -230,12 +231,15 @@ main(int argc, char** argv) {
     char watch_pubkey_b58[SOL_PUBKEY_BASE58_LEN] = {0};
     uint32_t watch_limit = 0;
     uint32_t printed_failures = 0;
+    bool fast = false;
+    uint64_t fast_bank_replay_ms = 0;
 
     static struct option long_opts[] = {
         {"ledger", required_argument, 0, 1000},
         {"rocksdb-path", required_argument, 0, 1001},
         {"slot", required_argument, 0, 1002},
         {"variant", required_argument, 0, 1003},
+        {"fast", no_argument, 0, 1014},
         {"print", required_argument, 0, 1004},
         {"progress", no_argument, 0, 1005},
         {"print-failed", required_argument, 0, 1006},
@@ -264,6 +268,9 @@ main(int argc, char** argv) {
             break;
         case 1003:
             variant = (uint32_t)strtoul(optarg, NULL, 10);
+            break;
+        case 1014:
+            fast = true;
             break;
         case 1004:
             print_limit = (uint32_t)strtoul(optarg, NULL, 10);
@@ -415,6 +422,17 @@ main(int argc, char** argv) {
         return 1;
     }
 
+    /* Ensure we can iterate vote/stake owners efficiently when advancing
+     * sysvars (Clock stake-weighted median). Without an owner index, bank
+     * creation can devolve into a full accounts scan and take minutes. */
+    {
+        sol_err_t idx_err = sol_accounts_db_ensure_core_owner_index(accounts_db);
+        if (idx_err != SOL_OK && progress) {
+            fprintf(stderr, "warning: failed to build core owner index: %s\\n", sol_err_str(idx_err));
+            fflush(stderr);
+        }
+    }
+
     if (progress) {
         uint64_t elapsed_ms = now_ms_monotonic() - t0_ms;
         fprintf(stderr,
@@ -540,6 +558,13 @@ main(int argc, char** argv) {
     if (bs_state.flags & SOL_ACCOUNTS_DB_BOOTSTRAP_HAS_BLOCKHASH) {
         sol_bank_set_blockhash(root_bank, &bs_state.blockhash);
     }
+    if (bs_state.flags & SOL_ACCOUNTS_DB_BOOTSTRAP_HAS_ACCOUNTS_LT_HASH) {
+        sol_bank_set_accounts_lt_hash(root_bank, &bs_state.accounts_lt_hash);
+    } else if (progress) {
+        fprintf(stderr,
+                "warning: AccountsDB bootstrap state missing accounts LtHash; child bank creation may be slow\n");
+        fflush(stderr);
+    }
     if (bs_state.flags & SOL_ACCOUNTS_DB_BOOTSTRAP_HAS_BANK_HASH) {
         sol_bank_set_bank_hash(root_bank, &bs_state.bank_hash);
     }
@@ -628,6 +653,155 @@ main(int argc, char** argv) {
     bool focus_writable[SOL_MAX_MESSAGE_ACCOUNTS];
     bool focus_signer[SOL_MAX_MESSAGE_ACCOUNTS];
     size_t focus_key_len = 0;
+
+    if (fast && (have_focus || have_watch)) {
+        fprintf(stderr, "error: --fast is incompatible with --focus/--watch-pubkey diagnostics\\n");
+        sol_bank_destroy(bank);
+        sol_bank_destroy(root_bank);
+        sol_accounts_db_destroy(accounts_db);
+        sol_entry_batch_destroy(batch);
+        sol_block_destroy(block);
+        sol_blockstore_destroy(bs);
+        return 1;
+    }
+
+    if (fast) {
+        uint64_t t_replay0_ms = now_ms_monotonic();
+        sol_err_t perr = sol_bank_process_entries(bank, batch);
+        fast_bank_replay_ms = now_ms_monotonic() - t_replay0_ms;
+        if (perr != SOL_OK) {
+            fprintf(stderr, "error: sol_bank_process_entries failed: %s\\n", sol_err_str(perr));
+            sol_bank_destroy(bank);
+            sol_bank_destroy(root_bank);
+            sol_accounts_db_destroy(accounts_db);
+            sol_entry_batch_destroy(batch);
+            sol_block_destroy(block);
+            sol_blockstore_destroy(bs);
+            return 1;
+        }
+
+        for (size_t ei = 0; ei < batch->num_entries; ei++) {
+            const sol_entry_t* entry = &batch->entries[ei];
+            for (uint32_t ti = 0; ti < entry->num_transactions; ti++) {
+                const sol_transaction_t* tx = &entry->transactions[ti];
+                const sol_signature_t* sig = sol_transaction_signature(tx);
+                sol_tx_status_entry_t st = {0};
+                bool found = sig && sol_bank_get_tx_status(bank, sig, &st);
+                sol_err_t status = found ? st.status : SOL_ERR_NOTFOUND;
+                uint8_t sig_len = tx->signatures_len;
+
+                /* Optional (post-hoc) per-tx diagnostics in --fast mode.  This
+                 * prints from recorded tx-status entries after replay. */
+                if (print_failures > 0 &&
+                    printed_failures < print_failures &&
+                    status != SOL_OK &&
+                    found &&
+                    st.fee != 0 &&
+                    (!have_print_failures_status || (int)status == print_failures_status)) {
+                    char sig_b58[SOL_SIGNATURE_BASE58_LEN] = {0};
+                    if (sig && sol_signature_to_base58(sig, sig_b58, sizeof(sig_b58)) != SOL_OK) {
+                        sig_b58[0] = '\0';
+                    }
+
+                    fprintf(stdout,
+                            "fail: sig=%s status=%d(%s) sig_len=%u fee=%" PRIu64 " cu=%" PRIu64 "\n",
+                            sig_b58[0] ? sig_b58 : "(unknown)",
+                            (int)status,
+                            sol_err_str(status),
+                            (unsigned)sig_len,
+                            (uint64_t)st.fee,
+                            (uint64_t)st.compute_units);
+                    fflush(stdout);
+                    printed_failures++;
+                }
+
+                if (printed < print_limit && (!found || st.fee == 0)) {
+                    char sig_b58[SOL_SIGNATURE_BASE58_LEN] = {0};
+                    if (sig && sol_signature_to_base58(sig, sig_b58, sizeof(sig_b58)) != SOL_OK) {
+                        sig_b58[0] = '\0';
+                    }
+
+                    fprintf(stdout,
+                            "miss: sig=%s status=%d(%s) sig_len=%u found=%s fee=%" PRIu64 " cu=%" PRIu64 "\n",
+                            sig_b58[0] ? sig_b58 : "(unknown)",
+                            (int)status,
+                            sol_err_str(status),
+                            (unsigned)sig_len,
+                            found ? "yes" : "no",
+                            found ? (uint64_t)st.fee : 0u,
+                            found ? (uint64_t)st.compute_units : 0u);
+                    fflush(stdout);
+                    printed++;
+                }
+
+                /* Count successes/failures using recorded status. */
+                if (status == SOL_OK) {
+                    ok_tx++;
+                } else {
+                    fail_tx++;
+                    bucket_add(fail_buckets, &fail_bucket_len, fail_bucket_cap, status, sig_len);
+
+                    sol_pubkey_t resolved_keys[SOL_MAX_MESSAGE_ACCOUNTS];
+                    bool resolved_writable[SOL_MAX_MESSAGE_ACCOUNTS];
+                    bool resolved_signer[SOL_MAX_MESSAGE_ACCOUNTS];
+                    size_t resolved_len = 0;
+                    const sol_pubkey_t* blame = NULL;
+
+                    sol_err_t resolve_err = sol_bank_resolve_transaction_accounts(
+                        bank,
+                        tx,
+                        resolved_keys,
+                        resolved_writable,
+                        resolved_signer,
+                        SOL_MAX_MESSAGE_ACCOUNTS,
+                        &resolved_len);
+
+                    if (resolve_err == SOL_OK && resolved_len > 0) {
+                        for (uint8_t ix_i = 0; ix_i < tx->message.instructions_len; ix_i++) {
+                            const sol_compiled_instruction_t* ix = &tx->message.instructions[ix_i];
+                            if (ix->program_id_index >= resolved_len) {
+                                continue;
+                            }
+                            const sol_pubkey_t* pid = &resolved_keys[ix->program_id_index];
+                            if (sol_pubkey_eq(pid, &SOL_COMPUTE_BUDGET_ID)) {
+                                continue;
+                            }
+                            blame = pid;
+                            break;
+                        }
+
+                        if (!blame && tx->message.instructions_len > 0) {
+                            const sol_compiled_instruction_t* ix = &tx->message.instructions[0];
+                            if (ix->program_id_index < resolved_len) {
+                                blame = &resolved_keys[ix->program_id_index];
+                            }
+                        }
+
+                        if (blame) {
+                            program_bucket_add(fail_programs,
+                                               &fail_program_len,
+                                               fail_program_cap,
+                                               blame,
+                                               sig_len);
+                        }
+                    } else {
+                        fail_program_resolve_err++;
+                    }
+                }
+
+                /* Best-effort: treat nonzero fee as "signature_count was incremented". */
+                if (found && st.fee != 0) {
+                    counted_sig += (uint64_t)sig_len;
+                } else {
+                    miss_tx++;
+                    miss_sig += (uint64_t)sig_len;
+                    bucket_add(buckets, &bucket_len, bucket_cap, status, sig_len);
+                }
+            }
+        }
+
+        goto replay_done;
+    }
 
     for (size_t ei = 0; ei < batch->num_entries; ei++) {
         const sol_entry_t* entry = &batch->entries[ei];
@@ -1352,6 +1526,8 @@ replay_done:
     }
 
     uint64_t bank_sig_count = sol_bank_signature_count(bank);
+    sol_bank_stats_t bank_stats = {0};
+    sol_bank_stats(bank, &bank_stats);
 
     fprintf(stdout, "\\n");
     fprintf(stdout, "slot=%" PRIu64 " variant=%u\\n", slot, (unsigned)variant);
@@ -1359,7 +1535,26 @@ replay_done:
             parsed_tx_total, parsed_sig_total);
     fprintf(stdout, "bank_signature_count=%" PRIu64 " counted_sig=%" PRIu64 " missing_sig=%" PRIu64 " missing_txs=%" PRIu64 "\\n",
             bank_sig_count, counted_sig, miss_sig, miss_tx);
+    fprintf(stdout,
+            "bank_stats: tx_processed=%" PRIu64 " tx_succeeded=%" PRIu64 " tx_failed=%" PRIu64
+            " rejected_sanitize=%" PRIu64 " rejected_duplicate=%" PRIu64 " rejected_v0_resolve=%" PRIu64
+            " rejected_compute_budget=%" PRIu64 " rejected_blockhash=%" PRIu64 " rejected_fee_payer_missing=%" PRIu64
+            " rejected_insufficient_funds=%" PRIu64 " rejected_signature=%" PRIu64 "\\n",
+            bank_stats.transactions_processed,
+            bank_stats.transactions_succeeded,
+            bank_stats.transactions_failed,
+            bank_stats.rejected_sanitize,
+            bank_stats.rejected_duplicate,
+            bank_stats.rejected_v0_resolve,
+            bank_stats.rejected_compute_budget,
+            bank_stats.rejected_blockhash,
+            bank_stats.rejected_fee_payer_missing,
+            bank_stats.rejected_insufficient_funds,
+            bank_stats.rejected_signature);
     fprintf(stdout, "tx_ok=%" PRIu64 " tx_fail=%" PRIu64 "\\n", ok_tx, fail_tx);
+    if (fast) {
+        fprintf(stdout, "bank_replay_ms=%" PRIu64 "\\n", fast_bank_replay_ms);
+    }
 
     if (parsed_sig_total >= bank_sig_count) {
         fprintf(stdout, "sig_total_diff=%" PRIu64 "\\n", (parsed_sig_total - bank_sig_count));
@@ -1440,12 +1635,22 @@ replay_done:
         }
     }
 
+    uint64_t cleanup_start_ms = 0;
+    if (fast) {
+        cleanup_start_ms = now_ms_monotonic();
+    }
+
     sol_bank_destroy(bank);
     sol_bank_destroy(root_bank);
     sol_accounts_db_destroy(accounts_db);
     sol_entry_batch_destroy(batch);
     sol_block_destroy(block);
     sol_blockstore_destroy(bs);
+
+    if (fast) {
+        uint64_t cleanup_ms = now_ms_monotonic() - cleanup_start_ms;
+        fprintf(stdout, "cleanup_ms=%" PRIu64 "\\n", cleanup_ms);
+    }
 
     return 0;
 }

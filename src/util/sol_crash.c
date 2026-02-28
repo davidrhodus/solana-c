@@ -72,5 +72,13 @@ sol_crash_install_handlers(void) {
     (void)sigaction(SIGILL, &sa, NULL);
     (void)sigaction(SIGFPE, &sa, NULL);
     (void)sigaction(SIGTRAP, &sa, NULL);
-}
 
+    /* Network-heavy processes should not die on a broken pipe while sending an
+     * HTTP/WebSocket response to a client that disconnected. */
+    struct sigaction ign;
+    memset(&ign, 0, sizeof(ign));
+    ign.sa_handler = SIG_IGN;
+    sigemptyset(&ign.sa_mask);
+    ign.sa_flags = 0;
+    (void)sigaction(SIGPIPE, &ign, NULL);
+}

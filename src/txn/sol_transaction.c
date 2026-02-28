@@ -79,6 +79,13 @@ sol_transaction_encode(
     if (tx == NULL || out == NULL || written == NULL) {
         return SOL_ERR_INVAL;
     }
+    if (tx->signatures_len > 0 && tx->signatures == NULL) {
+        return SOL_ERR_INVAL;
+    }
+    if (tx->message.version != SOL_MESSAGE_VERSION_LEGACY &&
+        tx->message.version != SOL_MESSAGE_VERSION_V0) {
+        return SOL_ERR_INVAL;
+    }
 
     sol_encoder_t enc;
     sol_encoder_init(&enc, out, out_len);

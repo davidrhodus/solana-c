@@ -78,9 +78,7 @@ sol_poh_hash_n(const sol_hash_t* start, uint64_t num_hashes, sol_hash_t* out) {
 
     sol_hash_t current = *start;
 
-    for (uint64_t i = 0; i < num_hashes; i++) {
-        sol_sha256_32bytes(current.bytes, current.bytes);
-    }
+    sol_sha256_32bytes_repeated(current.bytes, num_hashes);
 
     *out = current;
 }

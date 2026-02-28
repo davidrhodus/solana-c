@@ -10,9 +10,14 @@
 #include "../runtime/sol_leader_schedule.h"
 #include "../programs/sol_vote_program.h"
 #include "../programs/sol_stake_program.h"
+#include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#ifdef __linux__
+#include <sys/socket.h>
+#include <sys/uio.h>
+#endif
 
 /*
  * Slot tracking entry
@@ -56,6 +61,8 @@ struct sol_turbine {
     void*                   slot_callback_ctx;
     sol_turbine_shred_cb    shred_callback;
     void*                   shred_callback_ctx;
+    sol_turbine_shred_batch_cb shred_batch_callback;
+    void*                      shred_batch_callback_ctx;
 
     /* Statistics */
     sol_turbine_stats_t     stats;
@@ -294,7 +301,63 @@ retransmit_shred(sol_turbine_t* turbine, sol_slot_entry_t* entry,
     size_t num_children = sol_turbine_tree_children(
         entry->tree, children, SOL_TURBINE_DATA_PLANE_FANOUT);
 
-    /* Send to each child */
+    if (num_children == 0) {
+        return;
+    }
+
+#ifdef __linux__
+    /* Fast path: `sendmmsg` avoids one syscall per child while reusing the
+     * same shred buffer for all destinations. */
+    int fd = sol_udp_fd(turbine->tvu_sock);
+    if (fd >= 0) {
+        size_t off = 0;
+        while (off < num_children) {
+            int batch = (int)(num_children - off);
+            if (batch > SOL_NET_BATCH_SIZE) {
+                batch = SOL_NET_BATCH_SIZE;
+            }
+
+            struct mmsghdr msgs[SOL_NET_BATCH_SIZE];
+            struct iovec iovs[SOL_NET_BATCH_SIZE];
+            memset(msgs, 0, sizeof(msgs));
+
+            for (int i = 0; i < batch; i++) {
+                const sol_turbine_node_t* child = children[off + (size_t)i];
+
+                iovs[i].iov_base = (void*)data;
+                iovs[i].iov_len = len;
+
+                msgs[i].msg_hdr.msg_name = (void*)&child->tvu_addr.addr;
+                msgs[i].msg_hdr.msg_namelen = child->tvu_addr.len;
+                msgs[i].msg_hdr.msg_iov = &iovs[i];
+                msgs[i].msg_hdr.msg_iovlen = 1;
+            }
+
+            int sent = sendmmsg(fd, msgs, (unsigned)batch, 0);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                break;
+            }
+            if (sent == 0) {
+                break;
+            }
+
+            turbine->stats.shreds_retransmitted += (uint64_t)sent;
+            turbine->stats.bytes_sent += (uint64_t)sent * (uint64_t)len;
+
+            off += (size_t)sent;
+            if (sent < batch) {
+                /* Socket backpressure; retry on next tick. */
+                break;
+            }
+        }
+        return;
+    }
+#endif
+
+    /* Portable fallback: per-child send. */
     for (size_t i = 0; i < num_children; i++) {
         sol_err_t err = sol_udp_send(turbine->tvu_sock, data, len,
                                      &children[i]->tvu_addr);
@@ -411,6 +474,11 @@ sol_turbine_start(sol_turbine_t* turbine, uint16_t tvu_port) {
     sol_udp_config_t udp_cfg = SOL_UDP_CONFIG_DEFAULT;
     udp_cfg.bind_port = tvu_port;
     udp_cfg.nonblocking = true;
+    /* Mainnet shred feeds can exceed tens of thousands of packets/sec. Use a
+     * large socket receive buffer to reduce kernel-level drops when user-space
+     * is momentarily busy (signature verify, RocksDB, etc.). */
+    udp_cfg.recv_buf = 128u * 1024u * 1024u;
+    udp_cfg.send_buf = 128u * 1024u * 1024u;
 
     turbine->tvu_sock = sol_udp_new(&udp_cfg);
     if (!turbine->tvu_sock) {
@@ -509,21 +577,45 @@ sol_turbine_run_once(sol_turbine_t* turbine, uint32_t timeout_ms) {
     }
 
     /* Drain TVU socket to avoid dropping shreds under load. */
-    enum { SOL_TURBINE_RECV_BUDGET = 128 };
-    for (size_t i = 0; i < SOL_TURBINE_RECV_BUDGET; i++) {
-        sol_sockaddr_t src;
-        size_t len = sizeof(turbine->recv_buf);
+    enum { SOL_TURBINE_RECV_BUDGET = 32768 };
+    size_t received = 0;
+    sol_udp_pkt_t pkts[SOL_NET_BATCH_SIZE];
+    const bool fast_ingress =
+        (!turbine->config.enable_retransmit) &&
+        (turbine->shred_batch_callback || turbine->shred_callback) &&
+        !turbine->slot_callback;
 
-        sol_err_t err = sol_udp_recv(turbine->tvu_sock, turbine->recv_buf,
-                                     &len, &src);
-        if (err == SOL_OK) {
-            sol_turbine_receive_shred(turbine, turbine->recv_buf, len, &src);
-            continue;
+    while (received < SOL_TURBINE_RECV_BUDGET) {
+        int n = sol_udp_recv_batch(turbine->tvu_sock, pkts, SOL_NET_BATCH_SIZE);
+        if (n < 0) {
+            return SOL_ERR_IO;
         }
-        if (err != SOL_ERR_AGAIN) {
-            return err;
+        if (n == 0) {
+            break;
         }
-        break;
+        received += (size_t)n;
+        if (fast_ingress && turbine->shred_batch_callback) {
+            uint64_t bytes = 0;
+            for (int i = 0; i < n; i++) {
+                bytes += pkts[i].len;
+            }
+            turbine->stats.shreds_received += (uint64_t)n;
+            turbine->stats.bytes_received += bytes;
+            turbine->shred_batch_callback(turbine->shred_batch_callback_ctx, pkts, n);
+        } else {
+            for (int i = 0; i < n; i++) {
+                if (fast_ingress) {
+                    turbine->stats.shreds_received++;
+                    turbine->stats.bytes_received += pkts[i].len;
+                    turbine->shred_callback(turbine->shred_callback_ctx,
+                                            pkts[i].data,
+                                            pkts[i].len,
+                                            &pkts[i].addr);
+                } else {
+                    (void)sol_turbine_receive_shred(turbine, pkts[i].data, pkts[i].len, &pkts[i].addr);
+                }
+            }
+        }
     }
 
     return SOL_OK;
@@ -545,6 +637,15 @@ sol_turbine_set_shred_callback(sol_turbine_t* turbine,
     if (!turbine) return;
     turbine->shred_callback = callback;
     turbine->shred_callback_ctx = ctx;
+}
+
+void
+sol_turbine_set_shred_batch_callback(sol_turbine_t* turbine,
+                                     sol_turbine_shred_batch_cb callback,
+                                     void* ctx) {
+    if (!turbine) return;
+    turbine->shred_batch_callback = callback;
+    turbine->shred_batch_callback_ctx = ctx;
 }
 
 sol_err_t

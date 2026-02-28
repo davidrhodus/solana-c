@@ -397,6 +397,91 @@ TEST(entry_batch_parse_multiple_segments_with_padding) {
     sol_entry_batch_destroy(batch);
 }
 
+TEST(entry_batch_parse_multiple_segments_short_padding_straddle_resync_zerocopy) {
+    /* Regression: when padding between Vec<Entry> segments is shorter than the
+     * 8-byte bincode length prefix, a naive u64 read can straddle the next
+     * segment header and produce a plausible (but wrong) entry_count. Ensure
+     * the parser resynchronizes rather than failing with a decode error.
+     *
+     * This test specifically exercises the zero-copy decode path used during
+     * replay/catchup (copy_tx_bytes=false). */
+    const size_t cap = 32768;
+    uint8_t* buf = sol_calloc(1, cap);
+    TEST_ASSERT(buf != NULL);
+
+    size_t offset = 0;
+    uint64_t num_tx = 0;
+
+    /* Segment 1: 1 tick entry */
+    uint64_t entry_count = 1;
+    memcpy(buf + offset, &entry_count, 8);
+    offset += 8;
+
+    uint64_t num_hashes = 11;
+    memcpy(buf + offset, &num_hashes, 8);
+    offset += 8;
+    memset(buf + offset, 0xA1, 32);
+    offset += 32;
+    memcpy(buf + offset, &num_tx, 8);
+    offset += 8;
+
+    /* Insert 1 byte of padding so the next u64 read straddles the next segment header. */
+    buf[offset++] = 0x00;
+
+    /* Segment 2: 2 tick entries */
+    entry_count = 2;
+    memcpy(buf + offset, &entry_count, 8);
+    offset += 8;
+
+    num_hashes = 22;
+    memcpy(buf + offset, &num_hashes, 8);
+    offset += 8;
+    memset(buf + offset, 0xB2, 32);
+    offset += 32;
+    memcpy(buf + offset, &num_tx, 8);
+    offset += 8;
+
+    num_hashes = 33;
+    memcpy(buf + offset, &num_hashes, 8);
+    offset += 8;
+    memset(buf + offset, 0xC3, 32);
+    offset += 32;
+    memcpy(buf + offset, &num_tx, 8);
+    offset += 8;
+
+    /* Place a third segment far enough away to make the straddled entry_count
+     * appear plausible under min-size heuristics (segment_remaining is large). */
+    size_t seg3_off = 30000;
+    TEST_ASSERT(seg3_off + 8 + 48 <= cap);
+
+    offset = seg3_off;
+    entry_count = 1;
+    memcpy(buf + offset, &entry_count, 8);
+    offset += 8;
+
+    num_hashes = 44;
+    memcpy(buf + offset, &num_hashes, 8);
+    offset += 8;
+    memset(buf + offset, 0xD4, 32);
+    offset += 32;
+    memcpy(buf + offset, &num_tx, 8);
+    offset += 8;
+
+    sol_entry_batch_t* batch = sol_entry_batch_new(0);
+    TEST_ASSERT(batch != NULL);
+
+    sol_err_t err = sol_entry_batch_parse_ex(batch, buf, offset, false);
+    TEST_ASSERT_EQ(err, SOL_OK);
+    TEST_ASSERT_EQ(batch->num_entries, 4);
+    TEST_ASSERT_EQ(batch->entries[0].num_hashes, 11);
+    TEST_ASSERT_EQ(batch->entries[1].num_hashes, 22);
+    TEST_ASSERT_EQ(batch->entries[2].num_hashes, 33);
+    TEST_ASSERT_EQ(batch->entries[3].num_hashes, 44);
+
+    sol_entry_batch_destroy(batch);
+    sol_free(buf);
+}
+
 TEST(entry_batch_transaction_count) {
     sol_entry_batch_t* batch = sol_entry_batch_new(0);
     TEST_ASSERT(batch != NULL);
@@ -437,6 +522,140 @@ TEST(entry_batch_tick_count) {
 /*
  * Hash computation tests
  */
+
+static void
+hash_leaf_signature_test(const sol_signature_t* sig, sol_hash_t* out) {
+    sol_sha256_ctx_t ctx;
+    sol_sha256_init(&ctx);
+    const uint8_t prefix = 0;
+    sol_sha256_update(&ctx, &prefix, 1);
+    sol_sha256_update(&ctx, sig->bytes, 64);
+    sol_sha256_final_bytes(&ctx, out->bytes);
+}
+
+static void
+hash_intermediate_test(const sol_hash_t* left, const sol_hash_t* right, sol_hash_t* out) {
+    sol_sha256_ctx_t ctx;
+    sol_sha256_init(&ctx);
+    const uint8_t prefix = 1;
+    sol_sha256_update(&ctx, &prefix, 1);
+    sol_sha256_update(&ctx, left->bytes, 32);
+    sol_sha256_update(&ctx, right->bytes, 32);
+    sol_sha256_final_bytes(&ctx, out->bytes);
+}
+
+TEST(entry_transaction_merkle_root_single_signature) {
+    sol_signature_t sig = {0};
+    for (size_t i = 0; i < sizeof(sig.bytes); i++) {
+        sig.bytes[i] = (uint8_t)i;
+    }
+
+    sol_transaction_t* txs = sol_calloc(1, sizeof(*txs));
+    TEST_ASSERT(txs != NULL);
+    sol_transaction_init(&txs[0]);
+    txs[0].signatures = &sig;
+    txs[0].signatures_len = 1;
+
+    sol_entry_t entry;
+    sol_entry_init(&entry);
+    entry.num_hashes = 0;
+    entry.num_transactions = 1;
+    entry.transactions = txs;
+    entry.transactions_capacity = 1;
+
+    sol_hash_t got = {0};
+    sol_entry_transaction_merkle_root(&entry, &got);
+
+    sol_hash_t expected = {0};
+    hash_leaf_signature_test(&sig, &expected);
+
+    TEST_ASSERT_MEM_EQ(got.bytes, expected.bytes, 32);
+
+    sol_entry_cleanup(&entry);
+}
+
+TEST(entry_transaction_merkle_root_three_signatures_duplicates_last) {
+    sol_signature_t sigs[3] = {{0}};
+    for (size_t s = 0; s < 3; s++) {
+        for (size_t i = 0; i < sizeof(sigs[s].bytes); i++) {
+            sigs[s].bytes[i] = (uint8_t)(1u + (uint8_t)(s * 64u + i));
+        }
+    }
+
+    sol_transaction_t* txs = sol_calloc(1, sizeof(*txs));
+    TEST_ASSERT(txs != NULL);
+    sol_transaction_init(&txs[0]);
+    txs[0].signatures = sigs;
+    txs[0].signatures_len = 3;
+
+    sol_entry_t entry;
+    sol_entry_init(&entry);
+    entry.num_hashes = 0;
+    entry.num_transactions = 1;
+    entry.transactions = txs;
+    entry.transactions_capacity = 1;
+
+    sol_hash_t got = {0};
+    sol_entry_transaction_merkle_root(&entry, &got);
+
+    sol_hash_t leaf0 = {0}, leaf1 = {0}, leaf2 = {0};
+    hash_leaf_signature_test(&sigs[0], &leaf0);
+    hash_leaf_signature_test(&sigs[1], &leaf1);
+    hash_leaf_signature_test(&sigs[2], &leaf2);
+
+    sol_hash_t node0 = {0}, node1 = {0};
+    hash_intermediate_test(&leaf0, &leaf1, &node0);
+    hash_intermediate_test(&leaf2, &leaf2, &node1);
+
+    sol_hash_t expected = {0};
+    hash_intermediate_test(&node0, &node1, &expected);
+
+    TEST_ASSERT_MEM_EQ(got.bytes, expected.bytes, 32);
+
+    sol_entry_cleanup(&entry);
+}
+
+TEST(entry_compute_hash_transaction_entry_matches_spec) {
+    sol_signature_t sig = {0};
+    for (size_t i = 0; i < sizeof(sig.bytes); i++) {
+        sig.bytes[i] = (uint8_t)(0xA0u + (uint8_t)i);
+    }
+
+    sol_transaction_t* txs = sol_calloc(1, sizeof(*txs));
+    TEST_ASSERT(txs != NULL);
+    sol_transaction_init(&txs[0]);
+    txs[0].signatures = &sig;
+    txs[0].signatures_len = 1;
+
+    sol_entry_t entry;
+    sol_entry_init(&entry);
+    entry.num_hashes = 2;
+    entry.num_transactions = 1;
+    entry.transactions = txs;
+    entry.transactions_capacity = 1;
+
+    sol_hash_t prev_hash = {0};
+    memset(prev_hash.bytes, 0x11, 32);
+
+    sol_hash_t got = {0};
+    sol_entry_compute_hash(&entry, &prev_hash, &got);
+
+    sol_hash_t mixin = {0};
+    hash_leaf_signature_test(&sig, &mixin);
+
+    sol_hash_t cur = prev_hash;
+    sol_sha256_32bytes_repeated(cur.bytes, 1);
+
+    sol_sha256_ctx_t ctx;
+    sol_sha256_init(&ctx);
+    sol_sha256_update(&ctx, cur.bytes, 32);
+    sol_sha256_update(&ctx, mixin.bytes, 32);
+    sol_sha256_final_bytes(&ctx, cur.bytes);
+
+    TEST_ASSERT_MEM_EQ(got.bytes, cur.bytes, 32);
+
+    sol_entry_cleanup(&entry);
+}
 
 TEST(entry_compute_hash_deterministic) {
     sol_entry_t entry1, entry2;
@@ -549,8 +768,12 @@ static test_case_t entry_tests[] = {
     TEST_CASE(entry_batch_parse_allows_trailing_padding_bytes),
     TEST_CASE(entry_batch_parse_multiple_segments),
     TEST_CASE(entry_batch_parse_multiple_segments_with_padding),
+    TEST_CASE(entry_batch_parse_multiple_segments_short_padding_straddle_resync_zerocopy),
     TEST_CASE(entry_batch_transaction_count),
     TEST_CASE(entry_batch_tick_count),
+    TEST_CASE(entry_transaction_merkle_root_single_signature),
+    TEST_CASE(entry_transaction_merkle_root_three_signatures_duplicates_last),
+    TEST_CASE(entry_compute_hash_transaction_entry_matches_spec),
     TEST_CASE(entry_compute_hash_deterministic),
     TEST_CASE(entry_compute_hash_different_num_hashes),
     TEST_CASE(entry_compute_hash_different_prev_hash),

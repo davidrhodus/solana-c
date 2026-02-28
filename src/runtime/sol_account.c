@@ -4,8 +4,50 @@
 
 #include "sol_account.h"
 #include "../util/sol_alloc.h"
+#include "../util/sol_slab.h"
 #include "../crypto/sol_sha256.h"
 #include <string.h>
+
+/* ---- sol_account_t allocation ----
+ *
+ * Replay loads/destroys accounts at extremely high rates. Avoid malloc/free
+ * overhead by using a per-thread slab allocator for sol_account_t objects.
+ *
+ * We intentionally do not reclaim the slab at thread-exit: validator worker
+ * threads are long-lived and the slab footprint is small relative to the
+ * overall process.
+ */
+
+static __thread sol_slab_t* g_tls_account_slab = NULL;
+
+static inline sol_slab_t*
+account_slab_get_or_init(void) {
+    if (g_tls_account_slab) {
+        return g_tls_account_slab;
+    }
+
+    sol_slab_t* slab = sol_slab_new(sizeof(sol_account_t), _Alignof(sol_account_t), 0);
+    if (!slab) {
+        return NULL;
+    }
+    g_tls_account_slab = slab;
+    return slab;
+}
+
+sol_account_t*
+sol_account_alloc(void) {
+    sol_slab_t* slab = account_slab_get_or_init();
+    if (!slab) return NULL;
+    return (sol_account_t*)sol_slab_calloc(slab);
+}
+
+static inline void
+sol_account_free_struct(sol_account_t* account) {
+    if (!account) return;
+    sol_slab_t* slab = account_slab_get_or_init();
+    if (!slab) return; /* OOM: leak rather than freeing an interior pointer. */
+    sol_slab_free(slab, account);
+}
 
 /*
  * Well-known program IDs
@@ -28,7 +70,7 @@ sol_account_init(sol_account_t* account) {
 
 sol_account_t*
 sol_account_new(uint64_t lamports, size_t data_len, const sol_pubkey_t* owner) {
-    sol_account_t* account = sol_calloc(1, sizeof(sol_account_t));
+    sol_account_t* account = sol_account_alloc();
     if (!account) return NULL;
 
     account->meta.lamports = lamports;
@@ -37,7 +79,7 @@ sol_account_new(uint64_t lamports, size_t data_len, const sol_pubkey_t* owner) {
     if (data_len > 0) {
         account->data = sol_calloc(1, data_len);
         if (!account->data) {
-            sol_free(account);
+            sol_account_free_struct(account);
             return NULL;
         }
     }
@@ -53,7 +95,7 @@ sol_account_t*
 sol_account_clone(const sol_account_t* account) {
     if (!account) return NULL;
 
-    sol_account_t* clone = sol_calloc(1, sizeof(sol_account_t));
+    sol_account_t* clone = sol_account_alloc();
     if (!clone) return NULL;
 
     clone->meta = account->meta;
@@ -61,7 +103,7 @@ sol_account_clone(const sol_account_t* account) {
     if (account->meta.data_len > 0 && account->data) {
         clone->data = sol_alloc(account->meta.data_len);
         if (!clone->data) {
-            sol_free(clone);
+            sol_account_free_struct(clone);
             return NULL;
         }
         memcpy(clone->data, account->data, account->meta.data_len);
@@ -74,17 +116,22 @@ void
 sol_account_destroy(sol_account_t* account) {
     if (!account) return;
 
-    sol_free(account->data);
-    sol_free(account);
+    if (account->data && !account->data_borrowed) {
+        sol_free(account->data);
+    }
+    sol_account_free_struct(account);
 }
 
 void
 sol_account_cleanup(sol_account_t* account) {
     if (!account) return;
 
-    sol_free(account->data);
+    if (account->data && !account->data_borrowed) {
+        sol_free(account->data);
+    }
     account->data = NULL;
     account->meta.data_len = 0;
+    account->data_borrowed = false;
 }
 
 sol_err_t
@@ -93,28 +140,57 @@ sol_account_resize(sol_account_t* account, size_t new_len) {
     if (new_len > SOL_ACCOUNT_MAX_DATA_SIZE) return SOL_ERR_TOO_LARGE;
 
     if (new_len == account->meta.data_len) {
+        /* Detach borrowed (view) buffers on resize even if the size is unchanged.
+         * Callers typically resize before mutating account data. */
+        if (new_len > 0 && account->data && account->data_borrowed) {
+            uint8_t* new_data = sol_alloc(new_len);
+            if (!new_data) return SOL_ERR_NOMEM;
+            memcpy(new_data, account->data, new_len);
+            account->data = new_data;
+            account->data_borrowed = false;
+        }
         return SOL_OK;
     }
 
     if (new_len == 0) {
-        sol_free(account->data);
+        if (account->data && !account->data_borrowed) {
+            sol_free(account->data);
+        }
         account->data = NULL;
         account->meta.data_len = 0;
+        account->data_borrowed = false;
         return SOL_OK;
     }
 
-    /* Reallocate */
-    uint8_t* new_data = sol_realloc(account->data, new_len);
-    if (!new_data) return SOL_ERR_NOMEM;
+    if (account->data_borrowed) {
+        /* Copy-on-write: can't realloc a borrowed/view buffer. */
+        uint8_t* new_data = sol_calloc(1, new_len);
+        if (!new_data) return SOL_ERR_NOMEM;
 
-    /* Zero the new portion if growing */
-    if (new_len > account->meta.data_len) {
-        memset(new_data + account->meta.data_len, 0,
-               new_len - account->meta.data_len);
+        if (account->data && account->meta.data_len > 0) {
+            size_t to_copy = account->meta.data_len;
+            if (to_copy > new_len) to_copy = new_len;
+            memcpy(new_data, account->data, to_copy);
+        }
+
+        account->data = new_data;
+        account->meta.data_len = new_len;
+        account->data_borrowed = false;
+        return SOL_OK;
+    } else {
+        /* Reallocate owned buffer */
+        uint8_t* new_data = sol_realloc(account->data, new_len);
+        if (!new_data) return SOL_ERR_NOMEM;
+
+        /* Zero the new portion if growing */
+        if (new_len > account->meta.data_len) {
+            memset(new_data + account->meta.data_len, 0,
+                   new_len - account->meta.data_len);
+        }
+
+        account->data = new_data;
+        account->meta.data_len = new_len;
     }
-
-    account->data = new_data;
-    account->meta.data_len = new_len;
 
     return SOL_OK;
 }
@@ -122,6 +198,18 @@ sol_account_resize(sol_account_t* account, size_t new_len) {
 sol_err_t
 sol_account_set_data(sol_account_t* account, const uint8_t* data, size_t len) {
     if (!account) return SOL_ERR_INVAL;
+
+    /* Copy-on-write: `resize` may be a no-op for equal sizes, so detach here
+     * before copying into the buffer. */
+    if (len > 0 && data && account->data && account->data_borrowed) {
+        uint8_t* new_data = sol_alloc(len);
+        if (!new_data) return SOL_ERR_NOMEM;
+        memcpy(new_data, data, len);
+        account->data = new_data;
+        account->meta.data_len = len;
+        account->data_borrowed = false;
+        return SOL_OK;
+    }
 
     sol_err_t err = sol_account_resize(account, len);
     if (err != SOL_OK) return err;

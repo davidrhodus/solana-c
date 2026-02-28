@@ -1,8 +1,8 @@
 /*
  * sol_snapshot_download.c - Snapshot Download Implementation
  *
- * Uses curl for HTTP requests. For production use, consider integrating
- * a proper HTTP client library (libcurl, etc.)
+ * Uses aria2c for snapshot downloads (fast concurrent ranges) and curl for
+ * lightweight metadata probes/manifest fetches.
  */
 
 #include "sol_snapshot_download.h"
@@ -23,6 +23,8 @@
 #include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <time.h>
 
@@ -32,10 +34,32 @@
 
 #define SOL_SUBPROC_MAX_ARGS (64U)
 
+/* Defaults for curl-based snapshot downloads.
+ *
+ * The range downloader may open many concurrent connections. Some origins will
+ * accept the connections but stall on a subset of requests. Ensure each curl
+ * worker has a bounded lifetime and aborts if it makes no progress.
+ */
+#define SOL_SNAPSHOT_CURL_CONNECT_TIMEOUT_SECS (10U)
+#define SOL_SNAPSHOT_CURL_SPEED_TIME_SECS      (30U)
+#define SOL_SNAPSHOT_CURL_SPEED_LIMIT_BPS      (10240U) /* 10 KiB/s */
+#define SOL_SNAPSHOT_CURL_DEFAULT_TIMEOUT_SECS (600U)   /* per-request */
+
+static uint32_t
+snapshot_curl_effective_timeout(uint32_t timeout_secs) {
+    return timeout_secs ? timeout_secs : SOL_SNAPSHOT_CURL_DEFAULT_TIMEOUT_SECS;
+}
+
 static volatile sig_atomic_t g_snapshot_download_interrupted = 0;
 
 static char*
 sol_strdup_local(const char* s);
+
+static sol_err_t
+sol_run_process_capture_stdout_with_exit_code(const char* const* argv,
+                                              char** out,
+                                              size_t* out_len,
+                                              int* out_exit_code);
 
 static void
 snapshot_download_cleanup_orphaned_parts(const char* tmp_path) {
@@ -160,30 +184,28 @@ sol_snapshot_download_env_parallel_connections(uint32_t current, bool* out_overr
 static uint32_t
 sol_snapshot_download_autoscale_parallel_connections(uint64_t expected_size,
                                                      uint32_t current) {
-    if (current < 2 || expected_size == 0) return current;
+    if (current < 2) return current;
 
-    /* These thresholds intentionally favor higher concurrency for very large
-     * snapshot archives to keep bootstrap time low. */
+    /* Auto-scale default concurrency for large archives.
+     *
+     * The range downloader is self-throttling: if the origin rate-limits or
+     * connections fail, the direct downloader will automatically retry the
+     * remaining parts with reduced concurrency. */
     uint32_t target = current;
 
-    if (expected_size >= (192ULL * 1024ULL * 1024ULL * 1024ULL) && target < 128) {
-        target = 128;
-    } else if (expected_size >= (128ULL * 1024ULL * 1024ULL * 1024ULL) && target < 128) {
-        target = 128;
-    } else if (expected_size >= (96ULL * 1024ULL * 1024ULL * 1024ULL) && target < 96) {
-        target = 96;
-    } else if (expected_size >= (64ULL * 1024ULL * 1024ULL * 1024ULL) && target < 80) {
-        target = 80;
-    } else if (expected_size >= (32ULL * 1024ULL * 1024ULL * 1024ULL) && target < 64) {
-        target = 64;
-    } else if (expected_size >= (16ULL * 1024ULL * 1024ULL * 1024ULL) && target < 32) {
-        target = 32;
+    /* Keep the default aggressive enough to saturate typical validator links
+     * without overwhelming public RPC snapshot origins. Users can override via
+     * SOL_SNAPSHOT_DOWNLOAD_CONNECTIONS. */
+    if (expected_size >= (16ULL * 1024ULL * 1024ULL * 1024ULL)) { /* >= 16 GiB */
+        if (target < 32u) target = 32u;
+    }
+    if (expected_size >= (64ULL * 1024ULL * 1024ULL * 1024ULL)) { /* >= 64 GiB */
+        if (target < 64u) target = 64u;
     }
 
     if (target > SOL_SNAPSHOT_DOWNLOAD_MAX_PARALLEL_CONNECTIONS) {
         target = SOL_SNAPSHOT_DOWNLOAD_MAX_PARALLEL_CONNECTIONS;
     }
-
     return target;
 }
 
@@ -226,11 +248,222 @@ sol_spawn_process(const char* const* argv) {
     return pid;
 }
 
+/* Spawn a subprocess (no shell) with stdout piped back to the parent. */
+static sol_err_t
+sol_spawn_process_with_stdout_pipe(const char* const* argv,
+                                   pid_t* out_pid,
+                                   int* out_read_fd) {
+    if (!argv || !argv[0] || !out_pid || !out_read_fd) return SOL_ERR_INVAL;
+    *out_pid = (pid_t)-1;
+    *out_read_fd = -1;
+
+    int pipefd[2];
+#ifdef __linux__
+    if (pipe2(pipefd, O_CLOEXEC) != 0) {
+        return SOL_ERR_IO;
+    }
+#else
+    if (pipe(pipefd) != 0) {
+        return SOL_ERR_IO;
+    }
+    /* Critical when spawning many concurrent curl range workers: prevent pipe
+     * FDs from leaking across exec() into other children, which can otherwise
+     * keep unrelated pipes "alive" and deadlock downloads. */
+    (void)fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+#endif
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return SOL_ERR_IO;
+    }
+
+    if (pid == 0) {
+        /* Child */
+        sol_subprocess_set_pdeathsig();
+        close(pipefd[0]);
+        (void)dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            (void)dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        sol_execvp_const_argv(argv);
+        _exit(127);
+    }
+
+    /* Parent */
+    close(pipefd[1]);
+    *out_pid = pid;
+    *out_read_fd = pipefd[0];
+    return SOL_OK;
+}
+
 static uint64_t
 sol_now_ms_monotonic(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static bool
+split_path_dir_base(const char* path,
+                    char* out_dir,
+                    size_t out_dir_len,
+                    char* out_base,
+                    size_t out_base_len) {
+    if (!path || !out_dir || !out_base) return false;
+
+    const char* slash = strrchr(path, '/');
+    if (slash) {
+        size_t dlen = (size_t)(slash - path);
+        if (dlen == 0) {
+            if (out_dir_len < 2) return false;
+            out_dir[0] = '/';
+            out_dir[1] = '\0';
+        } else {
+            if (dlen >= out_dir_len) return false;
+            memcpy(out_dir, path, dlen);
+            out_dir[dlen] = '\0';
+        }
+
+        const char* base = slash + 1;
+        if (!base || base[0] == '\0') return false;
+        size_t blen = strlen(base);
+        if (blen >= out_base_len) return false;
+        memcpy(out_base, base, blen + 1);
+        return true;
+    }
+
+    if (out_dir_len < 2) return false;
+    out_dir[0] = '.';
+    out_dir[1] = '\0';
+
+    size_t blen = strlen(path);
+    if (blen >= out_base_len) return false;
+    memcpy(out_base, path, blen + 1);
+    return true;
+}
+
+static bool
+sol_snapshot_download_has_aria2c(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached != 0;
+
+    const char* argv[] = {"aria2c", "--version", NULL};
+    char* out = NULL;
+    size_t out_len = 0;
+    int exit_code = -1;
+
+    sol_err_t err = sol_run_process_capture_stdout_with_exit_code(
+        argv, &out, &out_len, &exit_code);
+    sol_free(out);
+
+    cached = (err == SOL_OK && exit_code == 0) ? 1 : 0;
+    return cached != 0;
+}
+
+static sol_err_t
+snapshot_download_with_aria2c(const char* url,
+                              const char* tmp_path,
+                              uint32_t connections,
+                              bool resume,
+                              uint32_t timeout_secs) {
+    if (!url || !tmp_path) return SOL_ERR_INVAL;
+
+    char dir[PATH_MAX];
+    char base[PATH_MAX];
+    if (!split_path_dir_base(tmp_path, dir, sizeof(dir), base, sizeof(base))) {
+        return SOL_ERR_TOO_LARGE;
+    }
+
+    if (connections == 0) {
+        connections = 1;
+    }
+
+    char conn_buf[16];
+    snprintf(conn_buf, sizeof(conn_buf), "%u", (unsigned)connections);
+
+    char timeout_buf[16] = {0};
+    if (timeout_secs > 0) {
+        snprintf(timeout_buf, sizeof(timeout_buf), "%u", (unsigned)timeout_secs);
+    }
+
+    const char* argv[SOL_SUBPROC_MAX_ARGS];
+    size_t argc = 0;
+    argv[argc++] = "aria2c";
+    argv[argc++] = "--allow-overwrite=true";
+    argv[argc++] = "--auto-file-renaming=false";
+    argv[argc++] = "--file-allocation=none";
+    argv[argc++] = "--max-tries";
+    argv[argc++] = "5";
+    argv[argc++] = "--retry-wait";
+    argv[argc++] = "1";
+    if (resume) {
+        argv[argc++] = "-c";
+    }
+    if (timeout_secs > 0) {
+        argv[argc++] = "--timeout";
+        argv[argc++] = timeout_buf;
+        argv[argc++] = "--connect-timeout";
+        argv[argc++] = timeout_buf;
+    }
+    if (connections > 1) {
+        argv[argc++] = "-x";
+        argv[argc++] = conn_buf;
+        argv[argc++] = "-s";
+        argv[argc++] = conn_buf;
+    }
+    argv[argc++] = "--dir";
+    argv[argc++] = dir;
+    argv[argc++] = "--out";
+    argv[argc++] = base;
+    argv[argc++] = url;
+    argv[argc++] = NULL;
+
+    if (argc >= SOL_SUBPROC_MAX_ARGS) {
+        return SOL_ERR_INVAL;
+    }
+
+    pid_t pid = sol_spawn_process(argv);
+    if (pid < 0) {
+        return SOL_ERR_IO;
+    }
+
+    int status = 0;
+    while (1) {
+        if (sol_snapshot_download_should_abort()) {
+            (void)kill(pid, SIGTERM);
+            while (waitpid(pid, &status, 0) < 0) {
+                if (errno == EINTR) continue;
+                break;
+            }
+            return SOL_ERR_SHUTDOWN;
+        }
+
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == 0) {
+            struct timespec ts = {0, 200 * 1000000L}; /* 200ms */
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return SOL_ERR_IO;
+        }
+        break;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return SOL_ERR_IO;
+    }
+
+    return SOL_OK;
 }
 
 static sol_err_t
@@ -244,9 +477,18 @@ sol_run_process_capture_stdout_with_exit_code(const char* const* argv,
     if (out_exit_code) *out_exit_code = -1;
 
     int pipefd[2];
+#ifdef __linux__
+    if (pipe2(pipefd, O_CLOEXEC) != 0) {
+        return SOL_ERR_IO;
+    }
+#else
     if (pipe(pipefd) != 0) {
         return SOL_ERR_IO;
     }
+    /* Avoid leaking capture pipes into unrelated exec()'d children. */
+    (void)fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
+#endif
 
     pid_t pid = fork();
     if (pid < 0) {
@@ -717,6 +959,21 @@ spawn_curl_range_download(const char* url,
     char max_buf[32];
     snprintf(max_buf, sizeof(max_buf), "%llu", (unsigned long long)max_filesize);
 
+    /* Ensure each worker has bounded lifetime and aborts if it stops making
+     * progress. `timeout_buf` is optional (callers often leave it empty when
+     * timeout==0). */
+    uint32_t eff_timeout = snapshot_curl_effective_timeout(timeout);
+    char timeout_buf_local[32];
+    snprintf(timeout_buf_local, sizeof(timeout_buf_local), "%u", (unsigned)eff_timeout);
+    const char* tbuf = (timeout_buf && timeout_buf[0] != '\0') ? timeout_buf : timeout_buf_local;
+
+    char conn_timeout_buf[16];
+    char speed_time_buf[16];
+    char speed_limit_buf[16];
+    snprintf(conn_timeout_buf, sizeof(conn_timeout_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_CONNECT_TIMEOUT_SECS);
+    snprintf(speed_time_buf, sizeof(speed_time_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_SPEED_TIME_SECS);
+    snprintf(speed_limit_buf, sizeof(speed_limit_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_SPEED_LIMIT_BPS);
+
     const char* argv[32];
     size_t argc = 0;
     argv[argc++] = "curl";
@@ -728,20 +985,273 @@ spawn_curl_range_download(const char* url,
     argv[argc++] = "--retry-delay";
     argv[argc++] = "1";
     argv[argc++] = "--retry-connrefused";
+    argv[argc++] = "--connect-timeout";
+    argv[argc++] = conn_timeout_buf;
+    argv[argc++] = "--speed-time";
+    argv[argc++] = speed_time_buf;
+    argv[argc++] = "--speed-limit";
+    argv[argc++] = speed_limit_buf;
     argv[argc++] = "--max-filesize";
     argv[argc++] = max_buf;
     argv[argc++] = "-r";
     argv[argc++] = range_buf;
     argv[argc++] = "-o";
     argv[argc++] = out_path;
-    if (timeout > 0) {
-        argv[argc++] = "-m";
-        argv[argc++] = timeout_buf;
-    }
+    argv[argc++] = "-m";
+    argv[argc++] = tbuf;
     argv[argc++] = url;
     argv[argc++] = NULL;
 
     return sol_spawn_process(argv);
+}
+
+/* Stream a curl download to a file descriptor so we can use sol_io_* (io_uring
+ * when enabled) for disk writes, rather than letting curl write the file.
+ *
+ * This is primarily a fallback path for origins that do not support HTTP byte
+ * ranges (parallel downloader can't be used), while still keeping disk writes
+ * on the selected IO backend.
+ *
+ * `start_offset` is only used when curl resume is enabled (Range-supported). */
+static sol_err_t
+snapshot_download_curl_stream_to_fd(const char* url,
+                                    int out_fd,
+                                    uint64_t start_offset,
+                                    uint64_t expected_size,
+                                    uint32_t timeout,
+                                    const char* timeout_buf,
+                                    bool enable_resume,
+                                    sol_io_ctx_t* io_ctx) {
+    if (!url || out_fd < 0) return SOL_ERR_INVAL;
+
+    char resume_buf[32] = {0};
+    if (enable_resume && start_offset > 0) {
+        snprintf(resume_buf, sizeof(resume_buf), "%lu", (unsigned long)start_offset);
+    }
+
+    uint32_t eff_timeout = snapshot_curl_effective_timeout(timeout);
+    char timeout_buf_local[32];
+    snprintf(timeout_buf_local, sizeof(timeout_buf_local), "%u", (unsigned)eff_timeout);
+    const char* tbuf = (timeout_buf && timeout_buf[0] != '\0') ? timeout_buf : timeout_buf_local;
+
+    char conn_timeout_buf[16];
+    char speed_time_buf[16];
+    char speed_limit_buf[16];
+    snprintf(conn_timeout_buf, sizeof(conn_timeout_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_CONNECT_TIMEOUT_SECS);
+    snprintf(speed_time_buf, sizeof(speed_time_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_SPEED_TIME_SECS);
+    snprintf(speed_limit_buf, sizeof(speed_limit_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_SPEED_LIMIT_BPS);
+
+    const char* argv[32];
+    size_t argc = 0;
+    argv[argc++] = "curl";
+    argv[argc++] = "--http1.1";
+    argv[argc++] = "-fsSL";
+    argv[argc++] = "-L";
+    argv[argc++] = "--retry";
+    argv[argc++] = "5";
+    argv[argc++] = "--retry-delay";
+    argv[argc++] = "1";
+    argv[argc++] = "--retry-connrefused";
+    argv[argc++] = "--connect-timeout";
+    argv[argc++] = conn_timeout_buf;
+    argv[argc++] = "--speed-time";
+    argv[argc++] = speed_time_buf;
+    argv[argc++] = "--speed-limit";
+    argv[argc++] = speed_limit_buf;
+    argv[argc++] = "-o";
+    argv[argc++] = "-";
+    if (enable_resume && start_offset > 0) {
+        argv[argc++] = "-C";
+        argv[argc++] = resume_buf;
+    }
+    argv[argc++] = "-m";
+    argv[argc++] = tbuf;
+    argv[argc++] = url;
+    argv[argc++] = NULL;
+
+    pid_t pid = (pid_t)-1;
+    int rfd = -1;
+    sol_err_t serr = sol_spawn_process_with_stdout_pipe(argv, &pid, &rfd);
+    if (serr != SOL_OK) return serr;
+
+    enum { BUF_SZ = 4 * 1024 * 1024 };
+    uint8_t* buf = sol_alloc(BUF_SZ);
+    if (!buf) {
+        (void)kill(pid, SIGTERM);
+        close(rfd);
+        (void)waitpid(pid, NULL, 0);
+        return SOL_ERR_NOMEM;
+    }
+
+    uint64_t have = 0;
+    uint64_t last_log_ms = sol_now_ms_monotonic();
+    uint64_t last_bytes = 0;
+
+    sol_err_t io_err = SOL_OK;
+    while (1) {
+        if (sol_snapshot_download_should_abort()) {
+            io_err = SOL_ERR_SHUTDOWN;
+            break;
+        }
+
+        ssize_t n = read(rfd, buf, BUF_SZ);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            io_err = SOL_ERR_IO;
+            break;
+        }
+        if (n == 0) {
+            break; /* EOF */
+        }
+
+        sol_err_t werr = sol_io_pwrite_all(io_ctx, out_fd, buf, (size_t)n, start_offset + have);
+        if (werr != SOL_OK) {
+            io_err = werr;
+            break;
+        }
+        have += (uint64_t)n;
+
+        uint64_t now_ms = sol_now_ms_monotonic();
+        if (now_ms - last_log_ms >= 5000) {
+            uint64_t bytes = start_offset + have;
+            uint64_t delta_ms = now_ms - last_log_ms;
+            uint64_t delta_bytes = (bytes >= last_bytes) ? (bytes - last_bytes) : 0;
+            uint64_t speed = delta_ms > 0 ? (delta_bytes * 1000) / delta_ms : 0;
+
+            if (expected_size > 0) {
+                double pct = (double)bytes * 100.0 / (double)expected_size;
+                sol_log_info("Snapshot download progress: %.1f%% (%lu/%lu bytes) (%lu MB/s) (single stream)",
+                             pct,
+                             (unsigned long)bytes,
+                             (unsigned long)expected_size,
+                             (unsigned long)(speed / (1024 * 1024)));
+            } else {
+                sol_log_info("Snapshot download progress: %lu bytes (%lu MB/s) (single stream)",
+                             (unsigned long)bytes,
+                             (unsigned long)(speed / (1024 * 1024)));
+            }
+
+            last_log_ms = now_ms;
+            last_bytes = bytes;
+        }
+    }
+
+    close(rfd);
+
+    if (io_err == SOL_ERR_SHUTDOWN) {
+        (void)kill(pid, SIGTERM);
+    }
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        break;
+    }
+
+    sol_free(buf);
+
+    if (io_err == SOL_ERR_SHUTDOWN) {
+        return SOL_ERR_SHUTDOWN;
+    }
+    if (io_err != SOL_OK) {
+        return io_err;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return SOL_ERR_IO;
+    }
+
+    /* Best-effort size check when Content-Length was known.
+     *
+     * NOTE: The streaming path may preallocate/leave holes depending on how the
+     * caller opens the file. Always compare against the actual number of bytes
+     * we streamed and fail fast on large mismatches so corrupt/short downloads
+     * don't get treated as complete archives. */
+    if (expected_size > 0) {
+        uint64_t bytes = start_offset + have;
+        if (bytes != expected_size) {
+            uint64_t diff = bytes > expected_size ? (bytes - expected_size) : (expected_size - bytes);
+            uint64_t tol = 0;
+            if (expected_size >= (1ULL * 1024ULL * 1024ULL * 1024ULL)) { /* >= 1 GiB */
+                tol = 1ULL * 1024ULL * 1024ULL;                         /* 1 MiB */
+            }
+
+            sol_log_warn("Snapshot download completed but size mismatch (got %lu expected %lu)",
+                         (unsigned long)bytes,
+                         (unsigned long)expected_size);
+
+            /* Ensure the on-disk file size reflects the bytes we actually wrote. */
+            (void)ftruncate(out_fd, (off_t)bytes);
+
+            if (diff > tol) {
+                return SOL_ERR_IO;
+            }
+        }
+    }
+
+    return SOL_OK;
+}
+
+static sol_err_t
+spawn_curl_range_stream(const char* url,
+                        uint64_t start,
+                        uint64_t end,
+                        uint64_t max_filesize,
+                        uint32_t timeout,
+                        const char* timeout_buf,
+                        pid_t* out_pid,
+                        int* out_read_fd) {
+    if (!url || !out_pid || !out_read_fd) return SOL_ERR_INVAL;
+
+    char range_buf[64];
+    snprintf(range_buf, sizeof(range_buf), "%llu-%llu",
+             (unsigned long long)start,
+             (unsigned long long)end);
+
+    char max_buf[32];
+    snprintf(max_buf, sizeof(max_buf), "%llu", (unsigned long long)max_filesize);
+
+    uint32_t eff_timeout = snapshot_curl_effective_timeout(timeout);
+    char timeout_buf_local[32];
+    snprintf(timeout_buf_local, sizeof(timeout_buf_local), "%u", (unsigned)eff_timeout);
+    const char* tbuf = (timeout_buf && timeout_buf[0] != '\0') ? timeout_buf : timeout_buf_local;
+
+    char conn_timeout_buf[16];
+    char speed_time_buf[16];
+    char speed_limit_buf[16];
+    snprintf(conn_timeout_buf, sizeof(conn_timeout_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_CONNECT_TIMEOUT_SECS);
+    snprintf(speed_time_buf, sizeof(speed_time_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_SPEED_TIME_SECS);
+    snprintf(speed_limit_buf, sizeof(speed_limit_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_SPEED_LIMIT_BPS);
+
+    const char* argv[32];
+    size_t argc = 0;
+    argv[argc++] = "curl";
+    argv[argc++] = "--http1.1";
+    argv[argc++] = "-fsSL";
+    argv[argc++] = "-L";
+    argv[argc++] = "--retry";
+    argv[argc++] = "5";
+    argv[argc++] = "--retry-delay";
+    argv[argc++] = "1";
+    argv[argc++] = "--retry-connrefused";
+    argv[argc++] = "--connect-timeout";
+    argv[argc++] = conn_timeout_buf;
+    argv[argc++] = "--speed-time";
+    argv[argc++] = speed_time_buf;
+    argv[argc++] = "--speed-limit";
+    argv[argc++] = speed_limit_buf;
+    argv[argc++] = "--max-filesize";
+    argv[argc++] = max_buf;
+    argv[argc++] = "-r";
+    argv[argc++] = range_buf;
+    argv[argc++] = "-o";
+    argv[argc++] = "-";
+    argv[argc++] = "-m";
+    argv[argc++] = tbuf;
+    argv[argc++] = url;
+    argv[argc++] = NULL;
+
+    return sol_spawn_process_with_stdout_pipe(argv, out_pid, out_read_fd);
 }
 
 sol_err_t
@@ -793,6 +1303,728 @@ sol_snapshot_download_calc_parallel_params(uint64_t total_size,
     *out_parts = parts;
     *out_inflight_max = inflight_max;
     return SOL_OK;
+}
+
+/* --- Parallel ranged download: stream -> direct pwrite into output file --- */
+
+#define SOL_SNAPSHOT_RANGEDL_STATE_VERSION (1U)
+static const uint8_t SOL_SNAPSHOT_RANGEDL_STATE_MAGIC[8] = {'S','O','L','R','N','G','D','1'};
+
+typedef struct {
+    uint8_t  magic[8];
+    uint32_t version;
+    uint32_t parts;
+    uint64_t total_size;
+    uint64_t start_offset;
+} sol_snapshot_rangedl_state_hdr_t;
+
+static bool
+rangedl_bitmap_get(const uint8_t* bm, uint32_t idx) {
+    return bm && ((bm[idx / 8u] >> (idx % 8u)) & 1u);
+}
+
+static void
+rangedl_bitmap_set(uint8_t* bm, uint32_t idx) {
+    if (!bm) return;
+    bm[idx / 8u] |= (uint8_t)(1u << (idx % 8u));
+}
+
+static sol_err_t
+pread_all_local(int fd, void* buf, size_t len, uint64_t offset) {
+    if (fd < 0 || (!buf && len)) return SOL_ERR_INVAL;
+    if (offset > (uint64_t)LLONG_MAX) return SOL_ERR_TOO_LARGE;
+
+    uint8_t* p = (uint8_t*)buf;
+    uint64_t off = offset;
+    size_t left = len;
+    while (left > 0) {
+        ssize_t n = pread(fd, p, left, (off_t)off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return SOL_ERR_IO;
+        }
+        if (n == 0) {
+            return SOL_ERR_TRUNCATED;
+        }
+        p += (size_t)n;
+        left -= (size_t)n;
+        off += (uint64_t)n;
+    }
+    return SOL_OK;
+}
+
+static sol_err_t
+pwrite_all_local(int fd, const void* buf, size_t len, uint64_t offset) {
+    if (fd < 0 || (!buf && len)) return SOL_ERR_INVAL;
+    if (offset > (uint64_t)LLONG_MAX) return SOL_ERR_TOO_LARGE;
+
+    const uint8_t* p = (const uint8_t*)buf;
+    uint64_t off = offset;
+    size_t left = len;
+    while (left > 0) {
+        ssize_t n = pwrite(fd, p, left, (off_t)off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return SOL_ERR_IO;
+        }
+        if (n == 0) {
+            return SOL_ERR_IO;
+        }
+        p += (size_t)n;
+        left -= (size_t)n;
+        off += (uint64_t)n;
+    }
+    return SOL_OK;
+}
+
+static sol_err_t
+rangedl_state_open(const char* state_path,
+                   bool resume,
+                   uint32_t parts,
+                   uint64_t total_size,
+                   uint64_t start_offset,
+                   int* out_fd,
+                   uint8_t** out_bitmap,
+                   size_t* out_bitmap_len,
+                   bool* out_fresh) {
+    if (!state_path || !out_fd || !out_bitmap || !out_bitmap_len) return SOL_ERR_INVAL;
+    *out_fd = -1;
+    *out_bitmap = NULL;
+    *out_bitmap_len = 0;
+    if (out_fresh) *out_fresh = true;
+
+    size_t bitmap_len = (size_t)((parts + 7u) / 8u);
+    if (bitmap_len == 0) return SOL_ERR_INVAL;
+
+    uint8_t* bitmap = sol_alloc(bitmap_len);
+    if (!bitmap) return SOL_ERR_NOMEM;
+    memset(bitmap, 0, bitmap_len);
+
+    if (resume) {
+        int fd = open(state_path, O_RDWR | O_CLOEXEC, 0644);
+        if (fd >= 0) {
+            sol_snapshot_rangedl_state_hdr_t hdr;
+            sol_err_t herr = pread_all_local(fd, &hdr, sizeof(hdr), 0);
+            if (herr == SOL_OK &&
+                memcmp(hdr.magic, SOL_SNAPSHOT_RANGEDL_STATE_MAGIC, sizeof(hdr.magic)) == 0 &&
+                hdr.version == SOL_SNAPSHOT_RANGEDL_STATE_VERSION &&
+                hdr.parts == parts &&
+                hdr.total_size == total_size &&
+                hdr.start_offset == start_offset &&
+                pread_all_local(fd, bitmap, bitmap_len, sizeof(hdr)) == SOL_OK) {
+                *out_fd = fd;
+                *out_bitmap = bitmap;
+                *out_bitmap_len = bitmap_len;
+                if (out_fresh) *out_fresh = false;
+                return SOL_OK;
+            }
+            close(fd);
+        }
+
+        /* Invalid/mismatched state; restart fresh. */
+        (void)unlink(state_path);
+    }
+
+    int fd = open(state_path, O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        sol_free(bitmap);
+        return SOL_ERR_IO;
+    }
+
+    sol_snapshot_rangedl_state_hdr_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.magic, SOL_SNAPSHOT_RANGEDL_STATE_MAGIC, sizeof(hdr.magic));
+    hdr.version = SOL_SNAPSHOT_RANGEDL_STATE_VERSION;
+    hdr.parts = parts;
+    hdr.total_size = total_size;
+    hdr.start_offset = start_offset;
+
+    sol_err_t werr = pwrite_all_local(fd, &hdr, sizeof(hdr), 0);
+    if (werr == SOL_OK) {
+        werr = pwrite_all_local(fd, bitmap, bitmap_len, sizeof(hdr));
+    }
+    if (werr != SOL_OK) {
+        close(fd);
+        (void)unlink(state_path);
+        sol_free(bitmap);
+        return werr;
+    }
+
+    *out_fd = fd;
+    *out_bitmap = bitmap;
+    *out_bitmap_len = bitmap_len;
+    if (out_fresh) *out_fresh = true;
+    return SOL_OK;
+}
+
+typedef struct {
+    const char* url;
+    int         out_fd;
+    sol_io_ctx_t* io_ctx;
+
+    const char* state_path;
+    int         state_fd;
+    pthread_mutex_t state_mu;
+
+    uint64_t    total_size;
+    uint64_t    start_offset;
+    uint64_t    chunk;
+    uint32_t    parts;
+    uint32_t    inflight_max;
+    uint32_t    concurrency;
+    uint32_t    timeout;
+    bool        ranges_confirmed;
+
+    uint8_t*    bitmap;
+    size_t      bitmap_len;
+
+    uint32_t    next_index;
+    int         fatal_err; /* sol_err_t */
+    uint32_t    saw_range_reject;
+    uint32_t    part_failures;
+
+    /* Progress reporting (best-effort). `bytes_streamed` counts bytes written
+     * to disk across all workers and will double-count if a part is retried.
+     * This is fine for speed estimates; we clamp percent to 100%. */
+    uint64_t    bytes_streamed;
+    uint32_t    parts_done; /* completed parts */
+    uint64_t    last_log_ms;
+    uint64_t    last_log_bytes;
+    uint32_t    progress_stop;
+} sol_snapshot_parallel_direct_ctx_t;
+
+static void
+direct_ctx_set_fatal(sol_snapshot_parallel_direct_ctx_t* ctx, sol_err_t err) {
+    if (!ctx || err == SOL_OK) return;
+    int expected = SOL_OK;
+    (void)__atomic_compare_exchange_n(&ctx->fatal_err,
+                                      &expected,
+                                      (int)err,
+                                      false,
+                                      __ATOMIC_RELAXED,
+                                      __ATOMIC_RELAXED);
+}
+
+static uint64_t
+direct_part_expected_bytes(const sol_snapshot_parallel_direct_ctx_t* ctx, uint32_t part_idx) {
+    if (!ctx || part_idx >= ctx->parts) return 0;
+
+    const uint64_t start = ctx->start_offset + ((uint64_t)part_idx * ctx->chunk);
+    const uint64_t end = (part_idx == ctx->parts - 1u) ? (ctx->total_size - 1u) : (start + ctx->chunk - 1u);
+    if (end < start) return 0;
+    return end - start + 1u;
+}
+
+static void
+direct_maybe_log_progress(sol_snapshot_parallel_direct_ctx_t* ctx) {
+    if (!ctx) return;
+
+    uint64_t now_ms = sol_now_ms_monotonic();
+    uint64_t last_ms = __atomic_load_n(&ctx->last_log_ms, __ATOMIC_RELAXED);
+    if (last_ms != 0 && now_ms - last_ms < 5000) {
+        return;
+    }
+
+    /* Ensure only one worker logs per interval. */
+    if (!__atomic_compare_exchange_n(&ctx->last_log_ms,
+                                     &last_ms,
+                                     now_ms,
+                                     false,
+                                     __ATOMIC_RELAXED,
+                                     __ATOMIC_RELAXED)) {
+        return;
+    }
+
+    uint64_t streamed = __atomic_load_n(&ctx->bytes_streamed, __ATOMIC_RELAXED);
+    uint64_t prev = __atomic_exchange_n(&ctx->last_log_bytes, streamed, __ATOMIC_RELAXED);
+    uint64_t delta_bytes = (streamed >= prev) ? (streamed - prev) : 0;
+    uint64_t delta_ms = (last_ms == 0 || now_ms <= last_ms) ? 0 : (now_ms - last_ms);
+    uint64_t speed = delta_ms > 0 ? (delta_bytes * 1000) / delta_ms : 0;
+
+    uint64_t total = ctx->total_size;
+    uint64_t max_remaining = total > ctx->start_offset ? (total - ctx->start_offset) : 0;
+    uint64_t clamped = streamed;
+    if (max_remaining > 0 && clamped > max_remaining) clamped = max_remaining;
+    uint64_t bytes = ctx->start_offset + clamped;
+    double pct = total > 0 ? (double)bytes * 100.0 / (double)total : 0.0;
+
+    uint32_t parts_done = __atomic_load_n(&ctx->parts_done, __ATOMIC_RELAXED);
+    sol_log_info("Snapshot download progress: %.1f%% (%lu/%lu bytes) (%lu MB/s, %u/%u conns, %u/%u parts) (direct write)",
+                 pct,
+                 (unsigned long)bytes,
+                 (unsigned long)total,
+                 (unsigned long)(speed / (1024 * 1024)),
+                 (unsigned)ctx->concurrency,
+                 (unsigned)ctx->inflight_max,
+                 (unsigned)parts_done,
+                 (unsigned)ctx->parts);
+}
+
+static sol_err_t
+direct_mark_part_complete(sol_snapshot_parallel_direct_ctx_t* ctx, uint32_t part_idx) {
+    if (!ctx || ctx->state_fd < 0 || !ctx->bitmap || part_idx >= ctx->parts) return SOL_ERR_INVAL;
+    pthread_mutex_lock(&ctx->state_mu);
+    rangedl_bitmap_set(ctx->bitmap, part_idx);
+    const uint32_t byte_idx = part_idx / 8u;
+    const uint64_t off = (uint64_t)sizeof(sol_snapshot_rangedl_state_hdr_t) + (uint64_t)byte_idx;
+    const uint8_t v = ctx->bitmap[byte_idx];
+    sol_err_t err = pwrite_all_local(ctx->state_fd, &v, 1, off);
+    pthread_mutex_unlock(&ctx->state_mu);
+    return err;
+}
+
+static sol_err_t
+direct_download_part(sol_snapshot_parallel_direct_ctx_t* ctx, uint32_t part_idx) {
+    if (!ctx || !ctx->url || ctx->out_fd < 0) return SOL_ERR_INVAL;
+    if (part_idx >= ctx->parts) return SOL_ERR_INVAL;
+
+    const uint64_t start = ctx->start_offset + ((uint64_t)part_idx * ctx->chunk);
+    const uint64_t end = (part_idx == ctx->parts - 1u) ? (ctx->total_size - 1u) : (start + ctx->chunk - 1u);
+    const uint64_t expected = end - start + 1u;
+
+    char timeout_buf[32] = {0};
+    if (ctx->timeout > 0) {
+        snprintf(timeout_buf, sizeof(timeout_buf), "%u", (unsigned)ctx->timeout);
+    }
+
+    enum { BUF_SZ = 4 * 1024 * 1024 };
+    uint8_t* buf = sol_alloc(BUF_SZ);
+    if (!buf) return SOL_ERR_NOMEM;
+
+    const uint32_t max_retries = 4;
+    for (uint32_t attempt = 1; attempt <= max_retries; attempt++) {
+        if (sol_snapshot_download_should_abort()) {
+            sol_free(buf);
+            return SOL_ERR_SHUTDOWN;
+        }
+        if (__atomic_load_n(&ctx->fatal_err, __ATOMIC_RELAXED) != SOL_OK) {
+            sol_free(buf);
+            return (sol_err_t)__atomic_load_n(&ctx->fatal_err, __ATOMIC_RELAXED);
+        }
+
+        pid_t pid = (pid_t)-1;
+        int rfd = -1;
+        sol_err_t serr = spawn_curl_range_stream(ctx->url,
+                                                 start,
+                                                 end,
+                                                 expected,
+                                                 ctx->timeout,
+                                                 timeout_buf,
+                                                 &pid,
+                                                 &rfd);
+        if (serr != SOL_OK) {
+            /* Spawn failures are usually local (fd exhaustion, etc). */
+            sol_free(buf);
+            return serr;
+        }
+
+        uint64_t have = 0;
+        sol_err_t io_err = SOL_OK;
+        while (have < expected) {
+            if (sol_snapshot_download_should_abort()) {
+                io_err = SOL_ERR_SHUTDOWN;
+                break;
+            }
+
+            size_t want = (size_t)(expected - have);
+            if (want > (size_t)BUF_SZ) want = (size_t)BUF_SZ;
+
+            ssize_t n = read(rfd, buf, want);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                io_err = SOL_ERR_IO;
+                break;
+            }
+            if (n == 0) {
+                break; /* EOF */
+            }
+
+            sol_err_t werr = sol_io_pwrite_all(ctx->io_ctx,
+                                               ctx->out_fd,
+                                               buf,
+                                               (size_t)n,
+                                               start + have);
+            if (werr != SOL_OK) {
+                io_err = werr;
+                break;
+            }
+
+            (void)__atomic_fetch_add(&ctx->bytes_streamed, (uint64_t)n, __ATOMIC_RELAXED);
+            have += (uint64_t)n;
+        }
+
+        close(rfd);
+
+        int status = 0;
+        while (waitpid(pid, &status, 0) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        int exit_code = -1;
+        if (WIFEXITED(status)) {
+            exit_code = WEXITSTATUS(status);
+        }
+
+        if (io_err == SOL_OK && have == expected && exit_code == 0) {
+            sol_free(buf);
+            return SOL_OK;
+        }
+
+        if (exit_code == 63) {
+            /* curl --max-filesize: range ignored/rejected */
+            __atomic_store_n(&ctx->saw_range_reject, 1u, __ATOMIC_RELAXED);
+        }
+
+        if (io_err == SOL_ERR_SHUTDOWN) {
+            sol_free(buf);
+            return SOL_ERR_SHUTDOWN;
+        }
+
+        if (attempt == max_retries) {
+            sol_free(buf);
+            return (io_err != SOL_OK) ? io_err : SOL_ERR_IO;
+        }
+
+        /* Best-effort backoff. */
+        uint64_t backoff_ms = 250ULL * (uint64_t)attempt;
+        if (backoff_ms > 5000ULL) backoff_ms = 5000ULL;
+        struct timespec ts = {(time_t)(backoff_ms / 1000ULL),
+                              (long)((backoff_ms % 1000ULL) * 1000000L)};
+        nanosleep(&ts, NULL);
+    }
+
+    sol_free(buf);
+    return SOL_ERR_IO;
+}
+
+static void*
+direct_worker_main(void* arg) {
+    sol_snapshot_parallel_direct_ctx_t* ctx = (sol_snapshot_parallel_direct_ctx_t*)arg;
+    if (!ctx) return NULL;
+
+    while (1) {
+        if (__atomic_load_n(&ctx->fatal_err, __ATOMIC_RELAXED) != SOL_OK) {
+            break;
+        }
+        if (sol_snapshot_download_should_abort()) {
+            direct_ctx_set_fatal(ctx, SOL_ERR_SHUTDOWN);
+            break;
+        }
+
+        uint32_t idx = __atomic_fetch_add(&ctx->next_index, 1u, __ATOMIC_RELAXED);
+        if (idx >= ctx->parts) break;
+
+        if (rangedl_bitmap_get(ctx->bitmap, idx)) {
+            continue;
+        }
+
+        sol_err_t err = direct_download_part(ctx, idx);
+        if (err == SOL_OK) {
+            sol_err_t merr = direct_mark_part_complete(ctx, idx);
+            if (merr != SOL_OK) {
+                direct_ctx_set_fatal(ctx, merr);
+                break;
+            }
+            (void)__atomic_fetch_add(&ctx->parts_done, 1u, __ATOMIC_RELAXED);
+            continue;
+        }
+
+        if (err == SOL_ERR_SHUTDOWN) {
+            direct_ctx_set_fatal(ctx, err);
+            break;
+        }
+        if (err == SOL_ERR_NOMEM || err == SOL_ERR_TOO_LARGE) {
+            direct_ctx_set_fatal(ctx, err);
+            break;
+        }
+
+        /* Non-fatal: leave part incomplete for a later round (potentially with
+         * reduced concurrency). */
+        (void)__atomic_fetch_add(&ctx->part_failures, 1u, __ATOMIC_RELAXED);
+    }
+
+    return NULL;
+}
+
+static void*
+direct_progress_main(void* arg) {
+    sol_snapshot_parallel_direct_ctx_t* ctx = (sol_snapshot_parallel_direct_ctx_t*)arg;
+    if (!ctx) return NULL;
+
+    while (1) {
+        if (__atomic_load_n(&ctx->progress_stop, __ATOMIC_RELAXED)) break;
+        if (sol_snapshot_download_should_abort()) break;
+        /* If a fatal error occurs, stop logging. */
+        if (__atomic_load_n(&ctx->fatal_err, __ATOMIC_RELAXED) != SOL_OK) break;
+
+        direct_maybe_log_progress(ctx);
+
+        struct timespec ts = {1, 0};
+        nanosleep(&ts, NULL);
+    }
+
+    return NULL;
+}
+
+static sol_err_t
+snapshot_download_parallel_direct(const char* url,
+                                  const char* out_path,
+                                  const char* state_path,
+                                  uint64_t total_size,
+                                  uint64_t start_offset,
+                                  uint32_t requested_connections,
+                                  bool ranges_confirmed,
+                                  const sol_snapshot_download_opts_t* options) {
+    if (!url || !out_path || !state_path || !options) return SOL_ERR_INVAL;
+    if (requested_connections < 2 || total_size == 0) return SOL_ERR_INVAL;
+    if (start_offset >= total_size) return SOL_ERR_INVAL;
+    if (sol_snapshot_download_should_abort()) return SOL_ERR_SHUTDOWN;
+
+    uint32_t parts = 0;
+    uint32_t inflight_max = 0;
+    sol_err_t perr = sol_snapshot_download_calc_parallel_params(
+        total_size, start_offset, requested_connections, &parts, &inflight_max);
+    if (perr != SOL_OK) return perr;
+
+    sol_log_info("Downloading using %u connections over %u parts (direct write; size=%lu bytes): %s",
+                 (unsigned)inflight_max,
+                 (unsigned)parts,
+                 (unsigned long)total_size,
+                 url);
+
+    bool state_fresh = true;
+    int state_fd = -1;
+    uint8_t* bitmap = NULL;
+    size_t bitmap_len = 0;
+    sol_err_t serr = rangedl_state_open(state_path,
+                                        options->resume,
+                                        parts,
+                                        total_size,
+                                        start_offset,
+                                        &state_fd,
+                                        &bitmap,
+                                        &bitmap_len,
+                                        &state_fresh);
+    if (serr != SOL_OK) {
+        return serr;
+    }
+
+    if (!state_fresh && options->resume) {
+        struct stat st;
+        if (stat(out_path, &st) != 0 || (uint64_t)st.st_size != total_size) {
+            sol_log_warn("Parallel direct download: state exists but partial file is missing/mismatched; restarting from scratch: %s",
+                         out_path);
+            close(state_fd);
+            sol_free(bitmap);
+            state_fd = -1;
+            bitmap = NULL;
+            bitmap_len = 0;
+            state_fresh = true;
+            (void)unlink(state_path);
+
+            serr = rangedl_state_open(state_path,
+                                      false,
+                                      parts,
+                                      total_size,
+                                      start_offset,
+                                      &state_fd,
+                                      &bitmap,
+                                      &bitmap_len,
+                                      &state_fresh);
+            if (serr != SOL_OK) {
+                return serr;
+            }
+        }
+    }
+
+    int out_fd = -1;
+    if (state_fresh || !options->resume) {
+        out_fd = open(out_path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
+    } else {
+        out_fd = open(out_path, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    }
+    if (out_fd < 0) {
+        close(state_fd);
+        sol_free(bitmap);
+        return SOL_ERR_IO;
+    }
+
+    if (ftruncate(out_fd, (off_t)total_size) != 0) {
+        close(out_fd);
+        close(state_fd);
+        sol_free(bitmap);
+        return SOL_ERR_IO;
+    }
+
+    sol_snapshot_parallel_direct_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.url = url;
+    ctx.out_fd = out_fd;
+    ctx.io_ctx = options->io_ctx;
+    ctx.state_path = state_path;
+    ctx.state_fd = state_fd;
+    pthread_mutex_init(&ctx.state_mu, NULL);
+    ctx.total_size = total_size;
+    ctx.start_offset = start_offset;
+    ctx.parts = parts;
+    ctx.inflight_max = inflight_max;
+    ctx.concurrency = inflight_max;
+    ctx.timeout = options->timeout_secs ? options->timeout_secs : 0;
+    ctx.ranges_confirmed = ranges_confirmed;
+    ctx.bitmap = bitmap;
+    ctx.bitmap_len = bitmap_len;
+    ctx.bytes_streamed = 0;
+    ctx.parts_done = 0;
+    ctx.last_log_ms = 0;
+    ctx.last_log_bytes = 0;
+
+    uint64_t remaining = total_size - start_offset;
+    ctx.chunk = remaining / parts;
+    if (ctx.chunk == 0) {
+        pthread_mutex_destroy(&ctx.state_mu);
+        close(out_fd);
+        close(state_fd);
+        sol_free(bitmap);
+        return SOL_ERR_INVAL;
+    }
+
+    uint32_t concurrency = inflight_max;
+    uint32_t rounds = 0;
+
+    /* Initialize progress counters from any resumed bitmap. */
+    if (bitmap && bitmap_len > 0) {
+        uint64_t done = 0;
+        uint32_t done_parts = 0;
+        for (uint32_t i = 0; i < parts; i++) {
+            if (rangedl_bitmap_get(bitmap, i)) {
+                uint64_t expected = direct_part_expected_bytes(&ctx, i);
+                if (expected > 0) done += expected;
+                done_parts++;
+            }
+        }
+        __atomic_store_n(&ctx.bytes_streamed, done, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctx.parts_done, done_parts, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctx.last_log_bytes, done, __ATOMIC_RELAXED);
+    }
+
+    pthread_t progress_th;
+    bool have_progress = false;
+    __atomic_store_n(&ctx.progress_stop, 0u, __ATOMIC_RELAXED);
+    if (pthread_create(&progress_th, NULL, direct_progress_main, &ctx) == 0) {
+        have_progress = true;
+    } else {
+        sol_log_warn("Parallel direct download: failed to start progress thread");
+    }
+
+    sol_err_t rc = SOL_OK;
+    while (1) {
+        if (sol_snapshot_download_should_abort()) {
+            direct_ctx_set_fatal(&ctx, SOL_ERR_SHUTDOWN);
+        }
+
+        __atomic_store_n(&ctx.next_index, 0u, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctx.fatal_err, SOL_OK, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctx.saw_range_reject, 0u, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctx.part_failures, 0u, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctx.concurrency, concurrency, __ATOMIC_RELAXED);
+
+        pthread_t* th = sol_calloc(concurrency, sizeof(*th));
+        if (!th) {
+            rc = SOL_ERR_NOMEM;
+            break;
+        }
+
+        uint32_t created = 0;
+        bool create_failed = false;
+        for (uint32_t i = 0; i < concurrency; i++) {
+            if (pthread_create(&th[i], NULL, direct_worker_main, &ctx) != 0) {
+                create_failed = true;
+                break;
+            }
+            created++;
+        }
+        for (uint32_t i = 0; i < created; i++) {
+            (void)pthread_join(th[i], NULL);
+        }
+
+        sol_free(th);
+
+        sol_err_t ferr = (sol_err_t)__atomic_load_n(&ctx.fatal_err, __ATOMIC_RELAXED);
+        if (ferr != SOL_OK) {
+            rc = ferr;
+            break;
+        }
+
+        bool all_done = true;
+        for (uint32_t i = 0; i < parts; i++) {
+            if (!rangedl_bitmap_get(bitmap, i)) {
+                all_done = false;
+                break;
+            }
+        }
+        if (all_done) {
+            rc = SOL_OK;
+            break;
+        }
+
+        if (!ranges_confirmed && __atomic_load_n(&ctx.saw_range_reject, __ATOMIC_RELAXED)) {
+            sol_log_warn("Parallel direct download: server rejected/ignored ranges; falling back");
+            rc = SOL_ERR_UNSUPPORTED;
+            break;
+        }
+
+        if (create_failed && created == 0) {
+            rc = SOL_ERR_IO;
+            break;
+        }
+
+        if (concurrency <= 1) {
+            rc = SOL_ERR_IO;
+            break;
+        }
+
+        uint32_t next = concurrency / 2u;
+        if (next < 1) next = 1;
+        rounds++;
+        if (rounds > 10) {
+            rc = SOL_ERR_IO;
+            break;
+        }
+
+        sol_log_warn("Parallel direct download: retrying remaining parts with %u connections (was %u)",
+                     (unsigned)next,
+                     (unsigned)concurrency);
+        concurrency = next;
+    }
+
+    if (have_progress) {
+        __atomic_store_n(&ctx.progress_stop, 1u, __ATOMIC_RELAXED);
+        (void)pthread_join(progress_th, NULL);
+    }
+
+    pthread_mutex_destroy(&ctx.state_mu);
+
+    close(out_fd);
+    close(state_fd);
+
+    /* Successful completion: remove state file. */
+    if (rc == SOL_OK) {
+        (void)unlink(state_path);
+    }
+    sol_free(bitmap);
+
+    if (rc == SOL_OK) {
+        struct stat st;
+        if (stat(out_path, &st) != 0 || (uint64_t)st.st_size != total_size) {
+            sol_log_error("Parallel direct download assembled wrong size (got %lu expected %lu)",
+                          (unsigned long)(st.st_size),
+                          (unsigned long)total_size);
+            rc = SOL_ERR_IO;
+        }
+    }
+
+    return rc;
 }
 
 static sol_err_t
@@ -1258,7 +2490,7 @@ snapshot_download_parallel(const char* url,
              * a specific range (e.g. curl exit 63 from --max-filesize). */
             uint64_t salvaged = 0;
             if (truncate_file_to_size(out_path, start_offset) == SOL_OK) {
-                int out_fd = open(out_path, O_WRONLY | O_APPEND, 0644);
+                int out_fd = open(out_path, O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
                 if (out_fd >= 0) {
                     for (uint32_t i = 0; i < parts; i++) {
                         struct stat st;
@@ -1322,7 +2554,7 @@ snapshot_download_parallel(const char* url,
 
     int out_fd = -1;
     if (start_offset == 0) {
-        out_fd = open(out_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        out_fd = open(out_path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
     } else {
         /* Append to an existing partial download. */
         struct stat st;
@@ -1337,7 +2569,7 @@ snapshot_download_parallel(const char* url,
             return SOL_ERR_IO;
         }
 
-        out_fd = open(out_path, O_WRONLY | O_APPEND, 0644);
+        out_fd = open(out_path, O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
     }
     if (out_fd < 0) {
         sol_free(ps);
@@ -2228,7 +3460,7 @@ sol_snapshot_find_best_download(const sol_snapshot_source_t* sources,
 }
 
 /*
- * Download snapshot using curl
+ * Download snapshot using aria2c (preferred) or curl fallback
  */
 sol_err_t
 sol_snapshot_download(const sol_available_snapshot_t* snapshot,
@@ -2287,6 +3519,15 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
         return SOL_ERR_TOO_LARGE;
     }
 
+    char rangedl_state_path[PATH_MAX];
+    int sn = snprintf(rangedl_state_path, sizeof(rangedl_state_path), "%s.ranges.v1", tmp_path);
+    if (sn < 0 || (size_t)sn >= sizeof(rangedl_state_path)) {
+        sol_free(resolved_url);
+        return SOL_ERR_TOO_LARGE;
+    }
+
+    const bool have_rangedl_state = access(rangedl_state_path, F_OK) == 0;
+
     /* Best-effort: cleanup orphaned parallel-download part files when no
      * active partial download exists. This prevents abandoned `.partial.part*`
      * files from consuming significant disk. */
@@ -2306,10 +3547,23 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
             effective_url, options.timeout_secs, &probed_size, &probed_ranges);
         if (probe_err == SOL_OK) {
             probe_ok = true;
-            if (expected_size == 0 && probed_size > 0) {
-                expected_size = probed_size;
-            }
             supports_ranges = probed_ranges;
+
+            /* If the snapshot manifest reports a size, but the origin reports a
+             * different Content-Length, prefer the probed size. In practice the
+             * on-wire size is what matters for resume/verification, and some
+             * manifest sources are occasionally stale or inconsistent. */
+            if (probed_size > 0) {
+                if (expected_size == 0) {
+                    expected_size = probed_size;
+                } else if (expected_size != probed_size) {
+                    sol_log_warn("Snapshot manifest size %lu differs from HTTP Content-Length %lu; using probed size: %s",
+                                 (unsigned long)expected_size,
+                                 (unsigned long)probed_size,
+                                 effective_url);
+                    expected_size = probed_size;
+                }
+            }
         } else {
             sol_log_debug("Snapshot size/range probe failed (err=%d): %s",
                           probe_err, effective_url);
@@ -2324,14 +3578,29 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
         size_tolerance = 1ULL * 1024ULL * 1024ULL;               /* 1 MiB */
     }
 
-    /* Only treat `expected_size` as authoritative when it came from a trusted
-     * manifest size or when the server confirmed range support (Content-Range).
+    /* Treat an explicitly-provided manifest size as authoritative, and also
+     * treat a successful size probe (Content-Length) as authoritative even if
+     * the origin doesn't support byte ranges.
      *
-     * Some RPC snapshot endpoints return inconsistent Content-Length values or
-     * rate-limit HEAD/range probes. In those cases we still use `expected_size`
-     * for heuristics but avoid failing downloads on small mismatches. */
+     * When `expected_size` is known, accepting large on-disk size mismatches
+     * leads to reusing corrupt/truncated archives (especially if a previous
+     * download left zeros/holes at the end). */
     bool enforce_size_match = (expected_size > 0) &&
-                              (snapshot->size > 0 || supports_ranges);
+                              (snapshot->size > 0 || supports_ranges || probe_ok);
+
+    bool use_aria2c = false;
+    {
+        /* Default to the built-in downloader so we can exceed aria2c's 16
+         * connections-per-host limit and leverage io_uring for disk writes. */
+        const char* env = getenv("SOL_SNAPSHOT_USE_ARIA2C");
+        bool want_aria2c = (env && env[0] != '\0' && strcmp(env, "0") != 0);
+        if (want_aria2c) {
+            use_aria2c = sol_snapshot_download_has_aria2c();
+            if (!use_aria2c) {
+                sol_log_warn("SOL_SNAPSHOT_USE_ARIA2C set but aria2c not found; falling back to built-in downloader");
+            }
+        }
+    }
 
     /* Auto-scale parallelism for large archives when the caller did not
      * explicitly configure connections (common in validator bootstrap flows). */
@@ -2391,7 +3660,7 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
     /* Prefer parallel range download when possible (large snapshots). */
     uint64_t resume_from = 0;
     bool moved_final_to_partial = false;
-    if (options.resume) {
+    if (options.resume && !have_rangedl_state) {
         struct stat st;
         if (stat(tmp_path, &st) == 0 && st.st_size > 0) {
             resume_from = (uint64_t)st.st_size;
@@ -2411,7 +3680,7 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
         }
     }
 
-    if (options.verify_after && expected_size > 0 && resume_from == expected_size) {
+    if (options.verify_after && expected_size > 0 && resume_from == expected_size && !have_rangedl_state) {
         if (rename(tmp_path, out_path) != 0) {
             sol_log_error("Failed to finalize existing snapshot download (rename): %s", strerror(errno));
             sol_free(resolved_url);
@@ -2444,19 +3713,22 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
              * requests. Some public RPC endpoints rate-limit range probes and
              * return 429s for parallel range fetches. */
             if (!supports_ranges) {
-                if (probe_ok) {
-                    if (allow_without_ranges) {
-                        sol_log_info("Snapshot server did not advertise HTTP range support; attempting parallel anyway: %s",
+                if (!allow_without_ranges) {
+                    want_parallel = false;
+                    if (probe_ok) {
+                        sol_log_info("Snapshot server did not confirm HTTP range support; falling back to non-parallel download: %s",
                                      effective_url);
                     } else {
-                        sol_log_info("Snapshot server did not confirm HTTP range support; using single stream: %s",
+                        sol_log_info("Snapshot range probe failed; falling back to non-parallel download: %s",
                                      effective_url);
-                        want_parallel = false;
                     }
+                } else if (probe_ok) {
+                    sol_log_info("Snapshot server did not confirm HTTP range support; attempting parallel download anyway: %s",
+                                 effective_url);
                 } else {
                     /* Probe failures can be transient (429, head blocked, etc).
-                     * Attempt the parallel range download anyway; it will fail
-                     * fast if the server ignores Range and then fall back. */
+                     * Attempt the parallel range download anyway (pipedev origin);
+                     * it will fail fast if the server ignores Range and then fall back. */
                     sol_log_info("Snapshot range probe failed; attempting parallel download anyway: %s",
                                  effective_url);
                 }
@@ -2471,19 +3743,37 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
             }
         }
 
-        if (want_parallel) {
+        const bool legacy_resume = options.resume && resume_from > 0 && !have_rangedl_state;
+        const bool skip_internal_for_legacy_resume = legacy_resume && use_aria2c;
+
+        if (want_parallel && !skip_internal_for_legacy_resume) {
             sol_sighandler_fn_t old_int = SIG_DFL;
             sol_sighandler_fn_t old_term = SIG_DFL;
             sol_snapshot_download_install_signal_handlers(&old_int, &old_term);
 
-            sol_err_t err = snapshot_download_parallel(
-                effective_url,
-                tmp_path,
-                total_size,
-                resume_from,
-                options.parallel_connections,
-                probe_ok && supports_ranges,
-                &options);
+            bool used_direct = false;
+            sol_err_t err = SOL_ERR_IO;
+            if (have_rangedl_state || resume_from == 0) {
+                used_direct = true;
+                err = snapshot_download_parallel_direct(
+                    effective_url,
+                    tmp_path,
+                    rangedl_state_path,
+                    total_size,
+                    0,
+                    options.parallel_connections,
+                    probe_ok && supports_ranges,
+                    &options);
+            } else {
+                err = snapshot_download_parallel(
+                    effective_url,
+                    tmp_path,
+                    total_size,
+                    resume_from,
+                    options.parallel_connections,
+                    probe_ok && supports_ranges,
+                    &options);
+            }
             sol_snapshot_download_restore_signal_handlers(old_int, old_term);
 
             if (err == SOL_ERR_SHUTDOWN) {
@@ -2513,13 +3803,26 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
             sol_log_warn("Parallel download failed (err=%d), falling back to single stream", err);
 
             /* Re-probe resume point after a failed parallel attempt. */
-            if (options.resume) {
+            if (used_direct) {
+                (void)unlink(rangedl_state_path);
+                (void)unlink(tmp_path);
+                resume_from = 0;
+            } else if (options.resume) {
                 struct stat st;
                 if (stat(tmp_path, &st) == 0 && st.st_size > 0) {
                     resume_from = (uint64_t)st.st_size;
                 }
             }
         }
+    }
+
+    if (have_rangedl_state) {
+        /* A ranged download uses random-access writes, so the `.partial` file
+         * size is not a reliable "resume offset". If we didn't complete via
+         * the ranged path above, fall back by starting fresh. */
+        (void)unlink(rangedl_state_path);
+        (void)unlink(tmp_path);
+        resume_from = 0;
     }
 
     /* Single-stream download (supports resume). */
@@ -2552,11 +3855,100 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
         sol_log_info("Resuming download from byte %lu", (unsigned long)resume_from);
     }
 
+    uint32_t aria2c_connections = 1;
+    if (use_aria2c && options.parallel_connections >= 2) {
+        uint64_t total_size = expected_size;
+        uint64_t min_size = options.parallel_min_size;
+        bool want_parallel = total_size > 0 &&
+                             (min_size == 0 || total_size >= min_size);
+
+        if (want_parallel) {
+            bool allow_without_ranges =
+                url_has_prefix(effective_url, "https://data.pipedev.network") ||
+                url_has_prefix(effective_url, "http://data.pipedev.network");
+
+            if (!supports_ranges) {
+                if (probe_ok) {
+                    if (!allow_without_ranges) {
+                        sol_log_info("Snapshot server did not confirm HTTP range support; using single aria2c connection: %s",
+                                     effective_url);
+                        want_parallel = false;
+                    }
+                } else {
+                    sol_log_info("Snapshot range probe failed; using multi-connection aria2c anyway: %s",
+                                 effective_url);
+                }
+            } else if (resume_from > 0 && total_size > resume_from) {
+                uint64_t remaining = total_size - resume_from;
+                if (remaining < (8ULL * 1024ULL * 1024ULL)) {
+                    want_parallel = false;
+                }
+            }
+        }
+
+        if (want_parallel) {
+            aria2c_connections = options.parallel_connections;
+        }
+    }
+
+    if (use_aria2c && aria2c_connections > 16) {
+        sol_log_info("aria2c max connections per server is 16; clamping from %u",
+                     (unsigned)aria2c_connections);
+        aria2c_connections = 16;
+    }
+
+    if (use_aria2c) {
+        bool aria_resume = options.resume;
+        if (aria_resume && probe_ok && !supports_ranges) {
+            sol_log_info("Disabling aria2c resume because server did not confirm range support: %s",
+                         effective_url);
+            aria_resume = false;
+        }
+
+        sol_log_info("Downloading with aria2c (%u connections): %s",
+                     (unsigned)aria2c_connections,
+                     effective_url);
+        sol_sighandler_fn_t old_int = SIG_DFL;
+        sol_sighandler_fn_t old_term = SIG_DFL;
+        sol_snapshot_download_install_signal_handlers(&old_int, &old_term);
+        sol_err_t aria_err = snapshot_download_with_aria2c(
+            effective_url,
+            tmp_path,
+            aria2c_connections,
+            aria_resume,
+            options.timeout_secs);
+        sol_snapshot_download_restore_signal_handlers(old_int, old_term);
+
+        if (aria_err == SOL_ERR_SHUTDOWN) {
+            sol_free(resolved_url);
+            return aria_err;
+        }
+        if (aria_err != SOL_OK) {
+            sol_log_error("Snapshot download failed (aria2c)");
+            if (moved_final_to_partial) {
+                if (access(out_path, F_OK) != 0) {
+                    (void)rename(tmp_path, out_path);
+                }
+            }
+            sol_free(resolved_url);
+            return aria_err;
+        }
+
+        goto download_finalize;
+    }
+
     sol_log_info("Downloading: %s", effective_url);
 
     char timeout_buf[32];
-    uint32_t timeout = options.timeout_secs ? options.timeout_secs : 0;
-    if (timeout > 0) snprintf(timeout_buf, sizeof(timeout_buf), "%u", timeout);
+    uint32_t timeout = snapshot_curl_effective_timeout(options.timeout_secs);
+    snprintf(timeout_buf, sizeof(timeout_buf), "%u", (unsigned)timeout);
+
+    char conn_timeout_buf[16];
+    char speed_time_buf[16];
+    char speed_limit_buf[16];
+    snprintf(conn_timeout_buf, sizeof(conn_timeout_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_CONNECT_TIMEOUT_SECS);
+    snprintf(speed_time_buf, sizeof(speed_time_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_SPEED_TIME_SECS);
+    snprintf(speed_limit_buf, sizeof(speed_limit_buf), "%u", (unsigned)SOL_SNAPSHOT_CURL_SPEED_LIMIT_BPS);
 
     sol_sighandler_fn_t old_int = SIG_DFL;
     sol_sighandler_fn_t old_term = SIG_DFL;
@@ -2577,75 +3969,127 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
                 resume_from = (uint64_t)st.st_size;
             }
         }
+        /* Resume requires HTTP range support. When the server doesn't support
+         * byte ranges we always restart from scratch on each attempt. */
+        if (!supports_ranges) {
+            resume_from = 0;
+        }
 
         char resume_buf[32] = {0};
         if (resume_from > 0) snprintf(resume_buf, sizeof(resume_buf), "%lu", (unsigned long)resume_from);
 
-        const char* argv[32];
-        size_t argc = 0;
-        argv[argc++] = "curl";
-        argv[argc++] = "--http1.1";
-        argv[argc++] = "-fL";
-        argv[argc++] = "--retry";
-        argv[argc++] = "5";
-        argv[argc++] = "--retry-delay";
-        argv[argc++] = "1";
-        argv[argc++] = "--retry-connrefused";
-        argv[argc++] = "-o";
-        argv[argc++] = tmp_path;
-        if (resume_from > 0 && supports_ranges) {
-            argv[argc++] = "-C";
-            argv[argc++] = resume_buf;
-        }
-        if (timeout > 0) {
-            argv[argc++] = "-m";
-            argv[argc++] = timeout_buf;
-        }
-        argv[argc++] = effective_url;
-        argv[argc++] = NULL;
-
-        pid_t pid = sol_spawn_process(argv);
-        if (pid < 0) {
-            sol_snapshot_download_restore_signal_handlers(old_int, old_term);
-            sol_free(resolved_url);
-            return SOL_ERR_IO;
+        bool use_pipe_writer = false;
+        if (options.io_ctx && sol_io_ctx_backend(options.io_ctx) == SOL_IO_BACKEND_URING) {
+            /* Only use the pipe writer when the origin doesn't support ranges.
+             * When ranges are supported we already use the direct parallel
+             * downloader, which also writes via the IO backend. */
+            use_pipe_writer = !supports_ranges;
         }
 
-        int status = 0;
-        while (1) {
-            if (sol_snapshot_download_should_abort()) {
-                (void)kill(pid, SIGTERM);
-                while (waitpid(pid, &status, 0) < 0) {
-                    if (errno == EINTR) continue;
-                    break;
-                }
-                sol_snapshot_download_restore_signal_handlers(old_int, old_term);
-                return SOL_ERR_SHUTDOWN;
-            }
+        if (use_pipe_writer) {
+            sol_log_info("Downloading via curl stream (disk writes: %s): %s",
+                         sol_io_backend_str(sol_io_ctx_backend(options.io_ctx)),
+                         effective_url);
 
-            pid_t r = waitpid(pid, &status, WNOHANG);
-            if (r == 0) {
-                struct timespec ts = {0, 200 * 1000000L}; /* 200ms */
-                nanosleep(&ts, NULL);
-                continue;
-            }
-            if (r < 0) {
-                if (errno == EINTR) continue;
+            int out_fd = open(tmp_path,
+                              O_CREAT | O_WRONLY | (resume_from ? 0 : O_TRUNC) | O_CLOEXEC,
+                              0644);
+            if (out_fd < 0) {
                 sol_snapshot_download_restore_signal_handlers(old_int, old_term);
                 sol_free(resolved_url);
                 return SOL_ERR_IO;
             }
-            break;
-        }
 
-        if (WIFEXITED(status)) {
-            last_exit = WEXITSTATUS(status);
-        } else {
+            sol_err_t perr = snapshot_download_curl_stream_to_fd(effective_url,
+                                                                 out_fd,
+                                                                 resume_from,
+                                                                 expected_size,
+                                                                 timeout,
+                                                                 timeout_buf,
+                                                                 resume_from > 0 && supports_ranges,
+                                                                 options.io_ctx);
+            close(out_fd);
+
+            if (perr == SOL_OK) {
+                last_exit = 0;
+                break;
+            }
+            if (perr == SOL_ERR_SHUTDOWN) {
+                sol_snapshot_download_restore_signal_handlers(old_int, old_term);
+                return SOL_ERR_SHUTDOWN;
+            }
             last_exit = -1;
-        }
+        } else {
+            const char* argv[32];
+            size_t argc = 0;
+            argv[argc++] = "curl";
+            argv[argc++] = "--http1.1";
+            argv[argc++] = "-fL";
+            argv[argc++] = "--retry";
+            argv[argc++] = "5";
+            argv[argc++] = "--retry-delay";
+            argv[argc++] = "1";
+            argv[argc++] = "--retry-connrefused";
+            argv[argc++] = "--connect-timeout";
+            argv[argc++] = conn_timeout_buf;
+            argv[argc++] = "--speed-time";
+            argv[argc++] = speed_time_buf;
+            argv[argc++] = "--speed-limit";
+            argv[argc++] = speed_limit_buf;
+            argv[argc++] = "-o";
+            argv[argc++] = tmp_path;
+            if (resume_from > 0 && supports_ranges) {
+                argv[argc++] = "-C";
+                argv[argc++] = resume_buf;
+            }
+            argv[argc++] = "-m";
+            argv[argc++] = timeout_buf;
+            argv[argc++] = effective_url;
+            argv[argc++] = NULL;
 
-        if (last_exit == 0) {
-            break;
+            pid_t pid = sol_spawn_process(argv);
+            if (pid < 0) {
+                sol_snapshot_download_restore_signal_handlers(old_int, old_term);
+                sol_free(resolved_url);
+                return SOL_ERR_IO;
+            }
+
+            int status = 0;
+            while (1) {
+                if (sol_snapshot_download_should_abort()) {
+                    (void)kill(pid, SIGTERM);
+                    while (waitpid(pid, &status, 0) < 0) {
+                        if (errno == EINTR) continue;
+                        break;
+                    }
+                    sol_snapshot_download_restore_signal_handlers(old_int, old_term);
+                    return SOL_ERR_SHUTDOWN;
+                }
+
+                pid_t r = waitpid(pid, &status, WNOHANG);
+                if (r == 0) {
+                    struct timespec ts = {0, 200 * 1000000L}; /* 200ms */
+                    nanosleep(&ts, NULL);
+                    continue;
+                }
+                if (r < 0) {
+                    if (errno == EINTR) continue;
+                    sol_snapshot_download_restore_signal_handlers(old_int, old_term);
+                    sol_free(resolved_url);
+                    return SOL_ERR_IO;
+                }
+                break;
+            }
+
+            if (WIFEXITED(status)) {
+                last_exit = WEXITSTATUS(status);
+            } else {
+                last_exit = -1;
+            }
+
+            if (last_exit == 0) {
+                break;
+            }
         }
 
         if (!options.resume || attempt == max_attempts) {
@@ -2677,6 +4121,7 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
 
     sol_snapshot_download_restore_signal_handlers(old_int, old_term);
 
+download_finalize:
     if (expected_size > 0 && enforce_size_match) {
         struct stat st2;
         if (stat(tmp_path, &st2) != 0) {

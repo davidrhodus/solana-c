@@ -89,6 +89,7 @@ typedef struct {
     /* Address lookup tables (v0 only) */
     sol_address_lookup_t*       address_lookups;
     uint8_t                     address_lookups_len;
+    sol_address_lookup_t        address_lookups_storage[SOL_MAX_ADDRESS_LOOKUP_TABLES];
 
     /*
      * Resolved accounts (after lookup table expansion)

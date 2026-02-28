@@ -222,6 +222,13 @@ bool sol_ping_verify(const sol_ping_t* ping);
 bool sol_pong_verify(const sol_pong_t* pong, const sol_ping_t* ping);
 
 /*
+ * Sign a CRDS value using the provided keypair
+ *
+ * The signature covers the CRDS value data (type tag + payload).
+ */
+sol_err_t sol_gossip_crds_value_sign(sol_crds_value_t* value, const sol_keypair_t* keypair);
+
+/*
  * Message type name
  */
 static inline const char*

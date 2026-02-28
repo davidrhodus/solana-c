@@ -15,10 +15,126 @@
 #include "../bpf/sol_bpf.h"
 #include "../crypto/sol_sha256.h"
 #include "../txn/sol_pubkey.h"
+#include "../util/sol_hash_fn.h"
 #include "../util/sol_log.h"
 #include "../util/sol_alloc.h"
+#include "../util/sol_map.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <time.h>
+
+/* Profiling helpers (opt-in via SOL_SBF_PROFILE=1). */
+static inline uint64_t
+monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void sbf_profile_report_atexit(void);
+
+static int
+sbf_profile_enabled(void) {
+    static int cached = -1;
+    static int registered = 0;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) return v != 0;
+    const char* env = getenv("SOL_SBF_PROFILE");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    if (enabled && __sync_bool_compare_and_swap(&registered, 0, 1)) {
+        atexit(sbf_profile_report_atexit);
+    }
+    return enabled != 0;
+}
+
+/* Diagnostics that stringify pubkeys and dump account headers can be very
+ * expensive on mainnet. Opt-in via SOL_SBF_VM_DIAG=1. */
+static int
+sbf_vm_diag_enabled(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) return v != 0;
+    const char* env = getenv("SOL_SBF_VM_DIAG");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static uint64_t
+sbf_slow_threshold_ns(void) {
+    /* Returns 0 when disabled. Cached after first call. */
+    static _Atomic uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) {
+        return v;
+    }
+
+    uint64_t ns = 0;
+    const char* env = getenv("SOL_SBF_SLOW_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long ms = strtoul(env, &end, 10);
+        if (end != env && ms > 0ul) {
+            ns = (uint64_t)ms * 1000000ull;
+        }
+    }
+
+    __atomic_store_n(&cached, ns, __ATOMIC_RELEASE);
+    return ns;
+}
+
+static _Atomic uint64_t g_sbf_prof_calls = 0;
+static _Atomic uint64_t g_sbf_prof_build_ns = 0;
+static _Atomic uint64_t g_sbf_prof_map_ns = 0;
+static _Atomic uint64_t g_sbf_prof_exec_ns = 0;
+static _Atomic uint64_t g_sbf_prof_wb_ns = 0;
+static _Atomic uint64_t g_sbf_prof_input_bytes = 0;
+static _Atomic uint64_t g_sbf_prof_meta_total = 0;
+
+static inline void
+sbf_profile_commit(uint64_t build_ns,
+                   uint64_t map_ns,
+                   uint64_t exec_ns,
+                   uint64_t wb_ns,
+                   size_t input_len,
+                   size_t meta_count) {
+    __atomic_fetch_add(&g_sbf_prof_calls, 1u, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_sbf_prof_build_ns, build_ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_sbf_prof_map_ns, map_ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_sbf_prof_exec_ns, exec_ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_sbf_prof_wb_ns, wb_ns, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_sbf_prof_input_bytes, (uint64_t)input_len, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_sbf_prof_meta_total, (uint64_t)meta_count, __ATOMIC_RELAXED);
+}
+
+static void
+sbf_profile_report_atexit(void) {
+    if (!sbf_profile_enabled()) return;
+    uint64_t calls = __atomic_load_n(&g_sbf_prof_calls, __ATOMIC_RELAXED);
+    if (!calls) return;
+    uint64_t build_ns = __atomic_load_n(&g_sbf_prof_build_ns, __ATOMIC_RELAXED);
+    uint64_t map_ns = __atomic_load_n(&g_sbf_prof_map_ns, __ATOMIC_RELAXED);
+    uint64_t exec_ns = __atomic_load_n(&g_sbf_prof_exec_ns, __ATOMIC_RELAXED);
+    uint64_t wb_ns = __atomic_load_n(&g_sbf_prof_wb_ns, __ATOMIC_RELAXED);
+    uint64_t bytes = __atomic_load_n(&g_sbf_prof_input_bytes, __ATOMIC_RELAXED);
+    uint64_t metas = __atomic_load_n(&g_sbf_prof_meta_total, __ATOMIC_RELAXED);
+
+    double ms_build = (double)build_ns / 1e6;
+    double ms_map = (double)map_ns / 1e6;
+    double ms_exec = (double)exec_ns / 1e6;
+    double ms_wb = (double)wb_ns / 1e6;
+
+    fprintf(stderr,
+            "sbf_profile: calls=%lu build_ms=%.3f map_ms=%.3f exec_ms=%.3f wb_ms=%.3f "
+            "avg_input_kb=%.2f avg_meta=%.2f\n",
+            (unsigned long)calls,
+            ms_build, ms_map, ms_exec, ms_wb,
+            calls ? ((double)bytes / 1024.0 / (double)calls) : 0.0,
+            calls ? ((double)metas / (double)calls) : 0.0);
+}
 
 /*
  * SBF entrypoint input serialization (Agave v3.1.8 compatible)
@@ -37,25 +153,56 @@ typedef struct {
     bool        is_signer;
     uint64_t    pre_lamports;
     uint64_t    pre_data_len;
+    /* Optional pre-exec snapshot retained from sbf_build_input().
+     *
+     * Writeback needs to observe CPI mutations, so it generally reloads the
+     * current account value from the bank. However, for overlay banks most
+     * accounts are unchanged locally; reloading from the parent can hit disk
+     * (AppendVec page faults / pread), causing multi-second stalls. Retaining
+     * the pre-exec snapshot allows writeback to:
+     * - validate read-only accounts without reloading
+     * - use the snapshot as the "current" value when the overlay has no local
+     *   entry (i.e. the account was not modified by CPI/previous instructions)
+     *
+     * This pointer is owned by the meta and released via
+     * sbf_metas_release_retained(). */
+    sol_account_t* ro_account;
     size_t      owner_off;
     size_t      lamports_off;
     size_t      data_len_off;
     size_t      data_off;
 } sol_sbf_account_meta_t;
 
+static void
+sbf_metas_release_retained(sol_sbf_account_meta_t* metas, size_t meta_count) {
+    if (!metas) return;
+    for (size_t i = 0; i < meta_count; i++) {
+        if (metas[i].ro_account) {
+            sol_account_destroy(metas[i].ro_account);
+            metas[i].ro_account = NULL;
+        }
+    }
+}
+
 typedef struct {
     uint8_t* data;
     size_t   len;
     size_t   cap;
+    bool     pooled;
+    bool     zeroed; /* true when [len..cap) is known to be zero-filled */
 } sol_sbf_buf_t;
 
 static void
 sbf_buf_free(sol_sbf_buf_t* b) {
     if (!b) return;
-    sol_free(b->data);
+    if (!b->pooled) {
+        sol_free(b->data);
+    }
     b->data = NULL;
     b->len = 0;
     b->cap = 0;
+    b->pooled = false;
+    b->zeroed = false;
 }
 
 static bool
@@ -64,6 +211,9 @@ sbf_buf_reserve(sol_sbf_buf_t* b, size_t extra) {
     if (extra > SIZE_MAX - b->len) return false;
     size_t need = b->len + extra;
     if (need <= b->cap) return true;
+
+    /* Pooled buffers are fixed-size and must not be reallocated. */
+    if (b->pooled) return false;
 
     size_t new_cap = b->cap ? b->cap : 4096u;
     while (new_cap < need) {
@@ -74,10 +224,21 @@ sbf_buf_reserve(sol_sbf_buf_t* b, size_t extra) {
         new_cap *= 2;
     }
 
-    uint8_t* next = (uint8_t*)sol_realloc(b->data, new_cap);
+    /* Critical perf path: The aligned SBF input format includes large zero
+     * padding regions (10 KiB realloc pad per account). Explicitly writing
+     * those zeros with memset is extremely expensive. Use zeroed allocations
+     * so sbf_buf_write_zeros() can simply advance the cursor without touching
+     * memory; large calloc() allocations typically come from mmap'd zero pages
+     * and don't require per-byte stores. */
+    uint8_t* next = (uint8_t*)sol_calloc(1u, new_cap);
     if (!next) return false;
+    if (b->data && b->len) {
+        memcpy(next, b->data, b->len);
+    }
+    sol_free(b->data);
     b->data = next;
     b->cap = new_cap;
+    b->zeroed = true;
     return true;
 }
 
@@ -94,7 +255,9 @@ static bool
 sbf_buf_write_zeros(sol_sbf_buf_t* b, size_t n) {
     if (!b) return false;
     if (!sbf_buf_reserve(b, n)) return false;
-    memset(b->data + b->len, 0, n);
+    if (!b->zeroed && n) {
+        memset(b->data + b->len, 0, n);
+    }
     b->len += n;
     return true;
 }
@@ -108,6 +271,349 @@ static bool
 sbf_buf_write_u64_le(sol_sbf_buf_t* b, uint64_t v) {
     /* Host is little-endian (Linux x86_64); serialize as little-endian. */
     return sbf_buf_write(b, &v, sizeof(uint64_t));
+}
+
+typedef struct {
+    uint8_t* buf;
+    size_t   cap;
+} sol_sbf_input_pool_t;
+
+static inline bool
+sbf_size_add(size_t* acc, size_t v) {
+    if (!acc) return false;
+    if (v > SIZE_MAX - *acc) return false;
+    *acc += v;
+    return true;
+}
+
+static inline bool
+sbf_u64_to_size(uint64_t v, size_t* out) {
+    if (!out) return false;
+    if (v > (uint64_t)SIZE_MAX) return false;
+    *out = (size_t)v;
+    return true;
+}
+
+static void
+sbf_loaded_accounts_destroy(sol_account_t* loaded_accounts[256]) {
+    if (!loaded_accounts) return;
+    for (size_t i = 0; i < 256u; i++) {
+        if (loaded_accounts[i]) {
+            sol_account_destroy(loaded_accounts[i]);
+            loaded_accounts[i] = NULL;
+        }
+    }
+}
+
+/*
+ * BPF program cache
+ *
+ * Mainnet execution invokes a small set of hot programs (Token, Memo, etc)
+ * many times per slot. Loading/parsing ELF from AppendVec on every invocation
+ * is catastrophic for replay throughput. Cache loaded `sol_bpf_program_t` per
+ * program-id and invalidate when the loader modifies program/programdata.
+ */
+typedef struct sol_bpf_prog_handle {
+    sol_bpf_program_t* prog;            /* Loaded ELF (ro_section + instruction view) */
+    sol_pubkey_t       programdata;     /* Upgradeable: ProgramData pubkey */
+    bool               has_programdata;
+    bool               loader_deprecated;
+    uint64_t           last_used;       /* LRU clock (updated under cache lock) */
+    size_t             ro_section_len;  /* For cache sizing */
+    uint32_t           refcnt;          /* Includes cache's ref while resident */
+
+    /* Cache-miss coordination: on mainnet it's common for many txs in a slot to
+     * invoke the same (previously unseen) program. Without coordination, every
+     * worker thread races to load+parse the same ELF, causing huge tail latency
+     * spikes. */
+    pthread_mutex_t    load_mu;
+    pthread_cond_t     load_cv;
+    int               load_state;       /* 0=ready 1=loading 2=failed */
+    sol_err_t          load_err;
+    bool              load_sync_inited;
+} sol_bpf_prog_handle_t;
+
+enum {
+    BPF_PROG_STATE_READY = 0,
+    BPF_PROG_STATE_LOADING = 1,
+    BPF_PROG_STATE_FAILED = 2,
+};
+
+static pthread_once_t    g_bpf_prog_cache_once = PTHREAD_ONCE_INIT;
+static pthread_rwlock_t  g_bpf_prog_cache_lock;
+static sol_pubkey_map_t* g_bpf_prog_cache = NULL;
+static uint64_t          g_bpf_prog_cache_clock = 0;
+static size_t            g_bpf_prog_cache_total_bytes = 0;
+static size_t            g_bpf_prog_cache_max_bytes = 0;
+static size_t            g_bpf_prog_cache_max_entries = 0;
+
+static inline void
+bpf_prog_handle_acquire(sol_bpf_prog_handle_t* h) {
+    if (!h) return;
+    __atomic_fetch_add(&h->refcnt, 1u, __ATOMIC_ACQUIRE);
+}
+
+static inline void
+bpf_prog_handle_release(sol_bpf_prog_handle_t* h) {
+    if (!h) return;
+    uint32_t prev = __atomic_fetch_sub(&h->refcnt, 1u, __ATOMIC_RELEASE);
+    if (prev == 1u) {
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (h->prog) {
+            sol_bpf_program_destroy(h->prog);
+        }
+        if (h->load_sync_inited) {
+            (void)pthread_cond_destroy(&h->load_cv);
+            (void)pthread_mutex_destroy(&h->load_mu);
+        }
+        sol_free(h);
+    }
+}
+
+static sol_bpf_prog_handle_t*
+bpf_prog_handle_new(int state) {
+    sol_bpf_prog_handle_t* h = sol_alloc_t(sol_bpf_prog_handle_t);
+    if (!h) return NULL;
+    memset(h, 0, sizeof(*h));
+    h->refcnt = 1u;
+    h->load_state = state;
+    h->load_err = SOL_OK;
+
+    if (pthread_mutex_init(&h->load_mu, NULL) != 0) {
+        sol_free(h);
+        return NULL;
+    }
+    if (pthread_cond_init(&h->load_cv, NULL) != 0) {
+        (void)pthread_mutex_destroy(&h->load_mu);
+        sol_free(h);
+        return NULL;
+    }
+    h->load_sync_inited = true;
+    return h;
+}
+
+static inline sol_err_t
+bpf_prog_handle_wait_ready(sol_bpf_prog_handle_t* h) {
+    if (!h) return SOL_ERR_INVAL;
+    int st = __atomic_load_n(&h->load_state, __ATOMIC_ACQUIRE);
+    if (st == BPF_PROG_STATE_READY) {
+        return (h->prog != NULL) ? SOL_OK : SOL_ERR_INVAL;
+    }
+    if (!h->load_sync_inited) {
+        return h->load_err ? h->load_err : SOL_ERR_INVAL;
+    }
+
+    pthread_mutex_lock(&h->load_mu);
+    while (h->load_state == BPF_PROG_STATE_LOADING) {
+        pthread_cond_wait(&h->load_cv, &h->load_mu);
+    }
+    sol_err_t err = SOL_OK;
+    if (h->load_state != BPF_PROG_STATE_READY || !h->prog) {
+        err = h->load_err ? h->load_err : SOL_ERR_INVAL;
+    }
+    pthread_mutex_unlock(&h->load_mu);
+    return err;
+}
+
+static size_t
+parse_size_env(const char* env, size_t def) {
+    if (!env || env[0] == '\0') return def;
+    char* end = NULL;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end == env) return def;
+    if (v > (unsigned long long)SIZE_MAX) return def;
+    return (size_t)v;
+}
+
+static void
+bpf_prog_cache_do_init(void) {
+    (void)pthread_rwlock_init(&g_bpf_prog_cache_lock, NULL);
+
+    /* Default: 1 GiB cache, 8192 entries. Override via env.
+     * Set either to 0 to disable caching. */
+    size_t mb = parse_size_env(getenv("SOL_BPF_PROG_CACHE_MB"), 1024u);
+    g_bpf_prog_cache_max_entries = parse_size_env(getenv("SOL_BPF_PROG_CACHE_ENTRIES"), 8192u);
+    if (mb == 0 || g_bpf_prog_cache_max_entries == 0) {
+        g_bpf_prog_cache_max_bytes = 0;
+        g_bpf_prog_cache_max_entries = 0;
+        g_bpf_prog_cache = NULL;
+        return;
+    }
+
+    if (mb > (SIZE_MAX / (1024u * 1024u))) {
+        mb = SIZE_MAX / (1024u * 1024u);
+    }
+    g_bpf_prog_cache_max_bytes = mb * 1024u * 1024u;
+
+    /* program_id -> sol_bpf_prog_handle_t* */
+    g_bpf_prog_cache = sol_pubkey_map_new(sizeof(sol_bpf_prog_handle_t*), 1024u);
+    if (!g_bpf_prog_cache) {
+        g_bpf_prog_cache_max_bytes = 0;
+        g_bpf_prog_cache_max_entries = 0;
+    }
+}
+
+static inline void
+bpf_prog_cache_init(void) {
+    (void)pthread_once(&g_bpf_prog_cache_once, bpf_prog_cache_do_init);
+}
+
+static void
+bpf_prog_cache_remove_locked(const sol_pubkey_t* program_id) {
+    if (!g_bpf_prog_cache || !program_id) return;
+
+    sol_bpf_prog_handle_t** slot = (sol_bpf_prog_handle_t**)sol_pubkey_map_get(g_bpf_prog_cache, program_id);
+    if (!slot || !*slot) return;
+
+    sol_bpf_prog_handle_t* victim = *slot;
+    (void)sol_pubkey_map_remove(g_bpf_prog_cache, program_id);
+
+    if (victim) {
+        if (g_bpf_prog_cache_total_bytes >= victim->ro_section_len) {
+            g_bpf_prog_cache_total_bytes -= victim->ro_section_len;
+        } else {
+            g_bpf_prog_cache_total_bytes = 0;
+        }
+        /* Drop the cache's reference; handle may stay alive while executing. */
+        bpf_prog_handle_release(victim);
+    }
+}
+
+static void
+bpf_prog_cache_evict_one_locked(void) {
+    if (!g_bpf_prog_cache) return;
+    if (sol_map_size(g_bpf_prog_cache->inner) == 0) return;
+
+    sol_pubkey_t victim_key = {0};
+    bool found = false;
+    uint64_t best = UINT64_MAX;
+
+    sol_map_iter_t it = sol_map_iter(g_bpf_prog_cache->inner);
+    void* keyp = NULL;
+    void* valp = NULL;
+    while (sol_map_iter_next(&it, &keyp, &valp)) {
+        sol_bpf_prog_handle_t* h = valp ? *(sol_bpf_prog_handle_t**)valp : NULL;
+        if (!h || !h->prog) continue;
+        if (h->last_used < best) {
+            best = h->last_used;
+            memcpy(victim_key.bytes, keyp, SOL_PUBKEY_SIZE);
+            found = true;
+        }
+    }
+
+    if (!found) return;
+
+    bpf_prog_cache_remove_locked(&victim_key);
+}
+
+static void
+bpf_prog_cache_evict_if_needed_locked(size_t incoming_bytes) {
+    if (!g_bpf_prog_cache) return;
+
+    /* Ensure we can at least hold one program. */
+    if (incoming_bytes > g_bpf_prog_cache_max_bytes) {
+        while (sol_map_size(g_bpf_prog_cache->inner) > 0) {
+            bpf_prog_cache_evict_one_locked();
+        }
+        return;
+    }
+
+    while (sol_map_size(g_bpf_prog_cache->inner) >= g_bpf_prog_cache_max_entries ||
+           g_bpf_prog_cache_total_bytes + incoming_bytes > g_bpf_prog_cache_max_bytes) {
+        size_t before = sol_map_size(g_bpf_prog_cache->inner);
+        bpf_prog_cache_evict_one_locked();
+        if (sol_map_size(g_bpf_prog_cache->inner) == before) {
+            break;
+        }
+    }
+}
+
+static sol_bpf_prog_handle_t*
+bpf_prog_cache_get_locked(const sol_pubkey_t* program_id) {
+    if (!g_bpf_prog_cache || !program_id) return NULL;
+    sol_bpf_prog_handle_t** slot = (sol_bpf_prog_handle_t**)sol_pubkey_map_get(g_bpf_prog_cache, program_id);
+    sol_bpf_prog_handle_t* h = slot ? *slot : NULL;
+    if (h) {
+        bpf_prog_handle_acquire(h);
+    }
+    return h;
+}
+
+static sol_bpf_prog_handle_t*
+bpf_prog_cache_insert_locked(const sol_pubkey_t* program_id, sol_bpf_prog_handle_t* h) {
+    if (!g_bpf_prog_cache || !program_id || !h) return NULL;
+
+    /* Another thread may have inserted while we were loading. Use the existing handle. */
+    sol_bpf_prog_handle_t* existing = bpf_prog_cache_get_locked(program_id);
+    if (existing) {
+        return existing;
+    }
+
+    if (h->ro_section_len > g_bpf_prog_cache_max_bytes) {
+        return NULL;
+    }
+
+    bpf_prog_cache_evict_if_needed_locked(h->ro_section_len);
+
+    h->last_used = ++g_bpf_prog_cache_clock;
+    h->refcnt = 1u; /* cache owns one ref while resident */
+
+    sol_bpf_prog_handle_t* val = h;
+    void* slot = sol_pubkey_map_insert(g_bpf_prog_cache, program_id, &val);
+    if (!slot) {
+        return NULL;
+    }
+
+    g_bpf_prog_cache_total_bytes += h->ro_section_len;
+
+    /* Return an acquired ref for execution. */
+    bpf_prog_handle_acquire(h);
+    return h;
+}
+
+static void
+bpf_prog_cache_invalidate_program(const sol_pubkey_t* program_id) {
+    bpf_prog_cache_init();
+    if (!g_bpf_prog_cache) return;
+    pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
+    bpf_prog_cache_remove_locked(program_id);
+    pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+
+    /* Parallel scheduler also caches Program->ProgramData mapping. */
+    sol_bank_programdata_cache_invalidate_program(program_id);
+}
+
+static void
+bpf_prog_cache_invalidate_programdata(const sol_pubkey_t* programdata_id) {
+    bpf_prog_cache_init();
+    if (!g_bpf_prog_cache || !programdata_id) return;
+
+    pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
+
+    sol_pubkey_t to_remove[128];
+    size_t n = 0;
+
+    sol_map_iter_t it = sol_map_iter(g_bpf_prog_cache->inner);
+    void* keyp = NULL;
+    void* valp = NULL;
+    while (sol_map_iter_next(&it, &keyp, &valp)) {
+        sol_bpf_prog_handle_t* h = valp ? *(sol_bpf_prog_handle_t**)valp : NULL;
+        if (!h || !h->prog) continue;
+        if (!h->has_programdata) continue;
+        if (!sol_pubkey_eq(&h->programdata, programdata_id)) continue;
+        if (n < (sizeof(to_remove) / sizeof(to_remove[0]))) {
+            memcpy(to_remove[n].bytes, keyp, SOL_PUBKEY_SIZE);
+            n++;
+        }
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        bpf_prog_cache_remove_locked(&to_remove[i]);
+    }
+
+    pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+
+    sol_bank_programdata_cache_invalidate_programdata(programdata_id);
 }
 
 static sol_err_t
@@ -136,47 +642,186 @@ sbf_build_input(
         return SOL_ERR_PROGRAM_INVALID_INSTR;
     }
 
-    sol_sbf_buf_t b = {0};
-
-    /* ka_num (u64) */
-    if (!sbf_buf_write_u64_le(&b, (uint64_t)ctx->account_indices_len)) {
-        sbf_buf_free(&b);
-        return SOL_ERR_NOMEM;
-    }
+    sol_err_t err = SOL_OK;
 
     int16_t first_pos[256];
     for (size_t i = 0; i < 256; i++) {
         first_pos[i] = -1;
     }
 
+    /* Load unique accounts once, then allocate the full SBF input buffer once.
+     *
+     * Performance note: aligned SBF input includes large zero padding regions
+     * (10 KiB realloc pad per account). The existing sbf_buf_reserve() uses
+     * calloc() so sbf_buf_write_zeros() can advance without touching memory,
+     * but repeated growth/copy dominates build time. */
+    sol_account_t* loaded_accounts[256] = {0};
+    const sol_slot_t zombie_slot = sol_bank_zombie_filter_slot(ctx->bank);
+    sol_sbf_buf_t b = {0};
     size_t meta_count = 0;
 
+    size_t total_len = 0;
+    if (!sbf_size_add(&total_len, sizeof(uint64_t))) { /* ka_num */
+        err = SOL_ERR_NOMEM;
+        goto fail;
+    }
+
+    size_t meta_count_pre = 0;
     for (uint8_t ix_pos = 0; ix_pos < ctx->account_indices_len; ix_pos++) {
         uint8_t key_idx = ctx->account_indices[ix_pos];
         if (key_idx >= ctx->account_keys_len) {
-            sbf_buf_free(&b);
-            return SOL_ERR_PROGRAM_INVALID_INSTR;
+            err = SOL_ERR_PROGRAM_INVALID_INSTR;
+            goto fail;
         }
 
         int16_t prev = first_pos[key_idx];
         if (prev >= 0) {
             /* Duplicate account reference */
-            if (!sbf_buf_write_u8(&b, (uint8_t)prev)) {
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+            if (!sbf_size_add(&total_len, 1u)) { /* dup marker */
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
-            /* Aligned (v2/upgradeable): 7 bytes padding.
-               Unaligned (deprecated v1): no padding. */
             if (!is_loader_deprecated) {
-                if (!sbf_buf_write_zeros(&b, SOL_SBF_DUP_PADDING)) {
-                    sbf_buf_free(&b);
-                    return SOL_ERR_NOMEM;
+                if (!sbf_size_add(&total_len, (size_t)SOL_SBF_DUP_PADDING)) {
+                    err = SOL_ERR_NOMEM;
+                    goto fail;
                 }
             }
             continue;
         }
 
         first_pos[key_idx] = (int16_t)ix_pos;
+
+        const sol_pubkey_t* key = &ctx->account_keys[key_idx];
+        sol_slot_t stored_slot = 0;
+        sol_account_t* account = sol_bank_load_account_view_ex(ctx->bank, key, &stored_slot);
+
+        /* Zombie filtering (see main serialization loop for rationale). */
+        if (account && account->meta.lamports == 0 &&
+            stored_slot <= zombie_slot) {
+            sol_account_destroy(account);
+            account = NULL;
+        }
+
+        loaded_accounts[key_idx] = account;
+
+        uint64_t data_len_u64 = account ? account->meta.data_len : 0;
+        size_t data_len = 0;
+        if (!sbf_u64_to_size(data_len_u64, &data_len)) {
+            err = SOL_ERR_NOMEM;
+            goto fail;
+        }
+
+        if (is_loader_deprecated) {
+            /* 92 bytes of fixed fields + data_len bytes */
+            if (!sbf_size_add(&total_len, 92u) ||
+                !sbf_size_add(&total_len, data_len)) {
+                err = SOL_ERR_NOMEM;
+                goto fail;
+            }
+        } else {
+            /* 10336 bytes of fixed fields (incl realloc pad + rent_epoch) + data + align pad */
+            size_t pad = (8u - (data_len & 7u)) & 7u;
+            if (!sbf_size_add(&total_len, 10336u) ||
+                !sbf_size_add(&total_len, data_len) ||
+                !sbf_size_add(&total_len, pad)) {
+                err = SOL_ERR_NOMEM;
+                goto fail;
+            }
+        }
+
+        meta_count_pre++;
+        if (meta_count_pre > SOL_MAX_ACCOUNTS_PER_TX) {
+            err = SOL_ERR_PROGRAM_MAX_ACCOUNTS;
+            goto fail;
+        }
+    }
+
+    /* instruction data (u64 len + bytes) */
+    size_t ix_data_len = 0;
+    if (!sbf_u64_to_size((uint64_t)ctx->instruction_data_len, &ix_data_len)) {
+        err = SOL_ERR_NOMEM;
+        goto fail;
+    }
+    if (!sbf_size_add(&total_len, sizeof(uint64_t)) ||
+        !sbf_size_add(&total_len, ix_data_len) ||
+        !sbf_size_add(&total_len, 32u)) { /* program id */
+        err = SOL_ERR_NOMEM;
+        goto fail;
+    }
+
+    /* Pool serialized SBF input buffers per OS thread and CPI stack height to
+     * avoid repeated large calloc/free churn and page faults on mainnet.
+     *
+     * IMPORTANT: use a distinct pool slot per stack height so nested CPI
+     * invocations don't clobber the caller's serialized buffer. */
+    enum { SOL_SBF_INPUT_POOL_MAX = 8 };
+    static __thread sol_sbf_input_pool_t tls_input_pool[SOL_SBF_INPUT_POOL_MAX];
+
+    size_t pool_idx = 0;
+    if (ctx && ctx->stack_height > 0) {
+        pool_idx = (size_t)(ctx->stack_height - 1u);
+        if (pool_idx >= SOL_SBF_INPUT_POOL_MAX) {
+            pool_idx = SOL_SBF_INPUT_POOL_MAX - 1u;
+        }
+    }
+
+    sol_sbf_input_pool_t* pool = &tls_input_pool[pool_idx];
+    if (!pool->buf || pool->cap < total_len) {
+        size_t new_cap = pool->cap ? pool->cap : 4096u;
+        while (new_cap < total_len) {
+            if (new_cap > SIZE_MAX / 2) {
+                new_cap = total_len;
+                break;
+            }
+            new_cap *= 2u;
+        }
+
+        uint8_t* next = (uint8_t*)sol_alloc(new_cap);
+        if (!next) {
+            err = SOL_ERR_NOMEM;
+            goto fail;
+        }
+        sol_free(pool->buf);
+        pool->buf = next;
+        pool->cap = new_cap;
+    }
+
+    b.data = pool->buf;
+    b.cap = total_len;
+    b.pooled = true;
+    b.zeroed = false;
+
+    /* ka_num (u64) */
+    if (!sbf_buf_write_u64_le(&b, (uint64_t)ctx->account_indices_len)) {
+        err = SOL_ERR_NOMEM;
+        goto fail;
+    }
+
+    for (uint8_t ix_pos = 0; ix_pos < ctx->account_indices_len; ix_pos++) {
+        uint8_t key_idx = ctx->account_indices[ix_pos];
+        if (key_idx >= ctx->account_keys_len) {
+            err = SOL_ERR_PROGRAM_INVALID_INSTR;
+            goto fail;
+        }
+
+        int16_t prev = first_pos[key_idx];
+        if (prev >= 0 && prev != (int16_t)ix_pos) {
+            /* Duplicate account reference */
+            if (!sbf_buf_write_u8(&b, (uint8_t)prev)) {
+                err = SOL_ERR_NOMEM;
+                goto fail;
+            }
+            /* Aligned (v2/upgradeable): 7 bytes padding.
+               Unaligned (deprecated v1): no padding. */
+            if (!is_loader_deprecated) {
+                if (!sbf_buf_write_zeros(&b, SOL_SBF_DUP_PADDING)) {
+                    err = SOL_ERR_NOMEM;
+                    goto fail;
+                }
+            }
+            continue;
+        }
 
         const bool is_signer = ctx->is_signer
             ? ctx->is_signer[key_idx]
@@ -186,19 +831,7 @@ sbf_build_input(
             : false;
 
         const sol_pubkey_t* key = &ctx->account_keys[key_idx];
-        sol_slot_t stored_slot = 0;
-        sol_account_t* account = sol_bank_load_account_ex(ctx->bank, key, &stored_slot);
-
-        /* Agave's is_loadable() returns false for 0-lamport accounts.
-         * Filter zombie accounts (0 lamports, stored before current slot)
-         * to match.  Accounts stored in the current slot are NOT filtered
-         * since they may have been modified by a previous instruction/tx
-         * within the same slot. */
-        if (account && account->meta.lamports == 0 &&
-            stored_slot <= sol_bank_zombie_filter_slot(ctx->bank)) {
-            sol_account_destroy(account);
-            account = NULL;
-        }
+        sol_account_t* account = loaded_accounts[key_idx];
 
         sol_pubkey_t owner = SOL_SYSTEM_PROGRAM_ID;
         uint64_t lamports = 0;
@@ -217,15 +850,6 @@ sbf_build_input(
             data = account->data;
         }
 
-        /* DEBUG: trace System Program executable flag */
-        if (sol_pubkey_eq(key, &SOL_SYSTEM_PROGRAM_ID) && !executable) {
-            sol_log_warn("sbf_build_input: System Program acct=%s exec=%d lamports=%lu owner=%.8s",
-                         account ? "found" : "NULL",
-                         (int)executable,
-                         (unsigned long)lamports,
-                         owner.bytes);
-        }
-
         size_t owner_off, lamports_off, data_len_off, data_off;
 
         if (is_loader_deprecated) {
@@ -239,64 +863,56 @@ sbf_build_input(
             if (!sbf_buf_write_u8(&b, SOL_SBF_NON_DUP_MARKER) ||
                 !sbf_buf_write_u8(&b, is_signer ? 1u : 0u) ||
                 !sbf_buf_write_u8(&b, is_writable ? 1u : 0u)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* key */
             if (!sbf_buf_write(&b, key->bytes, 32u)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* lamports */
             lamports_off = b.len;
             if (!sbf_buf_write_u64_le(&b, lamports)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* data len */
             data_len_off = b.len;
             if (!sbf_buf_write_u64_le(&b, data_len)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* data (no realloc padding, no alignment padding) */
             data_off = b.len;
             if (data_len > 0) {
                 if (!data || !sbf_buf_write(&b, data, (size_t)data_len)) {
-                    if (account) sol_account_destroy(account);
-                    sbf_buf_free(&b);
-                    return SOL_ERR_NOMEM;
+                    err = SOL_ERR_NOMEM;
+                    goto fail;
                 }
             }
 
             /* owner (after data for unaligned format) */
             owner_off = b.len;
             if (!sbf_buf_write(&b, owner.bytes, 32u)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* executable */
             if (!sbf_buf_write_u8(&b, executable ? 1u : 0u)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* rent epoch */
             if (!sbf_buf_write_u64_le(&b, rent_epoch)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
         } else {
             /* ========== Aligned serialization (BPF Loader v2 / Upgradeable) ==========
@@ -311,80 +927,74 @@ sbf_build_input(
                 !sbf_buf_write_u8(&b, is_writable ? 1u : 0u) ||
                 !sbf_buf_write_u8(&b, executable ? 1u : 0u) ||
                 !sbf_buf_write_zeros(&b, 4u)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* key */
             if (!sbf_buf_write(&b, key->bytes, 32u)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* owner */
             owner_off = b.len;
             if (!sbf_buf_write(&b, owner.bytes, 32u)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* lamports */
             lamports_off = b.len;
             if (!sbf_buf_write_u64_le(&b, lamports)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* data len */
             data_len_off = b.len;
             if (!sbf_buf_write_u64_le(&b, data_len)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* data */
             data_off = b.len;
             if (data_len > 0) {
                 if (!data || !sbf_buf_write(&b, data, (size_t)data_len)) {
-                    if (account) sol_account_destroy(account);
-                    sbf_buf_free(&b);
-                    return SOL_ERR_NOMEM;
+                    err = SOL_ERR_NOMEM;
+                    goto fail;
                 }
             }
 
             /* realloc padding */
             if (!sbf_buf_write_zeros(&b, SOL_SBF_MAX_PERMITTED_DATA_INCREASE)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* align to BPF_ALIGN_OF_U128 (8-byte) boundary after realloc region */
             size_t pad = (8u - ((size_t)data_len & 7u)) & 7u;
             if (pad && !sbf_buf_write_zeros(&b, pad)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
 
             /* rent epoch */
             if (!sbf_buf_write_u64_le(&b, rent_epoch)) {
-                if (account) sol_account_destroy(account);
-                sbf_buf_free(&b);
-                return SOL_ERR_NOMEM;
+                err = SOL_ERR_NOMEM;
+                goto fail;
             }
         }
 
         if (meta_count >= SOL_MAX_ACCOUNTS_PER_TX) {
-            if (account) sol_account_destroy(account);
-            sbf_buf_free(&b);
-            return SOL_ERR_PROGRAM_MAX_ACCOUNTS;
+            err = SOL_ERR_PROGRAM_MAX_ACCOUNTS;
+            goto fail;
         }
+
+        /* Retain the pre-exec account snapshot for writeback. This avoids
+         * re-loading from the parent (disk) when the overlay has no local delta. */
+        sol_account_t* ro_keep = account;
 
         out_metas[meta_count++] = (sol_sbf_account_meta_t){
             .key_index = key_idx,
@@ -392,21 +1002,23 @@ sbf_build_input(
             .is_signer = is_signer,
             .pre_lamports = lamports,
             .pre_data_len = data_len,
+            .ro_account = ro_keep,
             .owner_off = owner_off,
             .lamports_off = lamports_off,
             .data_len_off = data_len_off,
             .data_off = data_off,
         };
 
+        /* Transfer ownership of the loaded account snapshot to meta. */
         if (account) {
-            sol_account_destroy(account);
+            loaded_accounts[key_idx] = NULL;
         }
     }
 
     /* instruction data */
     if (!sbf_buf_write_u64_le(&b, (uint64_t)ctx->instruction_data_len)) {
-        sbf_buf_free(&b);
-        return SOL_ERR_NOMEM;
+        err = SOL_ERR_NOMEM;
+        goto fail;
     }
 
     if (out_instruction_data_vaddr) {
@@ -416,22 +1028,29 @@ sbf_build_input(
     if (ctx->instruction_data_len > 0) {
         if (!ctx->instruction_data ||
             !sbf_buf_write(&b, ctx->instruction_data, (size_t)ctx->instruction_data_len)) {
-            sbf_buf_free(&b);
-            return SOL_ERR_NOMEM;
+            err = SOL_ERR_NOMEM;
+            goto fail;
         }
     }
 
     /* program id */
     if (!sbf_buf_write(&b, ctx->program_id.bytes, 32u)) {
-        sbf_buf_free(&b);
-        return SOL_ERR_NOMEM;
+        err = SOL_ERR_NOMEM;
+        goto fail;
     }
 
     *out_buf = b.data;
     *out_len = b.len;
     *out_meta_count = meta_count;
 
+    sbf_loaded_accounts_destroy(loaded_accounts);
     return SOL_OK;
+
+fail:
+    sbf_metas_release_retained(out_metas, meta_count);
+    sbf_loaded_accounts_destroy(loaded_accounts);
+    sbf_buf_free(&b);
+    return err;
 }
 
 static sol_err_t
@@ -451,8 +1070,15 @@ sbf_apply_output(
     }
 
     /* Verify instruction lamports balance (best-effort). */
+    static int sbf_wb_diag_cached = -1;
+    if (sbf_wb_diag_cached < 0) {
+        const char* env = getenv("SOL_SBF_WB_DIAG");
+        sbf_wb_diag_cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    bool wb_diag = sbf_wb_diag_cached != 0;
+
     int128 delta = 0;
-    int128 bank_delta = 0;  /* cross-check against current bank values */
+    int128 bank_delta = 0;  /* cross-check against current bank values (diagnostic) */
     for (size_t i = 0; i < meta_count; i++) {
         const sol_sbf_account_meta_t* m = &metas[i];
         if (m->lamports_off + sizeof(uint64_t) > buf_len) {
@@ -465,8 +1091,8 @@ sbf_apply_output(
         delta += (int128)post_lamports - (int128)m->pre_lamports;
 
         /* Cross-check: compare post_lamports vs current bank value */
-        if (m->key_index < ctx->account_keys_len) {
-            sol_account_t* _chk = sol_bank_load_account(ctx->bank, &ctx->account_keys[m->key_index]);
+        if (wb_diag && m->key_index < ctx->account_keys_len) {
+            sol_account_t* _chk = sol_bank_load_account_view(ctx->bank, &ctx->account_keys[m->key_index]);
             uint64_t bank_lam = _chk ? _chk->meta.lamports : 0;
             if (_chk) sol_account_destroy(_chk);
             bank_delta += (int128)post_lamports - (int128)bank_lam;
@@ -480,15 +1106,14 @@ sbf_apply_output(
             }
         }
     }
-    /* Always log the balance check result for diagnostics */
-    {
+    /* Optional writeback diagnostics: these require loading bank state and can
+     * severely throttle replay. */
+    if (wb_diag && (delta != 0 || bank_delta != 0)) {
         char _prog58[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&ctx->program_id, _prog58, sizeof(_prog58));
-        if (delta != 0 || bank_delta != 0) {
-            sol_log_info("SBF_BALANCE: delta=%lld bank_delta=%lld meta_count=%zu program=%s depth=%u",
-                         (long long)(int64_t)delta, (long long)(int64_t)bank_delta,
-                         meta_count, _prog58, (unsigned)ctx->stack_height);
-        }
+        sol_log_info("SBF_BALANCE: delta=%lld bank_delta=%lld meta_count=%zu program=%s depth=%u",
+                     (long long)(int64_t)delta, (long long)(int64_t)bank_delta,
+                     meta_count, _prog58, (unsigned)ctx->stack_height);
     }
     if (delta != 0) {
         char _prog58[SOL_PUBKEY_BASE58_LEN] = {0};
@@ -558,19 +1183,83 @@ sbf_apply_output(
 
         const uint8_t* post_data = buf + m->data_off;
 
-        sol_slot_t sto_slot = 0;
-        sol_account_t* account = sol_bank_load_account_ex(ctx->bank, pubkey, &sto_slot);
-        /* Filter zombie accounts (0 lamports, stored before current slot) */
-        if (account && account->meta.lamports == 0 && m->pre_lamports == 0 &&
-            sto_slot <= sol_bank_zombie_filter_slot(ctx->bank)) {
-            sol_account_destroy(account);
-            account = NULL;
+        /* Fast path: read-only accounts cannot legally change during a program
+         * invocation (including during CPI), so validate against the retained
+         * pre-exec snapshot and skip the post-exec reload. */
+        if (!m->is_writable) {
+            uint64_t pre_lamports = m->pre_lamports;
+            uint64_t pre_data_len = m->pre_data_len;
+            sol_pubkey_t pre_owner = SOL_SYSTEM_PROGRAM_ID;
+            const uint8_t* pre_data = NULL;
+            if (m->ro_account) {
+                pre_owner = m->ro_account->meta.owner;
+                pre_data = m->ro_account->data;
+            }
+
+            bool owner_ok = sol_pubkey_eq(&post_owner, &pre_owner);
+            bool lamports_ok = post_lamports == pre_lamports;
+            bool len_ok = post_data_len == pre_data_len;
+            bool data_ok = true;
+            if (post_data_len > 0) {
+                if (!pre_data) {
+                    data_ok = false;
+                } else if (memcmp(pre_data, post_data, (size_t)post_data_len) != 0) {
+                    data_ok = false;
+                }
+            }
+
+            if (!owner_ok || !lamports_ok || !len_ok || !data_ok) {
+                char k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
+                sol_log_error("bpf_wb_diag: ro_mutation acct=%s lam_pre=%lu lam_post=%lu len_pre=%lu len_post=%lu",
+                              k58, (unsigned long)pre_lamports, (unsigned long)post_lamports,
+                              (unsigned long)pre_data_len, (unsigned long)post_data_len);
+                return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            }
+
+            continue;
         }
+
+        sol_account_t* account = NULL;
+        bool account_owned_by_meta = false;
+
+        /* Avoid expensive parent reloads for overlay banks.
+         *
+         * For overlay banks, CPI/previous-instruction mutations are stored in
+         * the local layer. If there's no local entry, the current value is the
+         * same as the pre-exec snapshot we already loaded in sbf_build_input(). */
+        sol_accounts_db_t* accounts_db = sol_bank_get_accounts_db(ctx->bank);
+        if (accounts_db && sol_accounts_db_is_overlay(accounts_db)) {
+            sol_account_t* local = NULL;
+            sol_accounts_db_local_kind_t kind =
+                sol_accounts_db_get_local_kind(accounts_db, pubkey, &local);
+            if (kind == SOL_ACCOUNTS_DB_LOCAL_ACCOUNT) {
+                account = local; /* owned by caller */
+            } else if (kind == SOL_ACCOUNTS_DB_LOCAL_TOMBSTONE) {
+                account = NULL;
+            } else { /* SOL_ACCOUNTS_DB_LOCAL_MISSING */
+                if (m->ro_account) {
+                    account = m->ro_account; /* owned by meta */
+                    account_owned_by_meta = true;
+                }
+            }
+        } else {
+            sol_slot_t sto_slot = 0;
+            account = sol_bank_load_account_view_ex(ctx->bank, pubkey, &sto_slot);
+            /* Filter zombie accounts (0 lamports, stored before current slot) */
+            if (account && account->meta.lamports == 0 && m->pre_lamports == 0 &&
+                sto_slot <= sol_bank_zombie_filter_slot(ctx->bank)) {
+                sol_account_destroy(account);
+                account = NULL;
+            }
+        }
+
         if (!account) {
             account = sol_account_new(0, 0, &SOL_SYSTEM_PROGRAM_ID);
             if (!account) {
                 return SOL_ERR_NOMEM;
             }
+            account_owned_by_meta = false;
         }
 
         bool touched = false;
@@ -688,7 +1377,9 @@ sbf_apply_output(
             }
         }
 
-        sol_account_destroy(account);
+        if (!account_owned_by_meta) {
+            sol_account_destroy(account);
+        }
     }
 
     return SOL_OK;
@@ -710,19 +1401,135 @@ new_vm_for_context(const sol_invoke_context_t* ctx) {
         }
     }
 
-    return sol_bpf_vm_new(&cfg);
+    /* Creating and destroying a full VM for every program invocation is
+     * extremely expensive (stack+heap allocation + syscall registration).
+     * Reuse VMs per OS thread *and per CPI stack height* so nested invocations
+     * do not clobber the caller VM. */
+    enum { SOL_BPF_VM_POOL_MAX = 8 };
+    static __thread sol_bpf_vm_t* tls_vm_pool[SOL_BPF_VM_POOL_MAX];
+
+    size_t pool_idx = 0;
+    if (ctx && ctx->stack_height > 0) {
+        pool_idx = (size_t)(ctx->stack_height - 1u);
+        if (pool_idx >= SOL_BPF_VM_POOL_MAX) {
+            pool_idx = SOL_BPF_VM_POOL_MAX - 1u;
+        }
+    }
+
+    sol_bpf_vm_t** slot = &tls_vm_pool[pool_idx];
+
+    if (*slot == NULL || (*slot)->heap_size != cfg.heap_size) {
+        if (*slot) {
+            sol_bpf_vm_destroy(*slot);
+            *slot = NULL;
+        }
+        *slot = sol_bpf_vm_new(&cfg);
+        if (*slot == NULL) {
+            return NULL;
+        }
+    }
+
+    if (sol_bpf_vm_reset(*slot, cfg.compute_units) != SOL_OK) {
+        /* Defensive: if reset fails (OOM), fall back to a fresh VM. */
+        sol_bpf_vm_destroy(*slot);
+        *slot = sol_bpf_vm_new(&cfg);
+        if (*slot == NULL) {
+            return NULL;
+        }
+        if (sol_bpf_vm_reset(*slot, cfg.compute_units) != SOL_OK) {
+            return NULL;
+        }
+    }
+
+    return *slot;
+}
+
+static void
+destroy_vm_detach_program(sol_bpf_vm_t* vm) {
+    if (!vm) return;
+    vm->program = NULL; /* program may be cached/shared */
+    /* VM is thread-local pooled; do not destroy. */
+}
+
+static sol_err_t
+vm_attach_program(sol_bpf_vm_t* vm, sol_bpf_program_t* prog) {
+    if (!vm || !prog || !prog->ro_section || prog->ro_section_len == 0) {
+        return SOL_ERR_INVAL;
+    }
+
+    sol_err_t err = sol_bpf_memory_add_region(&vm->memory, SOL_BPF_MM_PROGRAM_START,
+                                              prog->ro_section, prog->ro_section_len, false);
+    if (err != SOL_OK) {
+        return err;
+    }
+
+    vm->program = prog;
+    vm->pc = prog->entry_pc;
+
+    /* Adjust frame pointer (r10) based on SBPF version (matches sol_bpf_vm_load). */
+    if (sol_sbpf_dynamic_stack_frames(prog->sbpf_version)) {
+        vm->reg[10] = SOL_BPF_MM_STACK_START + (uint64_t)vm->stack_size;
+
+        /* Convert gapped stack mapping to linear for SBPFv1+. */
+        for (size_t i = 0; i < vm->memory.region_count; i++) {
+            sol_bpf_region_t* r = &vm->memory.regions[i];
+            if (r->vaddr == SOL_BPF_MM_STACK_START &&
+                r->kind == SOL_BPF_REGION_GAPPED) {
+                r->kind = SOL_BPF_REGION_LINEAR;
+                r->len = r->host_len;
+                r->elem_len = 0;
+                r->gap_len = 0;
+                vm->stack_virt_size = r->host_len;
+                vm->stack_gap_size = 0;
+                break;
+            }
+        }
+    }
+
+    return SOL_OK;
 }
 
 static sol_err_t
 execute_sbf_program(
     sol_invoke_context_t* ctx,
-    const uint8_t* elf_data,
-    size_t elf_len,
+    sol_bpf_program_t* prog,
     bool is_loader_deprecated
 ) {
-    if (!ctx || !ctx->bank || !elf_data || elf_len == 0) {
+    if (!ctx || !ctx->bank || !prog) {
         return SOL_ERR_INVAL;
     }
+
+    const bool prof = sbf_profile_enabled();
+    const uint64_t slow_thresh_ns = sbf_slow_threshold_ns();
+    const bool slow_enabled = slow_thresh_ns != 0u;
+    uint64_t prof_build_ns = 0;
+    uint64_t prof_map_ns = 0;
+    uint64_t prof_exec_ns = 0;
+    uint64_t prof_wb_ns = 0;
+    size_t prof_input_len = 0;
+    size_t prof_meta_count = 0;
+    uint64_t t0 = 0;
+    uint64_t t1 = 0;
+
+    uint64_t slow_total_t0 = slow_enabled ? monotonic_ns() : 0;
+    uint64_t slow_build_ns = 0;
+    uint64_t slow_map_ns = 0;
+    uint64_t slow_exec_ns = 0;
+    uint64_t slow_wb_ns = 0;
+    size_t slow_input_len = 0;
+    size_t slow_meta_count = 0;
+
+    /* BPF runtime error diagnostics are extremely expensive on mainnet because
+     * many transactions fail legitimately (compute exceeded, syscall failures,
+     * etc). Opt-in via SOL_SBF_VM_DIAG=1. */
+    static int sbf_vm_diag_cached = -1;
+    if (sbf_vm_diag_cached < 0) {
+        const char* env = getenv("SOL_SBF_VM_DIAG");
+        sbf_vm_diag_cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    bool vm_diag = sbf_vm_diag_cached != 0;
+    /* Avoid expensive debug formatting (base58, etc) when debug logging is off. */
+    const bool log_debug = sol_log_get_level() <= SOL_LOG_DEBUG;
 
     sol_bpf_vm_t* vm = new_vm_for_context(ctx);
     if (vm == NULL) {
@@ -734,13 +1541,9 @@ execute_sbf_program(
     sol_bpf_vm_set_cpi_handler(vm, sol_bpf_loader_cpi_dispatch);
     sol_bpf_vm_set_context(vm, ctx);
 
-    sol_err_t err = sol_bpf_vm_load(vm, elf_data, elf_len);
+    sol_err_t err = vm_attach_program(vm, prog);
     if (err != SOL_OK) {
-        char p58[SOL_PUBKEY_BASE58_LEN] = {0};
-        sol_pubkey_to_base58(&ctx->program_id, p58, sizeof(p58));
-        sol_log_error("bpf_exec_diag: elf_load_fail program=%s elf_len=%zu err=%d",
-                      p58, elf_len, err);
-        sol_bpf_vm_destroy(vm);
+        destroy_vm_detach_program(vm);
         return err;
     }
 
@@ -750,12 +1553,31 @@ execute_sbf_program(
     size_t meta_count = 0;
     uint64_t instruction_data_vaddr = 0;
 
+    if (prof || slow_enabled) t0 = monotonic_ns();
     err = sbf_build_input(ctx, &input_buf, &input_len,
                           metas, &meta_count,
                           &instruction_data_vaddr,
                           is_loader_deprecated);
+    if (prof || slow_enabled) {
+        t1 = monotonic_ns();
+        if (prof) {
+            prof_build_ns = t1 - t0;
+            prof_input_len = input_len;
+            prof_meta_count = meta_count;
+        }
+        if (slow_enabled) {
+            slow_build_ns = t1 - t0;
+            slow_input_len = input_len;
+            slow_meta_count = meta_count;
+        }
+    }
     if (err != SOL_OK) {
-        sol_bpf_vm_destroy(vm);
+        destroy_vm_detach_program(vm);
+        sbf_metas_release_retained(metas, meta_count);
+        if (prof) {
+            sbf_profile_commit(prof_build_ns, prof_map_ns, prof_exec_ns, prof_wb_ns,
+                               prof_input_len, prof_meta_count);
+        }
         return err;
     }
 
@@ -768,12 +1590,28 @@ execute_sbf_program(
      * Agave's behaviour: programs that temporarily write to read-only account
      * fields and later restore them succeed in Agave but would crash in our
      * VM due to the read-only overlay. */
-    err = sol_bpf_memory_add_region(
-        &vm->memory, SOL_BPF_MM_INPUT_START, input_buf, input_len, true
-    );
+    if (prof || slow_enabled) t0 = monotonic_ns();
+    err = sol_bpf_memory_add_region(&vm->memory,
+                                    SOL_BPF_MM_INPUT_START,
+                                    input_buf,
+                                    input_len,
+                                    true);
+    if (prof || slow_enabled) {
+        t1 = monotonic_ns();
+        if (prof) {
+            prof_map_ns = t1 - t0;
+        }
+        if (slow_enabled) {
+            slow_map_ns = t1 - t0;
+        }
+    }
     if (err != SOL_OK) {
-        sol_bpf_vm_destroy(vm);
-        sol_free(input_buf);
+        destroy_vm_detach_program(vm);
+        sbf_metas_release_retained(metas, meta_count);
+        if (prof) {
+            sbf_profile_commit(prof_build_ns, prof_map_ns, prof_exec_ns, prof_wb_ns,
+                               prof_input_len, prof_meta_count);
+        }
         return err;
     }
 
@@ -788,81 +1626,57 @@ execute_sbf_program(
     vm->caller_metas = metas;
     vm->caller_meta_count = meta_count;
 
-    /* Enable BPF input dump for specific failing programs (debug).
-     * Only dump the first invocation of each. */
+    /* BPF instruction tracing is opt-in. Enabling it can generate extremely
+     * large logs and should never be on by default on mainnet. */
     {
-        static int _trace_33y = 0;
-        {
-            char _p58[SOL_PUBKEY_BASE58_LEN] = {0};
-            sol_pubkey_to_base58(&ctx->program_id, _p58, sizeof(_p58));
-            bool do_trace = (_trace_33y < 1 && strncmp(_p58, "33ySW", 5) == 0);
+        static int bpf_trace_cached = -1;
+        static sol_pubkey_t trace_program_id;
+        static int trace_program_id_valid = 0;
+        static int trace_once = 1;
+        static int trace_used = 0;
+
+        if (bpf_trace_cached < 0) {
+            const char* env = getenv("SOL_BPF_TRACE_PROGRAM_ID");
+            if (env && env[0] != '\0' && strcmp(env, "0") != 0 &&
+                sol_pubkey_from_base58(env, &trace_program_id) == SOL_OK) {
+                trace_program_id_valid = 1;
+            }
+            const char* once_env = getenv("SOL_BPF_TRACE_ONCE");
+            if (once_env && once_env[0] != '\0') {
+                trace_once = strcmp(once_env, "0") != 0;
+            }
+            bpf_trace_cached = 0;
+        }
+
+        if (trace_program_id_valid && sol_pubkey_eq(&ctx->program_id, &trace_program_id)) {
+            bool do_trace = true;
+            if (trace_once) {
+                do_trace = __sync_bool_compare_and_swap(&trace_used, 0, 1);
+            }
+
             if (do_trace) {
-                _trace_33y++;
-                vm->trace = true;  /* enabled for debugging 33ySWW28 */
+                vm->trace = true;
+                char p58[SOL_PUBKEY_BASE58_LEN] = {0};
+                sol_pubkey_to_base58(&ctx->program_id, p58, sizeof(p58));
                 sol_log_info("BPF_TRACE_START: program=%s input_len=%zu meta_count=%zu cu_limit=%lu",
-                             _p58, input_len, meta_count,
-                             (unsigned long)vm->compute_units);
-                /* Dump full input to file for offline analysis */
-                char fname[128];
-                snprintf(fname, sizeof(fname), "/tmp/bpf_trace_%s.bin", _p58);
-                FILE* f = fopen(fname, "wb");
-                if (f) {
-                    fwrite(input_buf, 1, input_len, f);
-                    fclose(f);
-                    sol_log_info("BPF_TRACE: dumped %zu bytes to %s", input_len, fname);
-                }
-                /* Also decode all accounts in the input */
-                uint64_t num_accts = 0;
-                if (input_len >= 8) memcpy(&num_accts, input_buf, 8);
-                size_t pos = 8;
-                for (uint64_t ai = 0; ai < num_accts && pos < input_len; ai++) {
-                    uint8_t dup_marker = input_buf[pos];
-                    if (dup_marker != 0xFF) {
-                        sol_log_info("BPF_TRACE_ACCT[%lu]: DUP of %u", (unsigned long)ai, dup_marker);
-                        pos += 1 + 7; /* dup_marker + 7 padding */
-                        continue;
-                    }
-                    if (pos + 96 > input_len) break;
-                    uint8_t is_signer = input_buf[pos+1];
-                    uint8_t is_writable = input_buf[pos+2];
-                    uint8_t executable = input_buf[pos+3];
-                    char key58[SOL_PUBKEY_BASE58_LEN] = {0};
-                    char own58[SOL_PUBKEY_BASE58_LEN] = {0};
-                    sol_pubkey_to_base58((const sol_pubkey_t*)(input_buf + pos + 8), key58, sizeof(key58));
-                    sol_pubkey_to_base58((const sol_pubkey_t*)(input_buf + pos + 40), own58, sizeof(own58));
-                    uint64_t lamports = 0, data_len = 0;
-                    memcpy(&lamports, input_buf + pos + 72, 8);
-                    memcpy(&data_len, input_buf + pos + 80, 8);
-                    sol_log_info("BPF_TRACE_ACCT[%lu]: signer=%d writable=%d exec=%d key=%s owner=%s lamports=%lu data_len=%lu",
-                                 (unsigned long)ai, is_signer, is_writable, executable, key58, own58,
-                                 (unsigned long)lamports, (unsigned long)data_len);
-                    /* Advance past: marker(1)+signer(1)+writable(1)+exec(1)+pad(4)+key(32)+owner(32)+lamports(8)+data_len(8)+data+realloc(10240)+align+rent_epoch(8) */
-                    pos += 88 + (size_t)data_len + 10240;
-                    size_t align_pad = (8u - ((size_t)data_len & 7u)) & 7u;
-                    pos += align_pad + 8; /* rent_epoch */
-                }
-                /* Log instruction data */
-                if (pos + 8 <= input_len) {
-                    uint64_t instr_data_len = 0;
-                    memcpy(&instr_data_len, input_buf + pos, 8);
-                    sol_log_info("BPF_TRACE_INSTR: data_len=%lu offset=%zu",
-                                 (unsigned long)instr_data_len, pos + 8);
-                    /* Log first 64 bytes of instruction data as hex */
-                    if (instr_data_len > 0 && pos + 8 + instr_data_len <= input_len) {
-                        size_t dump_len = instr_data_len < 64 ? (size_t)instr_data_len : 64;
-                        char hexbuf[64*3+1];
-                        for (size_t hi = 0; hi < dump_len; hi++) {
-                            snprintf(hexbuf + hi*3, 4, "%02x ", input_buf[pos + 8 + hi]);
-                        }
-                        hexbuf[dump_len*3] = '\0';
-                        sol_log_info("BPF_TRACE_INSTR_HEX: %s", hexbuf);
+                             p58, input_len, meta_count, (unsigned long)vm->compute_units);
+
+                const char* dump_env = getenv("SOL_BPF_TRACE_DUMP_INPUT");
+                if (dump_env && dump_env[0] != '\0' && strcmp(dump_env, "0") != 0) {
+                    char fname[128];
+                    snprintf(fname, sizeof(fname), "/tmp/bpf_trace_%s.bin", p58);
+                    FILE* f = fopen(fname, "wb");
+                    if (f) {
+                        fwrite(input_buf, 1, input_len, f);
+                        fclose(f);
+                        sol_log_info("BPF_TRACE: dumped %zu bytes to %s", input_len, fname);
                     }
                 }
             }
         }
     }
 
-    {
+    if (__builtin_expect(log_debug, 0)) {
         char _cu_p58[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&ctx->program_id, _cu_p58, sizeof(_cu_p58));
         sol_log_debug("CU_TRACE vm_enter: program=%s vm_budget=%lu meter_remaining=%lu meter_consumed=%lu stack=%u",
@@ -873,7 +1687,17 @@ execute_sbf_program(
                      (unsigned)ctx->stack_height);
     }
 
+    if (prof || slow_enabled) t0 = monotonic_ns();
     err = sol_bpf_vm_execute(vm);
+    if (prof || slow_enabled) {
+        t1 = monotonic_ns();
+        if (prof) {
+            prof_exec_ns = t1 - t0;
+        }
+        if (slow_enabled) {
+            slow_exec_ns = t1 - t0;
+        }
+    }
     sol_bpf_error_t vm_error = vm->error;
     uint64_t vm_pc = vm->pc;
     uint64_t fault_vaddr = vm->fault_vaddr;
@@ -883,7 +1707,7 @@ execute_sbf_program(
     uint64_t return_value = sol_bpf_vm_return_value(vm);
     uint64_t compute_used = sol_bpf_vm_compute_used(vm);
 
-    {
+    if (__builtin_expect(log_debug, 0)) {
         char _cu_p58[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&ctx->program_id, _cu_p58, sizeof(_cu_p58));
         sol_log_debug("CU_TRACE vm_exit: program=%s vm_used=%lu vm_budget=%lu accounted=%lu meter_remaining=%lu meter_consumed=%lu err=%d vm_err=%d r0=%lu stack=%u",
@@ -921,6 +1745,7 @@ execute_sbf_program(
     }
 
     if (err != SOL_OK) {
+        if (vm_diag) {
         {
             char _p58[SOL_PUBKEY_BASE58_LEN] = {0};
             sol_pubkey_to_base58(&ctx->program_id, _p58, sizeof(_p58));
@@ -1167,6 +1992,7 @@ execute_sbf_program(
                 case SOL_BPF_ERR_STACK_OVERFLOW: err_name = "STACK_OVERFLOW"; break;
                 case SOL_BPF_ERR_CALL_DEPTH:    err_name = "CALL_DEPTH"; break;
                 case SOL_BPF_ERR_CALL_OUTSIDE_TEXT: err_name = "CALL_OUTSIDE_TEXT"; break;
+                case SOL_BPF_ERR_JIT_NOT_COMPILED: err_name = "JIT_NOT_COMPILED"; break;
                 default:                        err_name = "OTHER"; break;
             }
             const sol_invoke_context_t* diag_ctx = (const sol_invoke_context_t*)vm->context;
@@ -1179,6 +2005,7 @@ execute_sbf_program(
                           (unsigned long)vm_pc,
                           (unsigned long)return_value,
                           diag_b58[0] ? diag_b58 : "?");
+        }
         }
 
         /* Provide a more specific failure bucket when possible. */
@@ -1211,10 +2038,20 @@ execute_sbf_program(
         }
     }
 
-    sol_bpf_vm_destroy(vm);
+    destroy_vm_detach_program(vm);
+
+    /* Expensive per-transaction failure diagnostics are opt-in. Mainnet has a
+     * large volume of failing transactions (which are still valid), and
+     * dumping all account headers on failure can severely throttle replay. */
+    static int bpf_fail_diag_cached = -1;
+    if (bpf_fail_diag_cached < 0) {
+        const char* env = getenv("SOL_BPF_FAIL_DIAG");
+        bpf_fail_diag_cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
 
     /* Diagnostic: dump ALL account headers on BPF program failure */
-    if (err == SOL_OK && return_value != 0 && input_buf && input_len >= 16) {
+    if (bpf_fail_diag_cached &&
+        err == SOL_OK && return_value != 0 && input_buf && input_len >= 16) {
         /* MMM program: mmm3XBJg5gk8XJxEKBvdgptZz6SgK4tXvn36sodowMc */
         static const uint8_t mmm_id[32] = {
             0x0b, 0x78, 0x2a, 0x49, 0x3f, 0x91, 0xad, 0xf5,
@@ -1224,7 +2061,7 @@ execute_sbf_program(
         };
         bool is_mmm = memcmp(ctx->program_id.bytes, mmm_id, 32) == 0;
         static int _fail_diag_count = 0;
-        if (_fail_diag_count < 1000 || is_mmm) {
+        if (_fail_diag_count < 50 || is_mmm) {
             _fail_diag_count++;
             char _p58[SOL_PUBKEY_BASE58_LEN] = {0};
             sol_pubkey_to_base58(&ctx->program_id, _p58, sizeof(_p58));
@@ -1278,26 +2115,116 @@ execute_sbf_program(
     }
 
     if (err == SOL_OK && return_value == 0) {
+        if (prof || slow_enabled) t0 = monotonic_ns();
         sol_err_t wb_err = sbf_apply_output(ctx, input_buf, input_len, metas, meta_count);
-        sol_free(input_buf);
+        if (prof || slow_enabled) {
+            t1 = monotonic_ns();
+            if (prof) {
+                prof_wb_ns = t1 - t0;
+            }
+            if (slow_enabled) {
+                slow_wb_ns = t1 - t0;
+            }
+        }
+        sbf_metas_release_retained(metas, meta_count);
+        if (slow_enabled) {
+            uint64_t slow_total_ns = monotonic_ns() - slow_total_t0;
+            if (slow_total_ns >= slow_thresh_ns) {
+                char prog_b58[SOL_PUBKEY_BASE58_LEN] = {0};
+                sol_pubkey_to_base58(&ctx->program_id, prog_b58, sizeof(prog_b58));
+
+                char sig_b58[SOL_SIGNATURE_BASE58_LEN] = {0};
+                if (ctx->tx_signature) {
+                    sol_signature_to_base58(ctx->tx_signature, sig_b58, sizeof(sig_b58));
+                }
+
+                uint64_t cu_limit = vm ? vm->compute_units : 0u;
+                uint64_t meter_remaining = ctx->compute_meter ? ctx->compute_meter->remaining : 0u;
+
+                sol_log_info("SBF_SLOW: slot=%lu total_ms=%.3f build_ms=%.3f map_ms=%.3f exec_ms=%.3f wb_ms=%.3f input_len=%zu meta=%zu cu_limit=%lu meter_remaining=%lu stack=%lu program=%s sig=%s wb_err=%d",
+                             (unsigned long)sol_bank_slot(ctx->bank),
+                             (double)slow_total_ns / 1e6,
+                             (double)slow_build_ns / 1e6,
+                             (double)slow_map_ns / 1e6,
+                             (double)slow_exec_ns / 1e6,
+                             (double)slow_wb_ns / 1e6,
+                             slow_input_len,
+                             slow_meta_count,
+                             (unsigned long)cu_limit,
+                             (unsigned long)meter_remaining,
+                             (unsigned long)ctx->stack_height,
+                             prog_b58[0] ? prog_b58 : "?",
+                             sig_b58[0] ? sig_b58 : "none",
+                             (int)wb_err);
+            }
+        }
+        if (prof) {
+            sbf_profile_commit(prof_build_ns, prof_map_ns, prof_exec_ns, prof_wb_ns,
+                               prof_input_len, prof_meta_count);
+        }
         return wb_err;
     }
 
-    sol_free(input_buf);
+    sbf_metas_release_retained(metas, meta_count);
+
+    if (slow_enabled) {
+        uint64_t slow_total_ns = monotonic_ns() - slow_total_t0;
+        if (slow_total_ns >= slow_thresh_ns) {
+            char prog_b58[SOL_PUBKEY_BASE58_LEN] = {0};
+            sol_pubkey_to_base58(&ctx->program_id, prog_b58, sizeof(prog_b58));
+
+            char sig_b58[SOL_SIGNATURE_BASE58_LEN] = {0};
+            if (ctx->tx_signature) {
+                sol_signature_to_base58(ctx->tx_signature, sig_b58, sizeof(sig_b58));
+            }
+
+            uint64_t cu_limit = vm ? vm->compute_units : 0u;
+            uint64_t meter_remaining = ctx->compute_meter ? ctx->compute_meter->remaining : 0u;
+
+            sol_log_info("SBF_SLOW: slot=%lu total_ms=%.3f build_ms=%.3f map_ms=%.3f exec_ms=%.3f wb_ms=%.3f input_len=%zu meta=%zu cu_limit=%lu meter_remaining=%lu stack=%lu program=%s sig=%s err=%d r0=%lu",
+                         (unsigned long)sol_bank_slot(ctx->bank),
+                         (double)slow_total_ns / 1e6,
+                         (double)slow_build_ns / 1e6,
+                         (double)slow_map_ns / 1e6,
+                         (double)slow_exec_ns / 1e6,
+                         (double)slow_wb_ns / 1e6,
+                         slow_input_len,
+                         slow_meta_count,
+                         (unsigned long)cu_limit,
+                         (unsigned long)meter_remaining,
+                         (unsigned long)ctx->stack_height,
+                         prog_b58[0] ? prog_b58 : "?",
+                         sig_b58[0] ? sig_b58 : "none",
+                         (int)err,
+                         (unsigned long)return_value);
+        }
+    }
 
     if (err != SOL_OK) {
+        if (prof) {
+            sbf_profile_commit(prof_build_ns, prof_map_ns, prof_exec_ns, prof_wb_ns,
+                               prof_input_len, prof_meta_count);
+        }
         return err;
     }
 
     if (return_value != 0) {
         char _p58[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&ctx->program_id, _p58, sizeof(_p58));
-        sol_log_info("BPF program returned error: %lu (0x%lx) program=%s",
+        sol_log_debug("BPF program returned error: %lu (0x%lx) program=%s",
                      (unsigned long)return_value,
                      (unsigned long)return_value, _p58);
+        if (prof) {
+            sbf_profile_commit(prof_build_ns, prof_map_ns, prof_exec_ns, prof_wb_ns,
+                               prof_input_len, prof_meta_count);
+        }
         return SOL_ERR_PROGRAM_FAILED;
     }
 
+    if (prof) {
+        sbf_profile_commit(prof_build_ns, prof_map_ns, prof_exec_ns, prof_wb_ns,
+                           prof_input_len, prof_meta_count);
+    }
     return SOL_OK;
 }
 
@@ -1368,7 +2295,7 @@ get_account(sol_invoke_context_t* ctx, uint8_t index,
 
     /* Agave creates a default account for any key not in the DB */
     if (!*account) {
-        *account = sol_calloc(1, sizeof(sol_account_t));
+        *account = sol_account_alloc();
         if (*account) {
             (*account)->meta.owner = SOL_SYSTEM_PROGRAM_ID;
             (*account)->meta.rent_epoch = UINT64_MAX;
@@ -1550,7 +2477,9 @@ process_write(sol_invoke_context_t* ctx) {
     sol_bank_store_account(ctx->bank, buffer_pubkey, buffer);
     sol_account_destroy(buffer);
 
-    sol_log_info("BPF Loader: Wrote %zu bytes at offset %u", write_len, offset);
+    /* This instruction can occur many times in a single deploy/upgrade.
+     * Keep it at debug to avoid log spam during replay. */
+    sol_log_debug("BPF Loader: Wrote %zu bytes at offset %u", write_len, offset);
     return SOL_OK;
 }
 
@@ -1694,6 +2623,8 @@ process_deploy(sol_invoke_context_t* ctx) {
     /* Store accounts */
     sol_bank_store_account(ctx->bank, program_pubkey, program);
     sol_bank_store_account(ctx->bank, program_data_pubkey, program_data);
+    bpf_prog_cache_invalidate_program(program_pubkey);
+    bpf_prog_cache_invalidate_programdata(program_data_pubkey);
 
     sol_account_destroy(program_data);
     sol_account_destroy(program);
@@ -1868,6 +2799,19 @@ process_upgrade(sol_invoke_context_t* ctx) {
     /* Set programdata lamports to rent-exempt minimum */
     program_data->meta.lamports = programdata_balance_required;
     sol_bank_store_account(ctx->bank, program_data_pubkey, program_data);
+    {
+        const sol_pubkey_t* program_pubkey = NULL;
+        if (ctx->account_indices_len >= 2) {
+            uint8_t key_index = ctx->account_indices[1];
+            if (key_index < ctx->account_keys_len) {
+                program_pubkey = &ctx->account_keys[key_index];
+            }
+        }
+        if (program_pubkey) {
+            bpf_prog_cache_invalidate_program(program_pubkey);
+        }
+        bpf_prog_cache_invalidate_programdata(program_data_pubkey);
+    }
     sol_account_destroy(program_data);
 
     sol_log_info("BPF Loader: Upgraded program, new ELF size=%zu", new_elf_len);
@@ -2061,6 +3005,9 @@ process_close(sol_invoke_context_t* ctx) {
 
     sol_bank_store_account(ctx->bank, close_account_pubkey, close_account);
     sol_bank_store_account(ctx->bank, recipient_pubkey, recipient);
+    if (account_type == UPGRADEABLE_LOADER_STATE_PROGRAM_DATA) {
+        bpf_prog_cache_invalidate_programdata(close_account_pubkey);
+    }
 
     sol_account_destroy(close_account);
     sol_account_destroy(recipient);
@@ -2197,6 +3144,7 @@ process_extend_program(sol_invoke_context_t* ctx) {
     sol_log_info("BPF Loader: ExtendProgram requested %u additional bytes", additional_bytes);
 
     sol_bank_store_account(ctx->bank, program_data_pubkey, program_data);
+    bpf_prog_cache_invalidate_programdata(program_data_pubkey);
     sol_account_destroy(program_data);
     return SOL_OK;
 }
@@ -2213,27 +3161,103 @@ sol_err_t sol_bpf_loader_execute_program(
         _bpf_exec_trace--;
         char p58[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(program_id, p58, sizeof(p58));
-        sol_log_info("bpf_exec_entry: program=%s", p58);
+        sol_log_debug("bpf_exec_entry: program=%s", p58);
     }
     if (ctx != NULL) {
         ctx->compute_units_accounted = 0;
     }
 
-    sol_account_t* program_account = sol_bank_load_account(ctx->bank, program_id);
+    bpf_prog_cache_init();
+    sol_bpf_prog_handle_t* inflight = NULL;
+    bool inflight_loader = false;
 
-    if (program_account == NULL || !program_account->meta.executable) {
-        char p58[SOL_PUBKEY_BASE58_LEN] = {0};
-        sol_pubkey_to_base58(program_id, p58, sizeof(p58));
-        sol_log_error("bpf_exec_diag: check1 program=%s acct=%s exec=%d",
-                      p58,
-                      program_account ? "found" : "NULL",
-                      program_account ? (int)program_account->meta.executable : -1);
-        if (program_account) sol_account_destroy(program_account);
-        return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+    /* Fast path: execute from cache (or wait for an in-flight load). */
+    if (g_bpf_prog_cache) {
+        pthread_rwlock_rdlock(&g_bpf_prog_cache_lock);
+        sol_bpf_prog_handle_t* cached = bpf_prog_cache_get_locked(program_id);
+        pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+        if (cached) {
+            sol_err_t werr = bpf_prog_handle_wait_ready(cached);
+            if (werr == SOL_OK) {
+                sol_err_t err = execute_sbf_program(ctx, cached->prog, cached->loader_deprecated);
+                bpf_prog_handle_release(cached);
+                return err;
+            }
+            bpf_prog_handle_release(cached);
+            return werr;
+        }
     }
+
+    /* Cache miss: install an in-flight placeholder so only one thread performs
+     * AccountsDB loads + ELF parsing for this program. */
+    if (g_bpf_prog_cache) {
+        sol_bpf_prog_handle_t* placeholder = bpf_prog_handle_new(BPF_PROG_STATE_LOADING);
+        if (placeholder) {
+            pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
+            inflight = bpf_prog_cache_get_locked(program_id);
+            if (!inflight) {
+                inflight = bpf_prog_cache_insert_locked(program_id, placeholder);
+                if (!inflight) {
+                    bpf_prog_handle_release(placeholder);
+                    placeholder = NULL;
+                } else if (inflight == placeholder) {
+                    inflight_loader = true;
+                } else {
+                    bpf_prog_handle_release(placeholder);
+                    placeholder = NULL;
+                }
+            } else {
+                bpf_prog_handle_release(placeholder);
+                placeholder = NULL;
+            }
+            pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+        }
+
+        if (inflight && !inflight_loader) {
+            sol_err_t werr = bpf_prog_handle_wait_ready(inflight);
+            if (werr == SOL_OK) {
+                sol_err_t err = execute_sbf_program(ctx, inflight->prog, inflight->loader_deprecated);
+                bpf_prog_handle_release(inflight);
+                return err;
+            }
+            bpf_prog_handle_release(inflight);
+            return werr;
+        }
+    }
+
+    sol_err_t ret = SOL_OK;
+
+    sol_account_t* program_account = NULL;
+    sol_account_t* program_data = NULL;
+    sol_bpf_program_t* loaded = NULL;
 
     const uint8_t* elf_data = NULL;
     size_t elf_len = 0;
+    bool has_programdata = false;
+    sol_pubkey_t program_data_address = {0};
+
+    /* Cache miss (or inflight loader): load program account, fetch ELF, parse once. */
+    program_account = sol_bank_load_account_view(ctx->bank, program_id);
+
+    if (program_account == NULL || !program_account->meta.executable) {
+        if (sbf_vm_diag_enabled() || sol_log_get_level() <= SOL_LOG_DEBUG) {
+            char p58[SOL_PUBKEY_BASE58_LEN] = {0};
+            sol_pubkey_to_base58(program_id, p58, sizeof(p58));
+            if (sbf_vm_diag_enabled()) {
+                sol_log_error("bpf_exec_diag: check1 program=%s acct=%s exec=%d",
+                              p58,
+                              program_account ? "found" : "NULL",
+                              program_account ? (int)program_account->meta.executable : -1);
+            } else {
+                sol_log_debug("bpf_exec_diag: check1 program=%s acct=%s exec=%d",
+                              p58,
+                              program_account ? "found" : "NULL",
+                              program_account ? (int)program_account->meta.executable : -1);
+            }
+        }
+        ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+        goto fail;
+    }
 
     /* Detect BPF Loader v1 (deprecated) for different serialization/VM config.
      * is_bpf_loader_2() checks SOL_BPF_LOADER_V3_ID which is BPFLoader1111... */
@@ -2247,93 +3271,250 @@ sol_err_t sol_bpf_loader_execute_program(
     } else if (is_bpf_upgradeable_loader(&program_account->meta.owner)) {
         /* For upgradeable, get program data account */
         if (program_account->meta.data_len < UPGRADEABLE_LOADER_PROGRAM_SIZE) {
-            char p58[SOL_PUBKEY_BASE58_LEN] = {0};
-            sol_pubkey_to_base58(program_id, p58, sizeof(p58));
-            sol_log_error("bpf_exec_diag: check2 program=%s data_len=%zu need=%d",
-                          p58, program_account->meta.data_len, UPGRADEABLE_LOADER_PROGRAM_SIZE);
-            sol_account_destroy(program_account);
-            return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            if (sbf_vm_diag_enabled() || sol_log_get_level() <= SOL_LOG_DEBUG) {
+                char p58[SOL_PUBKEY_BASE58_LEN] = {0};
+                sol_pubkey_to_base58(program_id, p58, sizeof(p58));
+                if (sbf_vm_diag_enabled()) {
+                    sol_log_error("bpf_exec_diag: check2 program=%s data_len=%zu need=%d",
+                                  p58, program_account->meta.data_len, UPGRADEABLE_LOADER_PROGRAM_SIZE);
+                } else {
+                    sol_log_debug("bpf_exec_diag: check2 program=%s data_len=%zu need=%d",
+                                  p58, program_account->meta.data_len, UPGRADEABLE_LOADER_PROGRAM_SIZE);
+                }
+            }
+            ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            goto fail;
         }
 
         uint32_t program_type;
         memcpy(&program_type, program_account->data, 4);
         if (program_type != UPGRADEABLE_LOADER_STATE_PROGRAM) {
-            char p58[SOL_PUBKEY_BASE58_LEN] = {0};
-            sol_pubkey_to_base58(program_id, p58, sizeof(p58));
-            sol_log_error("bpf_exec_diag: check3 program=%s type=%u expected=%u",
-                          p58, program_type, UPGRADEABLE_LOADER_STATE_PROGRAM);
-            sol_account_destroy(program_account);
-            return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            if (sbf_vm_diag_enabled() || sol_log_get_level() <= SOL_LOG_DEBUG) {
+                char p58[SOL_PUBKEY_BASE58_LEN] = {0};
+                sol_pubkey_to_base58(program_id, p58, sizeof(p58));
+                if (sbf_vm_diag_enabled()) {
+                    sol_log_error("bpf_exec_diag: check3 program=%s type=%u expected=%u",
+                                  p58, program_type, UPGRADEABLE_LOADER_STATE_PROGRAM);
+                } else {
+                    sol_log_debug("bpf_exec_diag: check3 program=%s type=%u expected=%u",
+                                  p58, program_type, UPGRADEABLE_LOADER_STATE_PROGRAM);
+                }
+            }
+            ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            goto fail;
         }
 
         /* Get program data address */
-        sol_pubkey_t program_data_address;
+        has_programdata = true;
         memcpy(program_data_address.bytes, program_account->data + 4, 32);
 
         /* Load program data account */
-        sol_account_t* program_data = sol_bank_load_account(ctx->bank, &program_data_address);
-
+        program_data = sol_bank_load_account_view(ctx->bank, &program_data_address);
         if (program_data == NULL) {
-            char p58[SOL_PUBKEY_BASE58_LEN] = {0};
-            char pd58[SOL_PUBKEY_BASE58_LEN] = {0};
-            sol_pubkey_to_base58(program_id, p58, sizeof(p58));
-            sol_pubkey_to_base58(&program_data_address, pd58, sizeof(pd58));
-            sol_log_error("bpf_exec_diag: check4 program=%s program_data=%s NOT_FOUND",
-                          p58, pd58);
-            sol_account_destroy(program_account);
-            return SOL_ERR_ACCOUNT_NOT_FOUND;
+            if (sbf_vm_diag_enabled() || sol_log_get_level() <= SOL_LOG_DEBUG) {
+                char p58[SOL_PUBKEY_BASE58_LEN] = {0};
+                char pd58[SOL_PUBKEY_BASE58_LEN] = {0};
+                sol_pubkey_to_base58(program_id, p58, sizeof(p58));
+                sol_pubkey_to_base58(&program_data_address, pd58, sizeof(pd58));
+                if (sbf_vm_diag_enabled()) {
+                    sol_log_error("bpf_exec_diag: check4 program=%s program_data=%s NOT_FOUND",
+                                  p58, pd58);
+                } else {
+                    sol_log_debug("bpf_exec_diag: check4 program=%s program_data=%s NOT_FOUND",
+                                  p58, pd58);
+                }
+            }
+            ret = SOL_ERR_ACCOUNT_NOT_FOUND;
+            goto fail;
         }
 
         /* Verify program data state */
         if (program_data->meta.data_len < UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE) {
-            char p58[SOL_PUBKEY_BASE58_LEN] = {0};
-            sol_pubkey_to_base58(program_id, p58, sizeof(p58));
-            sol_log_error("bpf_exec_diag: check5 program=%s pd_data_len=%zu need=%d",
-                          p58, program_data->meta.data_len,
-                          UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE);
-            sol_account_destroy(program_account);
-            sol_account_destroy(program_data);
-            return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            if (sbf_vm_diag_enabled() || sol_log_get_level() <= SOL_LOG_DEBUG) {
+                char p58[SOL_PUBKEY_BASE58_LEN] = {0};
+                sol_pubkey_to_base58(program_id, p58, sizeof(p58));
+                if (sbf_vm_diag_enabled()) {
+                    sol_log_error("bpf_exec_diag: check5 program=%s pd_data_len=%zu need=%d",
+                                  p58, program_data->meta.data_len,
+                                  UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE);
+                } else {
+                    sol_log_debug("bpf_exec_diag: check5 program=%s pd_data_len=%zu need=%d",
+                                  p58, program_data->meta.data_len,
+                                  UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE);
+                }
+            }
+            ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            goto fail;
         }
 
         uint32_t program_data_type;
         memcpy(&program_data_type, program_data->data, 4);
         if (program_data_type != UPGRADEABLE_LOADER_STATE_PROGRAM_DATA) {
-            char p58[SOL_PUBKEY_BASE58_LEN] = {0};
-            sol_pubkey_to_base58(program_id, p58, sizeof(p58));
-            sol_log_error("bpf_exec_diag: check6 program=%s pd_type=%u expected=%u",
-                          p58, program_data_type, UPGRADEABLE_LOADER_STATE_PROGRAM_DATA);
-            sol_account_destroy(program_account);
-            sol_account_destroy(program_data);
-            return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            if (sbf_vm_diag_enabled() || sol_log_get_level() <= SOL_LOG_DEBUG) {
+                char p58[SOL_PUBKEY_BASE58_LEN] = {0};
+                sol_pubkey_to_base58(program_id, p58, sizeof(p58));
+                if (sbf_vm_diag_enabled()) {
+                    sol_log_error("bpf_exec_diag: check6 program=%s pd_type=%u expected=%u",
+                                  p58, program_data_type, UPGRADEABLE_LOADER_STATE_PROGRAM_DATA);
+                } else {
+                    sol_log_debug("bpf_exec_diag: check6 program=%s pd_type=%u expected=%u",
+                                  p58, program_data_type, UPGRADEABLE_LOADER_STATE_PROGRAM_DATA);
+                }
+            }
+            ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            goto fail;
         }
 
-        /* Note: We need to keep program_data alive while executing */
-        /* For now, copy the ELF data - this is suboptimal but safe */
+        elf_data = program_data->data + UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE;
         elf_len = program_data->meta.data_len - UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE;
-        uint8_t* elf_copy = sol_alloc(elf_len);
-        if (elf_copy == NULL) {
-            sol_account_destroy(program_account);
-            sol_account_destroy(program_data);
-            return SOL_ERR_NOMEM;
-        }
-        memcpy(elf_copy, program_data->data + UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE, elf_len);
-
-        sol_account_destroy(program_data);
-        sol_account_destroy(program_account);
-        sol_err_t err = execute_sbf_program(ctx, elf_copy, elf_len, false);
-        sol_free(elf_copy);
-        return err;
+        loader_deprecated = false;
     } else {
         sol_log_error("BPF Loader: Unknown program owner");
-        sol_account_destroy(program_account);
-        return SOL_ERR_PROGRAM_INVALID_OWNER;
+        ret = SOL_ERR_PROGRAM_INVALID_OWNER;
+        goto fail;
     }
 
-    /* For non-upgradeable loaders (direct ELF in program account) */
-    sol_err_t err = execute_sbf_program(ctx, elf_data, elf_len, loader_deprecated);
-    sol_account_destroy(program_account);
+    loaded = sol_bpf_program_new();
+    if (!loaded) {
+        ret = SOL_ERR_NOMEM;
+        goto fail;
+    }
+
+    sol_err_t load_err = sol_bpf_elf_load(loaded, elf_data, elf_len);
+    if (load_err != SOL_OK) {
+        if (sbf_vm_diag_enabled() || sol_log_get_level() <= SOL_LOG_DEBUG) {
+            char p58[SOL_PUBKEY_BASE58_LEN] = {0};
+            sol_pubkey_to_base58(program_id, p58, sizeof(p58));
+            if (sbf_vm_diag_enabled()) {
+                sol_log_error("bpf_exec_diag: elf_load_fail program=%s elf_len=%zu err=%d",
+                              p58, elf_len, load_err);
+            } else {
+                sol_log_debug("bpf_exec_diag: elf_load_fail program=%s elf_len=%zu err=%d",
+                              p58, elf_len, load_err);
+            }
+        }
+        ret = load_err;
+        goto fail;
+    }
+
+    if (program_data) {
+        sol_account_destroy(program_data);
+        program_data = NULL;
+    }
+    if (program_account) {
+        sol_account_destroy(program_account);
+        program_account = NULL;
+    }
+
+    if (inflight_loader && inflight) {
+        inflight->prog = loaded;
+        loaded = NULL;
+        inflight->has_programdata = has_programdata;
+        inflight->programdata = program_data_address;
+        inflight->loader_deprecated = loader_deprecated;
+        inflight->ro_section_len = inflight->prog ? inflight->prog->ro_section_len : 0;
+
+        if (g_bpf_prog_cache) {
+            pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
+            if (g_bpf_prog_cache) {
+                sol_bpf_prog_handle_t** slot =
+                    (sol_bpf_prog_handle_t**)sol_pubkey_map_get(g_bpf_prog_cache, program_id);
+                if (slot && *slot == inflight) {
+                    if (inflight->ro_section_len > g_bpf_prog_cache_max_bytes) {
+                        /* Do not flush the entire cache for an oversized program. */
+                        size_t saved = inflight->ro_section_len;
+                        inflight->ro_section_len = 0;
+                        bpf_prog_cache_remove_locked(program_id);
+                        inflight->ro_section_len = saved;
+                    } else {
+                        bpf_prog_cache_evict_if_needed_locked(inflight->ro_section_len);
+                        g_bpf_prog_cache_total_bytes += inflight->ro_section_len;
+                    }
+                }
+            }
+            pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+        }
+
+        pthread_mutex_lock(&inflight->load_mu);
+        inflight->load_err = SOL_OK;
+        __atomic_store_n(&inflight->load_state, BPF_PROG_STATE_READY, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&inflight->load_cv);
+        pthread_mutex_unlock(&inflight->load_mu);
+
+        sol_err_t err = execute_sbf_program(ctx, inflight->prog, inflight->loader_deprecated);
+        bpf_prog_handle_release(inflight);
+        return err;
+    }
+
+    sol_bpf_prog_handle_t* h = bpf_prog_handle_new(BPF_PROG_STATE_READY);
+    if (!h) {
+        sol_err_t err = execute_sbf_program(ctx, loaded, loader_deprecated);
+        sol_bpf_program_destroy(loaded);
+        loaded = NULL;
+        return err;
+    }
+
+    h->prog = loaded;
+    loaded = NULL;
+    h->has_programdata = has_programdata;
+    h->programdata = program_data_address;
+    h->loader_deprecated = loader_deprecated;
+    h->ro_section_len = h->prog ? h->prog->ro_section_len : 0;
+
+    sol_bpf_prog_handle_t* exec_h = NULL;
+    if (g_bpf_prog_cache) {
+        pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
+        exec_h = bpf_prog_cache_insert_locked(program_id, h);
+        pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+    }
+    if (!exec_h) {
+        exec_h = h;
+    } else if (exec_h != h) {
+        /* Another thread won the race; discard our freshly-loaded handle. */
+        bpf_prog_handle_release(h);
+    }
+
+    sol_err_t err = execute_sbf_program(ctx, exec_h->prog, exec_h->loader_deprecated);
+    bpf_prog_handle_release(exec_h);
     return err;
+
+fail:
+    if (loaded) {
+        sol_bpf_program_destroy(loaded);
+        loaded = NULL;
+    }
+    if (program_data) {
+        sol_account_destroy(program_data);
+        program_data = NULL;
+    }
+    if (program_account) {
+        sol_account_destroy(program_account);
+        program_account = NULL;
+    }
+
+    if (inflight_loader && inflight) {
+        pthread_mutex_lock(&inflight->load_mu);
+        inflight->load_err = ret;
+        __atomic_store_n(&inflight->load_state, BPF_PROG_STATE_FAILED, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&inflight->load_cv);
+        pthread_mutex_unlock(&inflight->load_mu);
+
+        if (g_bpf_prog_cache) {
+            pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
+            if (g_bpf_prog_cache) {
+                sol_bpf_prog_handle_t** slot =
+                    (sol_bpf_prog_handle_t**)sol_pubkey_map_get(g_bpf_prog_cache, program_id);
+                if (slot && *slot == inflight) {
+                    bpf_prog_cache_remove_locked(program_id);
+                }
+            }
+            pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+        }
+
+        bpf_prog_handle_release(inflight);
+    }
+
+    return ret;
 }
 
 /*
@@ -2418,6 +3599,7 @@ sol_err_t sol_bpf_loader_2_process(sol_invoke_context_t* ctx) {
 
         memcpy(program->data + offset, write_data, write_len);
         sol_bank_store_account(ctx->bank, program_pubkey, program);
+        bpf_prog_cache_invalidate_program(program_pubkey);
         sol_account_destroy(program);
 
         sol_log_info("BPF Loader v2: Wrote %zu bytes at offset %u", write_len, offset);
@@ -2445,6 +3627,7 @@ sol_err_t sol_bpf_loader_2_process(sol_invoke_context_t* ctx) {
 
         program->meta.executable = true;
         sol_bank_store_account(ctx->bank, program_pubkey, program);
+        bpf_prog_cache_invalidate_program(program_pubkey);
         sol_account_destroy(program);
 
         sol_log_info("BPF Loader v2: Finalized program");
@@ -2514,7 +3697,7 @@ typedef struct {
 #define SOL_BPF_RUST_ACCOUNT_INFO_SIZE 48u
 #define SOL_BPF_RUST_RC_REF_CELL_VALUE_OFF 24u
 
-static bool
+static SOL_UNUSED bool
 read_account_info_mem(
     sol_bpf_vm_t* vm,
     uint64_t info_ptr,
@@ -2531,7 +3714,7 @@ read_account_info_mem(
     return true;
 }
 
-static bool
+static SOL_UNUSED bool
 read_rust_account_info_mem(
     sol_bpf_vm_t* vm,
     uint64_t info_ptr,
@@ -2633,7 +3816,56 @@ read_pubkey_ptr(
     return true;
 }
 
-static int
+#define CPI_PUBKEY_MAP_SZ   (256u)
+#define CPI_PUBKEY_MAP_MASK (CPI_PUBKEY_MAP_SZ - 1u)
+
+static inline void
+cpi_pubkey_map_init(int16_t map[static CPI_PUBKEY_MAP_SZ]) {
+    memset(map, 0xff, CPI_PUBKEY_MAP_SZ * sizeof(map[0])); /* -1 */
+}
+
+static inline void
+cpi_pubkey_map_insert(int16_t map[static CPI_PUBKEY_MAP_SZ],
+                      const sol_pubkey_t* keys,
+                      size_t idx) {
+    uint64_t h = sol_xxhash64(keys[idx].bytes, 32, 0);
+    size_t pos = (size_t)h & (size_t)CPI_PUBKEY_MAP_MASK;
+    for (size_t probe = 0; probe < CPI_PUBKEY_MAP_SZ; probe++) {
+        int16_t cur = map[pos];
+        if (cur < 0) {
+            map[pos] = (int16_t)idx;
+            return;
+        }
+        /* Keep the first occurrence to match the legacy linear scan. */
+        if (sol_pubkey_eq(&keys[(size_t)cur], &keys[idx])) {
+            return;
+        }
+        pos = (pos + 1u) & (size_t)CPI_PUBKEY_MAP_MASK;
+    }
+}
+
+static inline int
+cpi_pubkey_map_lookup(const int16_t map[static CPI_PUBKEY_MAP_SZ],
+                      const sol_pubkey_t* keys,
+                      size_t keys_len,
+                      const sol_pubkey_t* key) {
+    if (!key) return -1;
+    uint64_t h = sol_xxhash64(key->bytes, 32, 0);
+    size_t pos = (size_t)h & (size_t)CPI_PUBKEY_MAP_MASK;
+    for (size_t probe = 0; probe < CPI_PUBKEY_MAP_SZ; probe++) {
+        int16_t cur = map[pos];
+        if (cur < 0) return -1;
+        size_t idx = (size_t)cur;
+        if (__builtin_expect(idx < keys_len, 1) &&
+            sol_pubkey_eq(&keys[idx], key)) {
+            return (int)idx;
+        }
+        pos = (pos + 1u) & (size_t)CPI_PUBKEY_MAP_MASK;
+    }
+    return -1;
+}
+
+static SOL_UNUSED int
 find_info_index(
     const sol_pubkey_t* pubkeys,
     size_t count,
@@ -2661,12 +3893,14 @@ sol_bpf_loader_cpi_dispatch(
     if (caller == NULL) {
         return SOL_ERR_INVAL;
     }
+    /* Avoid expensive debug formatting (base58, etc) when debug logging is off. */
+    const bool log_debug = sol_log_get_level() <= SOL_LOG_DEBUG;
 
     if (caller->compute_meter != NULL) {
         uint64_t used = sol_bpf_vm_compute_used(vm);
         if (used >= caller->compute_units_accounted) {
             uint64_t delta = used - caller->compute_units_accounted;
-            {
+            if (__builtin_expect(log_debug, 0)) {
                 char _cpi_p58[SOL_PUBKEY_BASE58_LEN] = {0};
                 sol_pubkey_to_base58(&caller->program_id, _cpi_p58, sizeof(_cpi_p58));
                 sol_log_debug("CU_TRACE cpi_sync: caller=%s vm_used=%lu accounted=%lu delta=%lu meter_remaining=%lu meter_consumed=%lu",
@@ -2680,19 +3914,19 @@ sol_bpf_loader_cpi_dispatch(
             sol_err_t meter_err = sol_compute_meter_consume(caller->compute_meter, delta);
             caller->compute_units_accounted = used;
             if (meter_err != SOL_OK) {
-                sol_log_info("CPI_DIAG: CU sync exhaustion delta=%lu", (unsigned long)delta);
+                sol_log_debug("CPI_DIAG: CU sync exhaustion delta=%lu", (unsigned long)delta);
                 return meter_err;
             }
         }
     }
 
     /* Log CPI dispatch entry */
-    {
+    if (__builtin_expect(log_debug, 0)) {
         char _caller_p[SOL_PUBKEY_BASE58_LEN] = {0};
         char _callee_p[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&caller->program_id, _caller_p, sizeof(_caller_p));
         sol_pubkey_to_base58(&instr->program_id, _callee_p, sizeof(_callee_p));
-        sol_log_info("CPI_ENTER: caller=%s callee=%s depth=%u cu_remaining=%lu accts=%zu",
+        sol_log_debug("CPI_ENTER: caller=%s callee=%s depth=%u cu_remaining=%lu accts=%zu",
                      _caller_p, _callee_p,
                      (unsigned)(caller->stack_height + 1),
                      caller->compute_meter ? (unsigned long)caller->compute_meter->remaining : 0UL,
@@ -2715,6 +3949,8 @@ sol_bpf_loader_cpi_dispatch(
     bool unique_is_writable[SOL_BPF_CPI_MAX_ACCOUNTS];
 
     size_t unique_count = 0;
+    int16_t unique_map[CPI_PUBKEY_MAP_SZ];
+    cpi_pubkey_map_init(unique_map);
 
     /* Pass 1: unique signer keys (preserve relative order among signers). */
     for (size_t i = 0; i < count; i++) {
@@ -2723,11 +3959,12 @@ sol_bpf_loader_cpi_dispatch(
         }
 
         const sol_pubkey_t* key = &instr->accounts[i].pubkey;
-        int idx = find_info_index(unique_keys, unique_count, key);
+        int idx = cpi_pubkey_map_lookup(unique_map, unique_keys, unique_count, key);
         if (idx < 0) {
             unique_keys[unique_count] = *key;
             unique_is_signer[unique_count] = true;
             unique_is_writable[unique_count] = instr->accounts[i].is_writable;
+            cpi_pubkey_map_insert(unique_map, unique_keys, unique_count);
             unique_count++;
         } else if (instr->accounts[i].is_writable) {
             unique_is_writable[(size_t)idx] = true;
@@ -2743,11 +3980,12 @@ sol_bpf_loader_cpi_dispatch(
         }
 
         const sol_pubkey_t* key = &instr->accounts[i].pubkey;
-        int idx = find_info_index(unique_keys, unique_count, key);
+        int idx = cpi_pubkey_map_lookup(unique_map, unique_keys, unique_count, key);
         if (idx < 0) {
             unique_keys[unique_count] = *key;
             unique_is_signer[unique_count] = false;
             unique_is_writable[unique_count] = instr->accounts[i].is_writable;
+            cpi_pubkey_map_insert(unique_map, unique_keys, unique_count);
             unique_count++;
         } else if (instr->accounts[i].is_writable) {
             unique_is_writable[(size_t)idx] = true;
@@ -2756,7 +3994,10 @@ sol_bpf_loader_cpi_dispatch(
 
     /* Map instruction account metas -> unique key indices (duplicates allowed). */
     for (size_t i = 0; i < count; i++) {
-        int idx = find_info_index(unique_keys, unique_count, &instr->accounts[i].pubkey);
+        int idx = cpi_pubkey_map_lookup(unique_map,
+                                        unique_keys,
+                                        unique_count,
+                                        &instr->accounts[i].pubkey);
         if (idx < 0) {
             return SOL_ERR_INVAL;
         }
@@ -2765,7 +4006,8 @@ sol_bpf_loader_cpi_dispatch(
 
     sol_bpf_account_info_t infos[SOL_BPF_CPI_MAX_ACCOUNTS];
     sol_bpf_rust_account_info_t rust_infos[SOL_BPF_CPI_MAX_ACCOUNTS];
-    sol_pubkey_t info_pubkeys[SOL_BPF_CPI_MAX_ACCOUNTS];
+    sol_pubkey_t info_pubkeys_local[SOL_BPF_CPI_MAX_ACCOUNTS];
+    const sol_pubkey_t* info_pubkeys = NULL;
     uint64_t info_ptrs[SOL_BPF_CPI_MAX_ACCOUNTS];
     size_t info_count = (size_t)instr->account_infos_len;
 
@@ -2773,36 +4015,94 @@ sol_bpf_loader_cpi_dispatch(
         return SOL_ERR_INVAL;
     }
 
-    for (size_t i = 0; i < info_count; i++) {
-        uint64_t info_ptr = 0;
-        if (!instr->account_infos_are_rust) {
-            info_ptr = instr->account_infos_ptr + i * sizeof(sol_bpf_account_info_t);
-            if (!read_account_info_mem(vm, info_ptr, &infos[i])) {
-                sol_log_info("CPI_DIAG: read_account_info_mem fail i=%zu ptr=0x%lx", i, (unsigned long)info_ptr);
-                return SOL_ERR_BPF_EXECUTE;
-            }
+    if (info_count > 0 && instr->account_infos_pubkeys != NULL) {
+        info_pubkeys = instr->account_infos_pubkeys;
+    } else {
+        info_pubkeys = info_pubkeys_local;
+    }
+    const bool need_pubkeys = (info_pubkeys == info_pubkeys_local);
 
-            if (!read_pubkey_ptr(vm, infos[i].pubkey_ptr, &info_pubkeys[i])) {
-                sol_log_info("CPI_DIAG: read_pubkey_ptr C fail i=%zu ptr=0x%lx", i, (unsigned long)infos[i].pubkey_ptr);
-                return SOL_ERR_BPF_EXECUTE;
-            }
+    int16_t info_map[CPI_PUBKEY_MAP_SZ];
+    cpi_pubkey_map_init(info_map);
 
-            info_ptrs[i] = info_ptr;
-            continue;
+    if (info_count == 0) {
+        /* No account_infos were provided. This is valid for CPI instructions that
+         * require no accounts (e.g. some sysvar/stake queries). */
+    } else if (!instr->account_infos_are_rust) {
+        size_t stride = sizeof(sol_bpf_account_info_t);
+        if (info_count > (SIZE_MAX / stride)) {
+            return SOL_ERR_OVERFLOW;
         }
-
-        info_ptr = instr->account_infos_ptr + i * (uint64_t)SOL_BPF_RUST_ACCOUNT_INFO_SIZE;
-        if (!read_rust_account_info_mem(vm, info_ptr, &rust_infos[i])) {
-            sol_log_info("CPI_DIAG: read_rust_account_info_mem fail i=%zu ptr=0x%lx", i, (unsigned long)info_ptr);
+        size_t total = info_count * stride;
+        uint8_t* infos_raw = sol_bpf_memory_translate(&vm->memory,
+                                                      instr->account_infos_ptr,
+                                                      total,
+                                                      false);
+        if (infos_raw == NULL) {
+            sol_log_debug("CPI_DIAG: translate account_infos C fail ptr=0x%lx len=%zu total=%zu",
+                          (unsigned long)instr->account_infos_ptr,
+                          info_count,
+                          total);
             return SOL_ERR_BPF_EXECUTE;
         }
 
-        if (!read_pubkey_ptr(vm, rust_infos[i].key_ptr, &info_pubkeys[i])) {
-            sol_log_info("CPI_DIAG: read_pubkey_ptr Rust fail i=%zu ptr=0x%lx", i, (unsigned long)rust_infos[i].key_ptr);
+        for (size_t i = 0; i < info_count; i++) {
+            const uint8_t* raw = infos_raw + i * stride;
+            memcpy(&infos[i], raw, sizeof(sol_bpf_account_info_t));
+
+            if (need_pubkeys) {
+                if (!read_pubkey_ptr(vm, infos[i].pubkey_ptr, &info_pubkeys_local[i])) {
+                    sol_log_debug("CPI_DIAG: read_pubkey_ptr C fail i=%zu ptr=0x%lx",
+                                  i,
+                                  (unsigned long)infos[i].pubkey_ptr);
+                    return SOL_ERR_BPF_EXECUTE;
+                }
+            }
+
+            info_ptrs[i] = instr->account_infos_ptr + (uint64_t)(i * stride);
+            cpi_pubkey_map_insert(info_map, info_pubkeys, i);
+        }
+    } else {
+        size_t stride = (size_t)SOL_BPF_RUST_ACCOUNT_INFO_SIZE;
+        if (info_count > (SIZE_MAX / stride)) {
+            return SOL_ERR_OVERFLOW;
+        }
+        size_t total = info_count * stride;
+        uint8_t* infos_raw = sol_bpf_memory_translate(&vm->memory,
+                                                      instr->account_infos_ptr,
+                                                      total,
+                                                      false);
+        if (infos_raw == NULL) {
+            sol_log_debug("CPI_DIAG: translate account_infos Rust fail ptr=0x%lx len=%zu total=%zu",
+                          (unsigned long)instr->account_infos_ptr,
+                          info_count,
+                          total);
             return SOL_ERR_BPF_EXECUTE;
         }
 
-        info_ptrs[i] = info_ptr;
+        for (size_t i = 0; i < info_count; i++) {
+            const uint8_t* data = infos_raw + i * stride;
+            memcpy(&rust_infos[i].key_ptr, data + 0, 8);
+            memcpy(&rust_infos[i].lamports_rc_ptr, data + 8, 8);
+            memcpy(&rust_infos[i].data_rc_ptr, data + 16, 8);
+            memcpy(&rust_infos[i].owner_ptr, data + 24, 8);
+            memcpy(&rust_infos[i].rent_epoch, data + 32, 8);
+            rust_infos[i].is_signer = data[40];
+            rust_infos[i].is_writable = data[41];
+            rust_infos[i].executable = data[42];
+
+            if (need_pubkeys) {
+                if (!read_pubkey_ptr(vm, rust_infos[i].key_ptr, &info_pubkeys_local[i])) {
+                    sol_log_debug("CPI_DIAG: read_pubkey_ptr Rust fail i=%zu ptr=0x%lx",
+                                  i,
+                                  (unsigned long)rust_infos[i].key_ptr);
+                    return SOL_ERR_BPF_EXECUTE;
+                }
+            }
+
+            info_ptrs[i] = instr->account_infos_ptr + (uint64_t)(i * stride);
+            cpi_pubkey_map_insert(info_map, info_pubkeys, i);
+        }
     }
 
     /* Per-account data translation cost (pre-SIMD-0339).
@@ -2822,36 +4122,39 @@ sol_bpf_loader_cpi_dispatch(
             if (charged_unique[uid]) continue;
             charged_unique[uid] = true;
 
-            /* Check if account is executable (use stored account state) */
-            bool is_executable = false;
             uint64_t charge_data_len = 0;
 
-            if (caller->bank != NULL) {
-                sol_account_t* acct = sol_bank_load_account(caller->bank,
-                                                            &unique_keys[uid]);
+            /* Prefer account_infos data length when available.
+             *
+             * For non-executable accounts, Agave charges based on account_info data_len.
+             * For executable accounts, Agave charges based on the bank's stored data_len,
+             * but when an executable account is present in account_infos, its data_len
+             * matches the stored length, so we can avoid an expensive bank load.
+             *
+             * If an account is executable and absent from account_infos (Agave permits
+             * this), fall back to a bank load to get the stored data_len. */
+            int info_idx = cpi_pubkey_map_lookup(info_map,
+                                                 info_pubkeys,
+                                                 info_count,
+                                                 &unique_keys[uid]);
+            if (info_idx >= 0) {
+                if (!instr->account_infos_are_rust) {
+                    charge_data_len = infos[info_idx].data_len;
+                } else {
+                    uint64_t d_ptr = 0, d_len = 0;
+                    if (rust_refcell_read_slice(vm,
+                                                rust_infos[info_idx].data_rc_ptr,
+                                                &d_ptr, &d_len)) {
+                        charge_data_len = d_len;
+                    }
+                }
+            } else if (caller->bank != NULL) {
+                sol_account_t* acct = sol_bank_load_account_view(caller->bank,
+                                                                 &unique_keys[uid]);
                 if (acct != NULL && acct->meta.executable) {
-                    is_executable = true;
                     charge_data_len = (uint64_t)acct->meta.data_len;
                 }
                 if (acct != NULL) sol_account_destroy(acct);
-            }
-
-            if (!is_executable) {
-                /* Non-executable: use account_info data length */
-                int info_idx = find_info_index(info_pubkeys, info_count,
-                                               &unique_keys[uid]);
-                if (info_idx >= 0) {
-                    if (!instr->account_infos_are_rust) {
-                        charge_data_len = infos[info_idx].data_len;
-                    } else {
-                        uint64_t d_ptr = 0, d_len = 0;
-                        if (rust_refcell_read_slice(vm,
-                                                    rust_infos[info_idx].data_rc_ptr,
-                                                    &d_ptr, &d_len)) {
-                            charge_data_len = d_len;
-                        }
-                    }
-                }
             }
 
             uint64_t cost = charge_data_len / SOL_CU_CPI_BYTES_PER_UNIT;
@@ -2859,85 +4162,92 @@ sol_bpf_loader_cpi_dispatch(
                 sol_err_t meter_err = sol_compute_meter_consume(
                     caller->compute_meter, cost);
                 if (meter_err != SOL_OK) {
-                    sol_log_info("CPI_DIAG: translation CU exhaustion at acct %zu cost=%lu", i, (unsigned long)cost);
+                    sol_log_debug("CPI_DIAG: translation CU exhaustion at acct %zu cost=%lu", i, (unsigned long)cost);
                     return meter_err;
                 }
             }
         }
     }
 
-    if (caller->bank != NULL) {
-        /*
-         * CPI pre-update (update_callee_account): sync ALL accounts from the
-         * caller's VM state to the bank, not just writable ones.  In Agave,
-         * update_callee_account runs for every instruction account when
-         * stricter_abi_and_runtime_constraints is true (cpi.rs line 863).
-         * The caller may have modified an account that is writable in the
-         * caller's instruction but read-only in the CPI instruction.  The
-         * callee must see these changes.
-         */
-        for (size_t i = 0; i < count; i++) {
-            int info_idx = find_info_index(info_pubkeys, info_count, &instr->accounts[i].pubkey);
-            if (info_idx < 0) {
-                /* Executable accounts (programs) are allowed to be absent from
-                 * account_infos. Agave skips them in translate_accounts_common. */
-                sol_account_t* chk = sol_bank_load_account(caller->bank,
-                                                            &instr->accounts[i].pubkey);
-                if (chk != NULL && chk->meta.executable) {
-                    sol_account_destroy(chk);
-                    continue;  /* Skip pre-update for executable accounts */
-                }
-                {
-                    char _k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                    char _p58[SOL_PUBKEY_BASE58_LEN] = {0};
-                    sol_pubkey_to_base58(&instr->accounts[i].pubkey, _k58, sizeof(_k58));
-                    sol_pubkey_to_base58(&instr->program_id, _p58, sizeof(_p58));
-                    sol_log_info("CPI_DIAG: pre-update account_not_found key=%s callee=%s idx=%zu exists=%d info_count=%zu",
-                                 _k58, _p58, i, chk != NULL, info_count);
-                }
-                if (chk != NULL) sol_account_destroy(chk);
-                return SOL_ERR_ACCOUNT_NOT_FOUND;
-            }
+    /*
+     * CPI caller-state overrides:
+     *
+     * The caller may have mutated account state in its in-VM AccountInfo buffers
+     * without writing back to the bank yet. Agave exposes these mutations to the
+     * callee via a shared transaction context. We replicate that behavior (and
+     * avoid a very expensive bank sync) by pushing a short-lived TLS override
+     * table, keyed by the caller-provided account_infos.
+     *
+     * While overrides are active, bank account loads return the caller AccountInfo
+     * view unless the callee has written the pubkey (then bank state is
+     * authoritative for that pubkey within the CPI).
+     */
+    sol_account_t override_accounts[SOL_BPF_CPI_MAX_ACCOUNTS];
+    uint8_t override_written[SOL_BPF_CPI_MAX_ACCOUNTS];
+    sol_bank_account_overrides_t overrides = {0};
+    sol_bank_account_overrides_t* overrides_prev = NULL;
+    bool overrides_active = false;
+
+    if (caller->bank != NULL && info_count > 0) {
+        memset(override_accounts, 0, sizeof(override_accounts));
+        memset(override_written, 0, sizeof(override_written));
+
+        for (size_t i = 0; i < info_count; i++) {
+            sol_account_t* oa = &override_accounts[i];
+            oa->data_borrowed = true;
+            oa->meta.owner = SOL_SYSTEM_PROGRAM_ID;
 
             uint64_t lamports_val = 0;
             sol_pubkey_t owner = {0};
             uint64_t data_ptr = 0;
             uint64_t data_len = 0;
             const uint8_t* data = NULL;
+            uint64_t rent_epoch = UINT64_MAX;
+            bool executable = false;
 
             if (!instr->account_infos_are_rust) {
-                sol_bpf_account_info_t* info = &infos[info_idx];
+                sol_bpf_account_info_t* info = &infos[i];
+
+                rent_epoch = info->rent_epoch;
+                executable = info->executable != 0;
 
                 uint64_t* lamports = (uint64_t*)sol_bpf_memory_translate(
                     &vm->memory, info->lamports_ptr, sizeof(uint64_t), false
                 );
                 if (lamports == NULL) {
-                    sol_log_info("CPI_DIAG: pre-update C lamports translate fail idx=%zu ptr=0x%lx", i, (unsigned long)info->lamports_ptr);
+                    sol_log_debug("CPI_DIAG: overrides C lamports translate fail i=%zu ptr=0x%lx",
+                                  i, (unsigned long)info->lamports_ptr);
                     return SOL_ERR_BPF_EXECUTE;
                 }
                 lamports_val = *lamports;
 
                 if (!read_pubkey_ptr(vm, info->owner_ptr, &owner)) {
-                    sol_log_info("CPI_DIAG: pre-update C owner translate fail idx=%zu ptr=0x%lx", i, (unsigned long)info->owner_ptr);
+                    sol_log_debug("CPI_DIAG: overrides C owner translate fail i=%zu ptr=0x%lx",
+                                  i, (unsigned long)info->owner_ptr);
                     return SOL_ERR_BPF_EXECUTE;
                 }
 
                 data_ptr = info->data_ptr;
                 data_len = info->data_len;
                 if (data_len > 0) {
-                    data = sol_bpf_memory_translate(&vm->memory, data_ptr, data_len, false);
+                    if (data_len > (uint64_t)SIZE_MAX) return SOL_ERR_OVERFLOW;
+                    data = sol_bpf_memory_translate(&vm->memory, data_ptr, (size_t)data_len, false);
                     if (data == NULL) {
-                        sol_log_info("CPI_DIAG: pre-update C data translate fail idx=%zu ptr=0x%lx len=%lu", i, (unsigned long)data_ptr, (unsigned long)data_len);
+                        sol_log_debug("CPI_DIAG: overrides C data translate fail i=%zu ptr=0x%lx len=%lu",
+                                      i, (unsigned long)data_ptr, (unsigned long)data_len);
                         return SOL_ERR_BPF_EXECUTE;
                     }
                 }
-
             } else {
-                sol_bpf_rust_account_info_t* info = &rust_infos[info_idx];
+                sol_bpf_rust_account_info_t* info = &rust_infos[i];
+
+                rent_epoch = info->rent_epoch;
+                executable = info->executable != 0;
 
                 uint64_t lamports_ptr = 0;
                 if (!rust_refcell_read_u64_ptr(vm, info->lamports_rc_ptr, &lamports_ptr)) {
-                    sol_log_info("CPI_DIAG: pre-update Rust lamports_rc fail idx=%zu rc_ptr=0x%lx", i, (unsigned long)info->lamports_rc_ptr);
+                    sol_log_debug("CPI_DIAG: overrides Rust lamports_rc fail i=%zu rc_ptr=0x%lx",
+                                  i, (unsigned long)info->lamports_rc_ptr);
                     return SOL_ERR_BPF_EXECUTE;
                 }
 
@@ -2945,93 +4255,50 @@ sol_bpf_loader_cpi_dispatch(
                     &vm->memory, lamports_ptr, sizeof(uint64_t), false
                 );
                 if (lamports == NULL) {
-                    sol_log_info("CPI_DIAG: pre-update Rust lamports translate fail idx=%zu ptr=0x%lx", i, (unsigned long)lamports_ptr);
+                    sol_log_debug("CPI_DIAG: overrides Rust lamports translate fail i=%zu ptr=0x%lx",
+                                  i, (unsigned long)lamports_ptr);
                     return SOL_ERR_BPF_EXECUTE;
                 }
                 lamports_val = *lamports;
 
                 if (!read_pubkey_ptr(vm, info->owner_ptr, &owner)) {
-                    sol_log_info("CPI_DIAG: pre-update Rust owner translate fail idx=%zu ptr=0x%lx", i, (unsigned long)info->owner_ptr);
+                    sol_log_debug("CPI_DIAG: overrides Rust owner translate fail i=%zu ptr=0x%lx",
+                                  i, (unsigned long)info->owner_ptr);
                     return SOL_ERR_BPF_EXECUTE;
                 }
 
                 if (!rust_refcell_read_slice(vm, info->data_rc_ptr, &data_ptr, &data_len)) {
-                    sol_log_info("CPI_DIAG: pre-update Rust data_rc fail idx=%zu rc_ptr=0x%lx", i, (unsigned long)info->data_rc_ptr);
+                    sol_log_debug("CPI_DIAG: overrides Rust data_rc fail i=%zu rc_ptr=0x%lx",
+                                  i, (unsigned long)info->data_rc_ptr);
                     return SOL_ERR_BPF_EXECUTE;
                 }
                 if (data_len > 0) {
+                    if (data_len > (uint64_t)SIZE_MAX) return SOL_ERR_OVERFLOW;
                     data = sol_bpf_memory_translate(&vm->memory, data_ptr, (size_t)data_len, false);
                     if (data == NULL) {
-                        sol_log_info("CPI_DIAG: pre-update Rust data translate fail idx=%zu ptr=0x%lx len=%lu", i, (unsigned long)data_ptr, (unsigned long)data_len);
+                        sol_log_debug("CPI_DIAG: overrides Rust data translate fail i=%zu ptr=0x%lx len=%lu",
+                                      i, (unsigned long)data_ptr, (unsigned long)data_len);
                         return SOL_ERR_BPF_EXECUTE;
                     }
                 }
-
             }
 
-            sol_account_t* account = sol_bank_load_account(caller->bank, &instr->accounts[i].pubkey);
-            bool created = false;
-            if (account == NULL) {
-                account = sol_account_new(lamports_val, (size_t)data_len, &owner);
-                if (account == NULL) {
-                    return SOL_ERR_NOMEM;
-                }
-                created = true;
-            }
-
-            /* Note: Do NOT sync executable or rent_epoch here.
-             * Agave's update_callee_account only syncs lamports, data,
-             * and owner. executable and rent_epoch are immutable metadata
-             * that programs cannot change.
-             *
-             * Only store to the bank if at least one field actually changed,
-             * to avoid inflating BankHashStats and wasting I/O. */
-
-            bool changed = created;
-
-            if (account->meta.lamports != lamports_val) {
-                account->meta.lamports = lamports_val;
-                changed = true;
-            }
-
-            if (!sol_pubkey_eq(&account->meta.owner, &owner)) {
-                account->meta.owner = owner;
-                changed = true;
-            }
-
-            bool data_changed = false;
-            if (account->meta.data_len != (size_t)data_len) {
-                data_changed = true;
-            } else if (data_len > 0) {
-                if (!account->data) {
-                    data_changed = true;
-                } else if (data != NULL && memcmp(account->data, data, (size_t)data_len) != 0) {
-                    data_changed = true;
-                }
-            }
-
-            if (data_changed) {
-                sol_err_t acc_err = sol_account_set_data(account, data, (size_t)data_len);
-                if (acc_err != SOL_OK) {
-                    sol_account_destroy(account);
-                    return acc_err;
-                }
-                changed = true;
-            }
-
-            if (changed) {
-                sol_err_t acc_err = sol_bank_store_account(caller->bank, &instr->accounts[i].pubkey, account);
-                sol_account_destroy(account);
-                if (acc_err != SOL_OK) {
-                    return acc_err;
-                }
-            } else {
-                sol_account_destroy(account);
-            }
+            oa->meta.lamports = lamports_val;
+            oa->meta.owner = owner;
+            oa->meta.data_len = (ulong)data_len;
+            oa->meta.rent_epoch = (sol_epoch_t)rent_epoch;
+            oa->meta.executable = executable;
+            oa->data = (uint8_t*)data;
         }
+
+        overrides.keys = info_pubkeys;
+        overrides.accounts = override_accounts;
+        overrides.written = override_written;
+        overrides.len = info_count;
+        overrides_active = true;
     }
 
-    {
+    if (__builtin_expect(log_debug, 0)) {
         char _p58[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&instr->program_id, _p58, sizeof(_p58));
         sol_log_debug("CPI_DIAG: dispatch_ok callee=%s count=%zu info_count=%zu unique=%zu depth=%lu",
@@ -3064,10 +4331,16 @@ sol_bpf_loader_cpi_dispatch(
     cpi_ctx.current_instruction_index = caller->current_instruction_index;
     cpi_ctx.instruction_trace = caller->instruction_trace;
 
+    if (overrides_active) {
+        overrides_prev = sol_bank_overrides_push(&overrides);
+    }
     sol_err_t err = sol_program_execute(&cpi_ctx);
+    if (overrides_active) {
+        sol_bank_overrides_pop(overrides_prev);
+    }
 
     if (caller->compute_meter != NULL) {
-        {
+        if (__builtin_expect(log_debug, 0)) {
             char _cpi_p58[SOL_PUBKEY_BASE58_LEN] = {0};
             char _callee_p58[SOL_PUBKEY_BASE58_LEN] = {0};
             sol_pubkey_to_base58(&caller->program_id, _cpi_p58, sizeof(_cpi_p58));
@@ -3114,7 +4387,7 @@ sol_bpf_loader_cpi_dispatch(
     if (err != SOL_OK) {
         char cpi_prog[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&instr->program_id, cpi_prog, sizeof(cpi_prog));
-        sol_log_info("CPI_FAIL: callee=%s err=%d(%s) depth=%u",
+        sol_log_debug("CPI_FAIL: callee=%s err=%d(%s) depth=%u",
                      cpi_prog, err, sol_err_str(err),
                      (unsigned)cpi_ctx.stack_height);
         return err;
@@ -3126,11 +4399,14 @@ sol_bpf_loader_cpi_dispatch(
                 continue;
             }
 
-            int info_idx = find_info_index(info_pubkeys, info_count, &instr->accounts[i].pubkey);
+            int info_idx = cpi_pubkey_map_lookup(info_map,
+                                                 info_pubkeys,
+                                                 info_count,
+                                                 &instr->accounts[i].pubkey);
             if (info_idx < 0) {
                 /* Executable accounts may be absent from account_infos.
                  * They should never be writable, but handle gracefully. */
-                sol_account_t* chk = sol_bank_load_account(caller->bank,
+                sol_account_t* chk = sol_bank_load_account_view(caller->bank,
                                                             &instr->accounts[i].pubkey);
                 if (chk != NULL && chk->meta.executable) {
                     sol_account_destroy(chk);
@@ -3140,7 +4416,16 @@ sol_bpf_loader_cpi_dispatch(
                 return SOL_ERR_ACCOUNT_NOT_FOUND;
             }
 
-            sol_account_t* account = sol_bank_load_account(caller->bank, &instr->accounts[i].pubkey);
+            /* If the callee did not touch this account, the caller's AccountInfo
+             * buffers already contain the correct state (including any mutations
+             * the caller made before the CPI).  Loading from the bank here would
+             * revert those caller-local changes because we avoided the expensive
+             * pre-sync (CPI pre-update) and the bank may still hold stale state. */
+            if (overrides_active && override_written[info_idx] == 0) {
+                continue;
+            }
+
+            sol_account_t* account = sol_bank_load_account_view(caller->bank, &instr->accounts[i].pubkey);
             if (account == NULL) {
                 continue;
             }
@@ -3319,11 +4604,13 @@ sol_bpf_loader_cpi_dispatch(
                             memcpy(vm->caller_input_buf + cmetas[mi].lamports_off,
                                    &account->meta.lamports, sizeof(uint64_t));
                             if (buf_old != account->meta.lamports) {
-                                char _k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                                sol_pubkey_to_base58(&instr->accounts[i].pubkey, _k58, sizeof(_k58));
-                                sol_log_info("CPI_BUF_WRITE: key=%s buf_old=%lu new=%lu off=%zu mi=%zu",
-                                             _k58, (unsigned long)buf_old, (unsigned long)account->meta.lamports,
-                                             cmetas[mi].lamports_off, mi);
+                                if (__builtin_expect(log_debug, 0)) {
+                                    char _k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                                    sol_pubkey_to_base58(&instr->accounts[i].pubkey, _k58, sizeof(_k58));
+                                    sol_log_debug("CPI_BUF_WRITE: key=%s buf_old=%lu new=%lu off=%zu mi=%zu",
+                                                 _k58, (unsigned long)buf_old, (unsigned long)account->meta.lamports,
+                                                 cmetas[mi].lamports_off, mi);
+                                }
                             }
                         }
                         /* Update data_len in serialized buffer */
@@ -3370,10 +4657,10 @@ sol_bpf_loader_cpi_dispatch(
     caller->return_data_program = cpi_ctx.return_data_program;
 
     /* CPI success trace */
-    {
+    if (__builtin_expect(log_debug, 0)) {
         char _callee[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&instr->program_id, _callee, sizeof(_callee));
-        sol_log_info("CPI_OK: callee=%s depth=%u cu_used=%lu ret_data_len=%u",
+        sol_log_debug("CPI_OK: callee=%s depth=%u cu_used=%lu ret_data_len=%u",
                      _callee, (unsigned)cpi_ctx.stack_height,
                      (unsigned long)vm->compute_units_used,
                      (unsigned)caller->return_data_len);

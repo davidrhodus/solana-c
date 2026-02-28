@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -300,17 +301,25 @@ health_server_thread(void* arg) {
 	            continue;
 	        }
 
-	        int client_fd = accept(server->server_fd,
-                               (struct sockaddr*)&client_addr, &addr_len);
-        if (client_fd < 0) {
-            if (errno != EINTR && errno != EAGAIN) {
-                sol_log_error("Health server accept failed: %s", strerror(errno));
+		        int client_fd = accept(server->server_fd,
+	                               (struct sockaddr*)&client_addr, &addr_len);
+	        if (client_fd < 0) {
+	            if (errno != EINTR && errno != EAGAIN) {
+	                sol_log_error("Health server accept failed: %s", strerror(errno));
+	            }
+	            continue;
+	        }
+
+        /* Don't leak client sockets into snapshot helper processes (curl/zstd). */
+        {
+            int fd_flags = fcntl(client_fd, F_GETFD, 0);
+            if (fd_flags >= 0) {
+                (void)fcntl(client_fd, F_SETFD, fd_flags | FD_CLOEXEC);
             }
-            continue;
         }
 
-        handle_client(server, client_fd);
-    }
+	        handle_client(server, client_fd);
+	    }
 
     return NULL;
 }
@@ -376,6 +385,14 @@ sol_health_server_start(sol_health_server_t* server) {
     if (server->server_fd < 0) {
         sol_log_error("Health server socket creation failed: %s", strerror(errno));
         return SOL_ERR_IO;
+    }
+
+    /* Ensure listen socket isn't inherited by snapshot helper processes (curl/zstd). */
+    {
+        int fd_flags = fcntl(server->server_fd, F_GETFD, 0);
+        if (fd_flags < 0 || fcntl(server->server_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+            sol_log_warn("Health server fcntl(FD_CLOEXEC) failed: %s", strerror(errno));
+        }
     }
 
     /* Set socket options */

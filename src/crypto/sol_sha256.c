@@ -1,13 +1,105 @@
 /*
  * sol_sha256.c - SHA-256 implementation
  *
- * Pure C implementation with optional hardware acceleration.
- * Follows FIPS 180-4 specification.
+ * Uses OpenSSL when available, otherwise a portable C implementation.
  */
 
 #include "sol_sha256.h"
-#include "../util/sol_bits.h"
 #include <string.h>
+
+#if SOL_USE_OPENSSL
+
+#include <openssl/sha.h>
+
+SOL_INLINE void
+sha256_state_to_bytes(const SHA_LONG h[static 8], uint8_t out[static 32]) {
+    for (int i = 0; i < 8; i++) {
+        uint32_t v = (uint32_t)h[i];
+        out[i * 4 + 0] = (uint8_t)(v >> 24);
+        out[i * 4 + 1] = (uint8_t)(v >> 16);
+        out[i * 4 + 2] = (uint8_t)(v >> 8);
+        out[i * 4 + 3] = (uint8_t)(v);
+    }
+}
+
+void
+sol_sha256_init(sol_sha256_ctx_t* ctx) {
+    if (!ctx) return;
+    (void)SHA256_Init(&ctx->inner);
+}
+
+void
+sol_sha256_update(sol_sha256_ctx_t* ctx, const void* data, size_t len) {
+    if (!ctx) return;
+    if (!data && len) return;
+    if (!len) return;
+    (void)SHA256_Update(&ctx->inner, data, len);
+}
+
+void
+sol_sha256_final(sol_sha256_ctx_t* ctx, sol_sha256_t* out) {
+    if (!ctx || !out) return;
+    (void)SHA256_Final(out->bytes, &ctx->inner);
+
+    /* Clear sensitive data */
+    memset(ctx, 0, sizeof(*ctx));
+}
+
+void
+sol_sha256(const void* data, size_t len, sol_sha256_t* out) {
+    if (!out) return;
+    if (!data && len) return;
+    (void)SHA256((const unsigned char*)data, len, out->bytes);
+}
+
+void
+sol_sha256_32bytes(const uint8_t in[static 32], uint8_t out[static 32]) {
+    if (!in || !out) return;
+
+    /* Single-block SHA-256 for a fixed-size 32-byte message. */
+    unsigned char block[64] = {0};
+    memcpy(block, in, 32);
+    block[32] = 0x80;
+
+    /* Length in bits (32 bytes = 256 bits), big-endian at block[56..63]. */
+    block[62] = 0x01;
+    block[63] = 0x00;
+
+    SHA256_CTX ctx;
+    (void)SHA256_Init(&ctx);
+    SHA256_Transform(&ctx, block);
+
+    sha256_state_to_bytes(ctx.h, out);
+}
+
+void
+sol_sha256_32bytes_repeated(uint8_t data[static 32], uint64_t cnt) {
+    if (!data) return;
+    if (cnt == 0) return;
+
+    /* Keep the padding/length portion constant across iterations. */
+    unsigned char block[64] = {0};
+    memcpy(block, data, 32);
+    block[32] = 0x80;
+    block[62] = 0x01;
+    block[63] = 0x00;
+
+    for (uint64_t i = 0; i < cnt; i++) {
+        SHA256_CTX ctx;
+        (void)SHA256_Init(&ctx);
+        SHA256_Transform(&ctx, block);
+
+        /* Next iteration hashes the previous digest bytes. */
+        sha256_state_to_bytes(ctx.h, block);
+        /* block[32..63] remain unchanged (padding + length) */
+    }
+
+    memcpy(data, block, 32);
+}
+
+#else /* SOL_USE_OPENSSL */
+
+#include "../util/sol_bits.h"
 
 /*
  * SHA-256 constants (first 32 bits of fractional parts of cube roots of first 64 primes)
@@ -234,6 +326,16 @@ sol_sha256_32bytes(const uint8_t in[static 32], uint8_t out[static 32]) {
         out[i * 4 + 3] = (uint8_t)(state[i]);
     }
 }
+
+void
+sol_sha256_32bytes_repeated(uint8_t data[static 32], uint64_t cnt) {
+    if (!data) return;
+    for (uint64_t i = 0; i < cnt; i++) {
+        sol_sha256_32bytes(data, data);
+    }
+}
+
+#endif /* SOL_USE_OPENSSL */
 
 sol_sha256_t*
 sol_sha256_hash(const void* data, size_t len, sol_sha256_t* out) {

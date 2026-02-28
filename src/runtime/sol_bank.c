@@ -4,6 +4,7 @@
 
 #include "sol_bank.h"
 #include "../util/sol_alloc.h"
+#include "../util/sol_arena.h"
 #include "../util/sol_log.h"
 #include "../crypto/sol_sha256.h"
 #include "../crypto/sol_ed25519.h"
@@ -21,12 +22,31 @@
 #include "sol_program.h"
 #include "sol_sysvar.h"
 #include "../util/sol_bits.h"
+#include "../util/sol_map.h"
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+
+/* ---- Concurrency helpers (bank hot path) ---- */
+
+static inline uint64_t bank_monotonic_ns(void);
+
+#define BANK_STAT_ADD(bank, field, val) \
+    (__atomic_fetch_add(&(bank)->stats.field, (uint64_t)(val), __ATOMIC_RELAXED))
+
+#define BANK_STAT_INC(bank, field) BANK_STAT_ADD((bank), field, 1u)
+
+#define BANK_FLAG_CLEAR(bank, field) \
+    (__atomic_store_n(&(bank)->field, false, __ATOMIC_RELAXED))
+
+#define BANK_U64_ADD(bank, field, val) \
+    (__atomic_fetch_add(&(bank)->field, (uint64_t)(val), __ATOMIC_RELAXED))
 
 /*
  * Reserved account keys - accounts that are NEVER writable even if the
@@ -131,25 +151,132 @@ is_reserved_account_key(const sol_pubkey_t* key) {
 static bool
 bank_skip_instruction_exec(void) {
     static int cached = -1;
-    if (cached >= 0) {
-        return cached != 0;
-    }
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
 
     const char* env = getenv("SOL_SKIP_INSTRUCTION_EXEC");
-    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
-    return cached != 0;
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
 }
 
 static bool
 bank_skip_signature_verify(void) {
     static int cached = -1;
-    if (cached >= 0) {
-        return cached != 0;
-    }
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
 
     const char* env = getenv("SOL_SKIP_SIGNATURE_VERIFY");
-    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
-    return cached != 0;
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static uint64_t
+bank_slow_tx_threshold_ns(void) {
+    /* Returns 0 when disabled. Cached after first call. */
+    static _Atomic uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) {
+        return v;
+    }
+
+    uint64_t ns = 0;
+    const char* env = getenv("SOL_SLOW_TX_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long ms = strtoul(env, &end, 10);
+        if (end != env && ms > 0ul) {
+            ns = (uint64_t)ms * 1000000ull;
+        }
+    }
+
+    __atomic_store_n(&cached, ns, __ATOMIC_RELEASE);
+    return ns;
+}
+
+static bool
+bank_skip_transaction_processing(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
+
+    const char* env = getenv("SOL_SKIP_TX_PROCESSING");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+bank_sysvar_diag_enable(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
+
+    const char* env = getenv("SOL_SYSVAR_DIAG");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+bank_lt_hash_diag_enable(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
+
+    const char* env = getenv("SOL_LT_HASH_DIAG");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+bank_lt_hash_timing_enable(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
+
+    const char* env = getenv("SOL_LT_HASH_TIMING");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+bank_rent_diag_enable(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
+
+    const char* env = getenv("SOL_RENT_DIAG");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+bank_fee_payer_trace_enable(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
+
+    const char* env = getenv("SOL_FEE_PAYER_TRACE");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+bank_lamport_diag_enable(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
+
+    const char* env = getenv("SOL_LAMPORT_DIAG");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
 }
 
 /*
@@ -190,6 +317,12 @@ typedef struct sol_tx_status_node {
  * Transaction status cache hash table size
  */
 #define TX_STATUS_HASH_SIZE 4096
+
+/* ---- Address Lookup Table cache (v0 message resolution) ---- */
+
+typedef struct {
+    sol_alt_state_t state;
+} bank_alt_cache_entry_t;
 
 /*
  * Bank structure
@@ -234,6 +367,15 @@ struct sol_bank {
     /* Recent blockhashes */
     sol_blockhash_entry_t   recent_blockhashes[MAX_RECENT_BLOCKHASHES];
     size_t                  recent_blockhash_count;
+    /* Fast lookup: blockhash -> lamports_per_signature */
+    sol_map_t*              recent_blockhash_map;
+
+    /* Cache frequently accessed sysvars/derived values to avoid repeated
+     * AccountsDB loads in the hot execution path. */
+    sol_clock_t             cached_clock;
+    bool                    cached_clock_valid;
+    sol_slot_hashes_t       cached_slot_hashes;
+    bool                    cached_slot_hashes_valid;
 
     /* Transaction status cache */
     sol_tx_status_node_t*   tx_status_buckets[TX_STATUS_HASH_SIZE];
@@ -249,9 +391,218 @@ struct sol_bank {
     /* Statistics */
     sol_bank_stats_t        stats;
 
+    /* Cached parsed ALT tables (pubkey -> bank_alt_cache_entry_t*). */
+    sol_pubkey_map_t*       alt_cache;
+    pthread_rwlock_t        alt_cache_lock;
+    bool                    alt_cache_lock_init;
+    uint64_t                alt_cache_hits;
+    uint64_t                alt_cache_misses;
+
     /* Thread safety */
     pthread_mutex_t         lock;
 };
+
+static uint64_t
+bank_recent_blockhash_hash(const void* key) {
+    const sol_hash_t* h = (const sol_hash_t*)key;
+    return sol_hash_bytes(h->bytes, SOL_HASH_SIZE);
+}
+
+static bool
+bank_recent_blockhash_eq(const void* a, const void* b) {
+    return memcmp(a, b, SOL_HASH_SIZE) == 0;
+}
+
+static void
+bank_recent_blockhash_map_rebuild(sol_bank_t* bank) {
+    if (!bank) return;
+
+    size_t count = bank->recent_blockhash_count;
+    if (count == 0) {
+        if (bank->recent_blockhash_map) {
+            sol_map_clear(bank->recent_blockhash_map);
+        }
+        return;
+    }
+
+    if (!bank->recent_blockhash_map) {
+        size_t cap = count * 2u;
+        if (cap < 16u) cap = 16u;
+        bank->recent_blockhash_map = sol_map_new(sizeof(sol_hash_t),
+                                                 sizeof(uint64_t),
+                                                 bank_recent_blockhash_hash,
+                                                 bank_recent_blockhash_eq,
+                                                 cap);
+        if (!bank->recent_blockhash_map) {
+            return;
+        }
+    } else {
+        sol_map_clear(bank->recent_blockhash_map);
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        (void)sol_map_insert(bank->recent_blockhash_map,
+                             &bank->recent_blockhashes[i].hash,
+                             &bank->recent_blockhashes[i].fee_calculator);
+    }
+}
+
+static void
+bank_alt_cache_destroy(sol_bank_t* bank) {
+    if (!bank || !bank->alt_cache_lock_init) return;
+
+    pthread_rwlock_wrlock(&bank->alt_cache_lock);
+    if (bank->alt_cache) {
+        sol_map_iter_t it = sol_map_iter(bank->alt_cache->inner);
+        void* key = NULL;
+        void* val = NULL;
+        while (sol_map_iter_next(&it, &key, &val)) {
+            bank_alt_cache_entry_t* entry =
+                val ? *(bank_alt_cache_entry_t* const*)val : NULL;
+            if (entry) {
+                sol_alt_state_free(&entry->state);
+                sol_free(entry);
+            }
+        }
+        sol_pubkey_map_destroy(bank->alt_cache);
+        bank->alt_cache = NULL;
+    }
+    pthread_rwlock_unlock(&bank->alt_cache_lock);
+
+    pthread_rwlock_destroy(&bank->alt_cache_lock);
+    bank->alt_cache_lock_init = false;
+}
+
+static void
+bank_alt_cache_init(sol_bank_t* bank) {
+    if (!bank || bank->alt_cache_lock_init) return;
+
+    if (pthread_rwlock_init(&bank->alt_cache_lock, NULL) != 0) {
+        return;
+    }
+    bank->alt_cache_lock_init = true;
+    bank->alt_cache = sol_pubkey_map_new(sizeof(void*), 256u);
+    if (!bank->alt_cache) {
+        pthread_rwlock_destroy(&bank->alt_cache_lock);
+        bank->alt_cache_lock_init = false;
+    }
+}
+
+static void
+bank_alt_cache_invalidate(sol_bank_t* bank, const sol_pubkey_t* key) {
+    if (!bank || !key || !bank->alt_cache_lock_init || !bank->alt_cache) return;
+
+    bank_alt_cache_entry_t* entry = NULL;
+
+    /* Optimistic read path: avoid taking the exclusive lock unless we
+     * actually have a cached entry for this key. */
+    pthread_rwlock_rdlock(&bank->alt_cache_lock);
+    bank_alt_cache_entry_t** found =
+        (bank_alt_cache_entry_t**)sol_pubkey_map_get(bank->alt_cache, key);
+    bool present = (found && *found);
+    pthread_rwlock_unlock(&bank->alt_cache_lock);
+
+    if (!present) return;
+
+    pthread_rwlock_wrlock(&bank->alt_cache_lock);
+    found = (bank_alt_cache_entry_t**)sol_pubkey_map_get(bank->alt_cache, key);
+    if (found && *found) {
+        entry = *found;
+        (void)sol_pubkey_map_remove(bank->alt_cache, key);
+    }
+    pthread_rwlock_unlock(&bank->alt_cache_lock);
+
+    if (entry) {
+        sol_alt_state_free(&entry->state);
+        sol_free(entry);
+    }
+}
+
+static sol_err_t
+bank_alt_cache_get(sol_bank_t* bank, const sol_pubkey_t* key, const sol_alt_state_t** out_state) {
+    if (!bank || !key || !out_state) return SOL_ERR_INVAL;
+
+    bank_alt_cache_init(bank);
+    if (!bank->alt_cache_lock_init || !bank->alt_cache) {
+        return SOL_ERR_NOT_IMPLEMENTED;
+    }
+
+    /* If this table was modified in the current bank overlay, bypass the cache
+     * and re-load from AccountsDB (which will observe the local layer). */
+    if (sol_accounts_db_is_overlay(bank->accounts_db)) {
+        sol_accounts_db_local_kind_t kind =
+            sol_accounts_db_get_local_kind(bank->accounts_db, key, NULL);
+        if (kind == SOL_ACCOUNTS_DB_LOCAL_TOMBSTONE) {
+            return SOL_ERR_TX_SANITIZE;
+        }
+        if (kind == SOL_ACCOUNTS_DB_LOCAL_ACCOUNT) {
+            goto load_and_insert;
+        }
+    }
+
+    pthread_rwlock_rdlock(&bank->alt_cache_lock);
+    bank_alt_cache_entry_t** found =
+        (bank_alt_cache_entry_t**)sol_pubkey_map_get(bank->alt_cache, key);
+    if (found && *found) {
+        __atomic_fetch_add(&bank->alt_cache_hits, 1, __ATOMIC_RELAXED);
+        *out_state = &(*found)->state;
+        pthread_rwlock_unlock(&bank->alt_cache_lock);
+        return SOL_OK;
+    }
+    pthread_rwlock_unlock(&bank->alt_cache_lock);
+    __atomic_fetch_add(&bank->alt_cache_misses, 1, __ATOMIC_RELAXED);
+
+    /* Miss: load and parse outside lock, then insert. */
+load_and_insert: ;
+    sol_account_t* table_account = sol_accounts_db_load(bank->accounts_db, key);
+    if (!table_account) {
+        return SOL_ERR_TX_SANITIZE;
+    }
+
+    if (!sol_pubkey_eq(&table_account->meta.owner, &SOL_ADDRESS_LOOKUP_TABLE_ID)) {
+        sol_account_destroy(table_account);
+        return SOL_ERR_TX_SANITIZE;
+    }
+
+    bank_alt_cache_entry_t* entry = sol_calloc(1, sizeof(*entry));
+    if (!entry) {
+        sol_account_destroy(table_account);
+        return SOL_ERR_NOMEM;
+    }
+    sol_alt_state_init(&entry->state);
+
+    sol_err_t deser_err =
+        sol_alt_deserialize(&entry->state, table_account->data, (size_t)table_account->meta.data_len);
+    sol_account_destroy(table_account);
+    if (deser_err != SOL_OK) {
+        sol_alt_state_free(&entry->state);
+        sol_free(entry);
+        return SOL_ERR_TX_SANITIZE;
+    }
+
+    if (!sol_alt_is_active(&entry->state, sol_bank_slot(bank))) {
+        sol_alt_state_free(&entry->state);
+        sol_free(entry);
+        return SOL_ERR_TX_SANITIZE;
+    }
+
+    pthread_rwlock_wrlock(&bank->alt_cache_lock);
+    bank_alt_cache_entry_t** existing =
+        (bank_alt_cache_entry_t**)sol_pubkey_map_get(bank->alt_cache, key);
+    if (existing && *existing) {
+        *out_state = &(*existing)->state;
+        pthread_rwlock_unlock(&bank->alt_cache_lock);
+        sol_alt_state_free(&entry->state);
+        sol_free(entry);
+        return SOL_OK;
+    }
+
+    void* v = entry;
+    (void)sol_pubkey_map_insert(bank->alt_cache, key, &v);
+    *out_state = &entry->state;
+    pthread_rwlock_unlock(&bank->alt_cache_lock);
+    return SOL_OK;
+}
 
 static sol_err_t refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing);
 static sol_err_t update_recent_blockhashes_sysvar(sol_bank_t* bank);
@@ -264,6 +615,16 @@ static uint64_t bank_lamports_per_signature_for_blockhash_locked(
 static bool bank_try_get_durable_nonce_fee_calculator(const sol_bank_t* bank,
                                                       const sol_transaction_t* tx,
                                                       uint64_t* out_lamports_per_signature);
+
+static bool
+bank_log_fee_dist(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached != 0;
+
+    const char* env = getenv("SOL_LOG_FEE_DIST");
+    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached != 0;
+}
 
 static sol_err_t
 distribute_slot_fees(sol_bank_t* bank) {
@@ -320,8 +681,13 @@ distribute_slot_fees(sol_bank_t* bank) {
     if (!deposit_ok) {
         char coll_b58[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&bank->fee_collector, coll_b58, sizeof(coll_b58));
-        sol_log_info("FEE_DIST: slot=%lu BURNED %lu lamports (collector=%s failed validation)",
-                     (unsigned long)bank->slot, (unsigned long)to_collector, coll_b58);
+        if (bank_log_fee_dist()) {
+            sol_log_info("FEE_DIST: slot=%lu BURNED %lu lamports (collector=%s failed validation)",
+                         (unsigned long)bank->slot, (unsigned long)to_collector, coll_b58);
+        } else {
+            sol_log_debug("FEE_DIST: slot=%lu BURNED %lu lamports (collector=%s failed validation)",
+                          (unsigned long)bank->slot, (unsigned long)to_collector, coll_b58);
+        }
         sol_account_destroy(collector);
         return SOL_OK;
     }
@@ -330,10 +696,17 @@ distribute_slot_fees(sol_bank_t* bank) {
     {
         char coll_b58[SOL_PUBKEY_BASE58_LEN] = {0};
         sol_pubkey_to_base58(&bank->fee_collector, coll_b58, sizeof(coll_b58));
-        sol_log_info("FEE_DIST: slot=%lu collector=%s total_fees=%lu priority=%lu burned=%lu to_collector=%lu",
-                     (unsigned long)bank->slot, coll_b58,
-                     (unsigned long)total_fees, (unsigned long)priority_fees,
-                     (unsigned long)burned, (unsigned long)to_collector);
+        if (bank_log_fee_dist()) {
+            sol_log_info("FEE_DIST: slot=%lu collector=%s total_fees=%lu priority=%lu burned=%lu to_collector=%lu",
+                         (unsigned long)bank->slot, coll_b58,
+                         (unsigned long)total_fees, (unsigned long)priority_fees,
+                         (unsigned long)burned, (unsigned long)to_collector);
+        } else {
+            sol_log_debug("FEE_DIST: slot=%lu collector=%s total_fees=%lu priority=%lu burned=%lu to_collector=%lu",
+                          (unsigned long)bank->slot, coll_b58,
+                          (unsigned long)total_fees, (unsigned long)priority_fees,
+                          (unsigned long)burned, (unsigned long)to_collector);
+        }
     }
 
     sol_err_t err = sol_bank_store_account(bank, &bank->fee_collector, collector);
@@ -395,6 +768,7 @@ restore_recent_blockhashes_from_sysvar(sol_bank_t* bank) {
     }
     bank->recent_blockhash_count = count;
     bank->blockhash = bank->recent_blockhashes[0].hash;
+    bank_recent_blockhash_map_rebuild(bank);
     if (sol_log_get_level() <= SOL_LOG_DEBUG) {
         char hex[65] = {0};
         (void)sol_hash_to_hex(&bank->blockhash, hex, sizeof(hex));
@@ -473,6 +847,110 @@ typedef struct {
 static vote_stakes_cache_entry_t g_vote_stakes_cache[VOTE_STAKES_CACHE_ENTRIES];
 static uint64_t g_vote_stakes_cache_gen = 1;
 static pthread_mutex_t g_vote_stakes_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static sol_pubkey_map_t*
+pubkey_u64_map_clone(const sol_pubkey_map_t* src) {
+    if (!src || !src->inner) return NULL;
+
+    size_t src_size = sol_map_size(src->inner);
+    size_t src_cap = sol_map_capacity(src->inner);
+    size_t cap = src_cap;
+    if (cap < src_size * 2) {
+        cap = src_size * 2;
+    }
+    if (cap < 1024u) {
+        cap = 1024u;
+    }
+
+    sol_pubkey_map_t* dst = sol_pubkey_map_new(sizeof(uint64_t), cap);
+    if (!dst) return NULL;
+
+    sol_map_iter_t it = sol_map_iter(src->inner);
+    void* k = NULL;
+    void* v = NULL;
+    while (sol_map_iter_next(&it, &k, &v)) {
+        if (!k || !v) continue;
+        sol_pubkey_t key = *(const sol_pubkey_t*)k;
+        uint64_t stake = *(const uint64_t*)v;
+        if (!sol_pubkey_map_insert(dst, &key, &stake)) {
+            sol_pubkey_map_destroy(dst);
+            return NULL;
+        }
+    }
+
+    return dst;
+}
+
+sol_err_t
+sol_bank_seed_vote_stakes_cache(sol_accounts_db_t* accounts_db,
+                                uint64_t epoch,
+                                const sol_pubkey_map_t* vote_stakes,
+                                uint64_t total_stake) {
+    if (!accounts_db || !vote_stakes) return SOL_ERR_INVAL;
+
+    uint64_t root_id = sol_accounts_db_root_id(accounts_db);
+    if (root_id == 0) {
+        root_id = sol_accounts_db_id(accounts_db);
+    }
+    if (root_id == 0) {
+        return SOL_ERR_INVAL;
+    }
+
+    sol_pubkey_map_t* clone = pubkey_u64_map_clone(vote_stakes);
+    if (!clone) {
+        return SOL_ERR_NOMEM;
+    }
+
+    pthread_mutex_lock(&g_vote_stakes_cache_lock);
+
+    /* Replace existing entry if present. */
+    for (size_t i = 0; i < VOTE_STAKES_CACHE_ENTRIES; i++) {
+        vote_stakes_cache_entry_t* e = &g_vote_stakes_cache[i];
+        if (e->valid && e->root_id == root_id && e->epoch == epoch) {
+            if (e->vote_stakes) {
+                sol_pubkey_map_destroy(e->vote_stakes);
+            }
+            e->vote_stakes = clone;
+            e->total_stake = total_stake;
+            e->gen = ++g_vote_stakes_cache_gen;
+            pthread_mutex_unlock(&g_vote_stakes_cache_lock);
+            return SOL_OK;
+        }
+    }
+
+    /* Find eviction slot (first invalid, else least-recently-used). */
+    size_t evict = 0;
+    uint64_t oldest = UINT64_MAX;
+    for (size_t i = 0; i < VOTE_STAKES_CACHE_ENTRIES; i++) {
+        vote_stakes_cache_entry_t* e = &g_vote_stakes_cache[i];
+        if (!e->valid || !e->vote_stakes) {
+            evict = i;
+            oldest = 0;
+            break;
+        }
+        if (e->gen < oldest) {
+            oldest = e->gen;
+            evict = i;
+        }
+    }
+
+    vote_stakes_cache_entry_t* slot = &g_vote_stakes_cache[evict];
+    if (slot->vote_stakes) {
+        sol_pubkey_map_destroy(slot->vote_stakes);
+    }
+
+    *slot = (vote_stakes_cache_entry_t){
+        .root_id = root_id,
+        .epoch = epoch,
+        .vote_stakes = clone,
+        .total_stake = total_stake,
+        .gen = ++g_vote_stakes_cache_gen,
+        .valid = true,
+    };
+
+    pthread_mutex_unlock(&g_vote_stakes_cache_lock);
+    return SOL_OK;
+}
 
 static sol_pubkey_map_t*
 bank_get_vote_stakes_cached(sol_bank_t* bank, uint64_t epoch, uint64_t* out_total_stake) {
@@ -559,6 +1037,146 @@ bank_get_vote_stakes_cached(sol_bank_t* bank, uint64_t epoch, uint64_t* out_tota
     return new_map;
 }
 
+/* ---- Vote timestamp cache (Clock sysvar median timestamp) ---- */
+
+typedef struct {
+    uint64_t last_timestamp_slot;
+    int64_t  last_timestamp;
+} vote_timestamp_cache_val_t;
+
+static pthread_once_t   g_vote_ts_cache_once = PTHREAD_ONCE_INIT;
+static pthread_rwlock_t g_vote_ts_cache_lock;
+static sol_pubkey_map_t* g_vote_ts_cache = NULL;
+static uint64_t         g_vote_ts_cache_root_id = 0;
+
+static void
+vote_ts_cache_do_init(void) {
+    (void)pthread_rwlock_init(&g_vote_ts_cache_lock, NULL);
+}
+
+static inline void
+vote_ts_cache_init(void) {
+    (void)pthread_once(&g_vote_ts_cache_once, vote_ts_cache_do_init);
+}
+
+static inline uint64_t
+vote_ts_cache_root_id_for_db(const sol_accounts_db_t* db) {
+    uint64_t root_id = sol_accounts_db_root_id(db);
+    if (root_id == 0) {
+        root_id = sol_accounts_db_id(db);
+    }
+    return root_id;
+}
+
+sol_err_t
+sol_bank_seed_vote_timestamp_cache(sol_accounts_db_t* accounts_db,
+                                   const sol_pubkey_map_t* vote_stakes) {
+    if (!accounts_db || !vote_stakes || !vote_stakes->inner) {
+        return SOL_ERR_INVAL;
+    }
+
+    vote_ts_cache_init();
+
+    uint64_t root_id = vote_ts_cache_root_id_for_db(accounts_db);
+    if (root_id == 0) {
+        return SOL_ERR_INVAL;
+    }
+
+    size_t src_size = sol_map_size(vote_stakes->inner);
+    size_t src_cap = sol_map_capacity(vote_stakes->inner);
+    size_t cap = src_cap;
+    if (cap < src_size * 2) {
+        cap = src_size * 2;
+    }
+    if (cap < 1024u) {
+        cap = 1024u;
+    }
+
+    sol_pubkey_map_t* tmp = sol_pubkey_map_new(sizeof(vote_timestamp_cache_val_t), cap);
+    if (!tmp) {
+        return SOL_ERR_NOMEM;
+    }
+
+    sol_map_iter_t it = sol_map_iter(vote_stakes->inner);
+    void* k = NULL;
+    void* v = NULL;
+    while (sol_map_iter_next(&it, &k, &v)) {
+        if (!k || !v) continue;
+        const sol_pubkey_t* vote_pubkey = (const sol_pubkey_t*)k;
+        uint64_t stake = *(const uint64_t*)v;
+        if (stake == 0) continue;
+
+        sol_account_t* account = sol_accounts_db_load_view(accounts_db, vote_pubkey);
+        if (!account) continue;
+        if (account->meta.lamports == 0 ||
+            !sol_pubkey_eq(&account->meta.owner, &SOL_VOTE_PROGRAM_ID)) {
+            sol_account_destroy(account);
+            continue;
+        }
+
+        sol_vote_state_t vote_state;
+        if (sol_vote_state_deserialize(&vote_state, account->data, account->meta.data_len) == SOL_OK) {
+            vote_timestamp_cache_val_t val = {
+                .last_timestamp_slot = vote_state.last_timestamp_slot,
+                .last_timestamp = vote_state.last_timestamp,
+            };
+            (void)sol_pubkey_map_insert(tmp, vote_pubkey, &val);
+        }
+        sol_account_destroy(account);
+    }
+
+    pthread_rwlock_wrlock(&g_vote_ts_cache_lock);
+    if (g_vote_ts_cache) {
+        sol_pubkey_map_destroy(g_vote_ts_cache);
+    }
+    g_vote_ts_cache = tmp;
+    g_vote_ts_cache_root_id = root_id;
+    pthread_rwlock_unlock(&g_vote_ts_cache_lock);
+    return SOL_OK;
+}
+
+void
+sol_bank_vote_timestamp_cache_update(sol_bank_t* bank,
+                                     const sol_pubkey_t* vote_pubkey,
+                                     uint64_t last_timestamp_slot,
+                                     int64_t last_timestamp) {
+    if (!bank || !bank->accounts_db || !vote_pubkey) {
+        return;
+    }
+
+    vote_ts_cache_init();
+    uint64_t root_id = vote_ts_cache_root_id_for_db(bank->accounts_db);
+    if (root_id == 0) {
+        return;
+    }
+
+    pthread_rwlock_wrlock(&g_vote_ts_cache_lock);
+    if (g_vote_ts_cache_root_id != root_id || !g_vote_ts_cache) {
+        if (g_vote_ts_cache) {
+            sol_pubkey_map_destroy(g_vote_ts_cache);
+            g_vote_ts_cache = NULL;
+        }
+        g_vote_ts_cache = sol_pubkey_map_new(sizeof(vote_timestamp_cache_val_t), 4096u);
+        g_vote_ts_cache_root_id = root_id;
+    }
+
+    if (g_vote_ts_cache) {
+        vote_timestamp_cache_val_t* cur =
+            (vote_timestamp_cache_val_t*)sol_pubkey_map_get(g_vote_ts_cache, vote_pubkey);
+        if (!cur ||
+            cur->last_timestamp_slot != last_timestamp_slot ||
+            cur->last_timestamp != last_timestamp) {
+            vote_timestamp_cache_val_t val = {
+                .last_timestamp_slot = last_timestamp_slot,
+                .last_timestamp = last_timestamp,
+            };
+            (void)sol_pubkey_map_insert(g_vote_ts_cache, vote_pubkey, &val);
+        }
+    }
+
+    pthread_rwlock_unlock(&g_vote_ts_cache_lock);
+}
+
 typedef struct {
     int64_t     timestamp;
     uint64_t    stake;
@@ -573,96 +1191,6 @@ cmp_timestamp_sample(const void* a, const void* b) {
     return 0;
 }
 
-typedef struct {
-    const sol_pubkey_map_t* vote_stakes;
-    sol_slot_t              slot;
-    uint64_t                ns_per_slot;
-    uint64_t                slots_per_epoch;
-    timestamp_sample_t*     samples;
-    size_t                  len;
-    size_t                  cap;
-    __uint128_t             total_stake;
-    bool                    oom;
-} timestamp_collect_ctx_t;
-
-static bool
-collect_vote_timestamp_cb(const sol_pubkey_t* pubkey,
-                          const sol_account_t* account,
-                          void* ctx) {
-    timestamp_collect_ctx_t* c = (timestamp_collect_ctx_t*)ctx;
-    if (!c || c->oom) {
-        return false;
-    }
-    if (!pubkey || !account) {
-        return true;
-    }
-    if (account->meta.lamports == 0) {
-        return true;
-    }
-
-    /* Iterate-owner should already filter by owner, but keep the check for
-     * safety on fallback paths. */
-    if (!sol_pubkey_eq(&account->meta.owner, &SOL_VOTE_PROGRAM_ID)) {
-        return true;
-    }
-
-    const uint64_t* stake_ptr = (const uint64_t*)sol_pubkey_map_get(c->vote_stakes, pubkey);
-    if (!stake_ptr || *stake_ptr == 0) {
-        return true;
-    }
-
-    sol_vote_state_t vote_state;
-    if (sol_vote_state_deserialize(&vote_state, account->data, account->meta.data_len) != SOL_OK) {
-        return true;
-    }
-
-    if (vote_state.last_timestamp_slot == 0 || vote_state.last_timestamp == 0) {
-        return true;
-    }
-    if ((sol_slot_t)vote_state.last_timestamp_slot > c->slot) {
-        return true;
-    }
-
-    sol_slot_t age = c->slot - (sol_slot_t)vote_state.last_timestamp_slot;
-    if ((uint64_t)age > c->slots_per_epoch) {
-        return true;
-    }
-
-    __uint128_t delta_ns = (__uint128_t)(uint64_t)age * (__uint128_t)c->ns_per_slot;
-    uint64_t delta_s = (uint64_t)(delta_ns / 1000000000ULL);
-
-    if (delta_s > (uint64_t)INT64_MAX) {
-        return true;
-    }
-    if (vote_state.last_timestamp > INT64_MAX - (int64_t)delta_s) {
-        return true;
-    }
-
-    int64_t estimate = vote_state.last_timestamp + (int64_t)delta_s;
-
-    if (c->len == c->cap) {
-        size_t new_cap = c->cap ? (c->cap * 2) : 256;
-        if (new_cap < c->cap) {
-            c->oom = true;
-            return false;
-        }
-        timestamp_sample_t* next = sol_realloc(c->samples, new_cap * sizeof(*next));
-        if (!next) {
-            c->oom = true;
-            return false;
-        }
-        c->samples = next;
-        c->cap = new_cap;
-    }
-
-    c->samples[c->len++] = (timestamp_sample_t){
-        .timestamp = estimate,
-        .stake = *stake_ptr,
-    };
-    c->total_stake += (__uint128_t)(*stake_ptr);
-    return true;
-}
-
 static bool
 stake_weighted_median_timestamp(sol_bank_t* bank,
                                 const sol_pubkey_map_t* vote_stakes,
@@ -675,43 +1203,136 @@ stake_weighted_median_timestamp(sol_bank_t* bank,
         return false;
     }
 
-    timestamp_collect_ctx_t ctx = {
-        .vote_stakes = vote_stakes,
-        .slot = bank->slot,
-        .ns_per_slot = ns_per_slot,
-        .slots_per_epoch = bank->config.slots_per_epoch,
-        .samples = NULL,
-        .len = 0,
-        .cap = 0,
-        .total_stake = 0,
-        .oom = false,
-    };
+    /* The vote-stakes map already contains only vote accounts with non-zero
+     * effective stake. Iterate it directly to avoid scanning all Vote-owned
+     * accounts and then checking stake weights. */
+    static __thread timestamp_sample_t* tls_samples = NULL;
+    static __thread size_t tls_cap = 0;
+    timestamp_sample_t* samples = tls_samples;
+    size_t len = 0;
+    size_t cap = tls_cap;
+    __uint128_t total_stake = 0;
 
-    sol_accounts_db_iterate_owner(bank->accounts_db,
-                                  &SOL_VOTE_PROGRAM_ID,
-                                  collect_vote_timestamp_cb,
-                                  &ctx);
+    vote_ts_cache_init();
+    uint64_t root_id = vote_ts_cache_root_id_for_db(bank->accounts_db);
 
-    if (ctx.oom || ctx.len == 0 || ctx.total_stake == 0) {
-        sol_free(ctx.samples);
+    sol_pubkey_map_t* ts_map = NULL;
+    pthread_rwlock_rdlock(&g_vote_ts_cache_lock);
+    if (g_vote_ts_cache && g_vote_ts_cache_root_id == root_id) {
+        ts_map = g_vote_ts_cache;
+    }
+
+    sol_map_iter_t it = sol_map_iter(vote_stakes->inner);
+    void* k = NULL;
+    void* v = NULL;
+    while (sol_map_iter_next(&it, &k, &v)) {
+        if (!k || !v) continue;
+        const sol_pubkey_t* vote_pubkey = (const sol_pubkey_t*)k;
+        uint64_t stake = *(const uint64_t*)v;
+        if (stake == 0) continue;
+
+        vote_timestamp_cache_val_t cached = {0};
+        bool have_cached = false;
+        if (ts_map) {
+            vote_timestamp_cache_val_t* p =
+                (vote_timestamp_cache_val_t*)sol_pubkey_map_get(ts_map, vote_pubkey);
+            if (p) {
+                cached = *p;
+                have_cached = true;
+            }
+        }
+
+        uint64_t last_slot = cached.last_timestamp_slot;
+        int64_t last_ts = cached.last_timestamp;
+
+        if (!have_cached) {
+            sol_account_t* account = sol_accounts_db_load_view(bank->accounts_db, vote_pubkey);
+            if (!account) continue;
+            if (account->meta.lamports == 0 ||
+                !sol_pubkey_eq(&account->meta.owner, &SOL_VOTE_PROGRAM_ID)) {
+                sol_account_destroy(account);
+                continue;
+            }
+
+            sol_vote_state_t vote_state;
+            if (sol_vote_state_deserialize(&vote_state, account->data, account->meta.data_len) != SOL_OK) {
+                sol_account_destroy(account);
+                continue;
+            }
+            sol_account_destroy(account);
+
+            last_slot = vote_state.last_timestamp_slot;
+            last_ts = vote_state.last_timestamp;
+        }
+
+        if (last_slot == 0 || last_ts == 0) {
+            continue;
+        }
+        if ((sol_slot_t)last_slot > bank->slot) {
+            continue;
+        }
+
+        sol_slot_t age = bank->slot - (sol_slot_t)last_slot;
+        if ((uint64_t)age > bank->config.slots_per_epoch) {
+            continue;
+        }
+
+        __uint128_t delta_ns = (__uint128_t)(uint64_t)age * (__uint128_t)ns_per_slot;
+        uint64_t delta_s = (uint64_t)(delta_ns / 1000000000ULL);
+
+        if (delta_s > (uint64_t)INT64_MAX) {
+            continue;
+        }
+        if (last_ts > INT64_MAX - (int64_t)delta_s) {
+            continue;
+        }
+
+        int64_t estimate = last_ts + (int64_t)delta_s;
+
+        if (len == cap) {
+            size_t new_cap = cap ? (cap * 2) : 256;
+            if (new_cap < cap) {
+                pthread_rwlock_unlock(&g_vote_ts_cache_lock);
+                return false;
+            }
+            timestamp_sample_t* next = sol_realloc(samples, new_cap * sizeof(*next));
+            if (!next) {
+                pthread_rwlock_unlock(&g_vote_ts_cache_lock);
+                return false;
+            }
+            samples = next;
+            cap = new_cap;
+            tls_samples = samples;
+            tls_cap = cap;
+        }
+
+        samples[len++] = (timestamp_sample_t){
+            .timestamp = estimate,
+            .stake = stake,
+        };
+        total_stake += (__uint128_t)stake;
+    }
+
+    pthread_rwlock_unlock(&g_vote_ts_cache_lock);
+
+    if (len == 0 || total_stake == 0) {
         return false;
     }
 
-    qsort(ctx.samples, ctx.len, sizeof(*ctx.samples), cmp_timestamp_sample);
+    qsort(samples, len, sizeof(*samples), cmp_timestamp_sample);
 
     /* Agave: stake_accumulator > total_stake / 2  (strictly greater than) */
-    __uint128_t half_stake = ctx.total_stake / 2;
+    __uint128_t half_stake = total_stake / 2;
     __uint128_t cum = 0;
-    int64_t median = ctx.samples[ctx.len - 1].timestamp;
-    for (size_t i = 0; i < ctx.len; i++) {
-        cum += (__uint128_t)ctx.samples[i].stake;
+    int64_t median = samples[len - 1].timestamp;
+    for (size_t i = 0; i < len; i++) {
+        cum += (__uint128_t)samples[i].stake;
         if (cum > half_stake) {
-            median = ctx.samples[i].timestamp;
+            median = samples[i].timestamp;
             break;
         }
     }
 
-    sol_free(ctx.samples);
     *out_timestamp = median;
     return true;
 }
@@ -737,6 +1358,62 @@ tx_status_exists_locked(const sol_bank_t* bank, const sol_signature_t* signature
         node = node->next;
     }
     return false;
+}
+
+/* Thread-safe wrapper. */
+static bool
+tx_status_exists(const sol_bank_t* bank, const sol_signature_t* signature) {
+    if (!bank || !signature) return false;
+    pthread_mutex_lock((pthread_mutex_t*)&bank->lock);
+    bool exists = tx_status_exists_locked(bank, signature);
+    pthread_mutex_unlock((pthread_mutex_t*)&bank->lock);
+    return exists;
+}
+
+/* Reserve a tx-status slot early so duplicates in the same slot are rejected
+ * deterministically even under parallel execution. */
+static bool
+tx_status_reserve(sol_bank_t* bank, const sol_signature_t* signature) {
+    if (!bank || !signature) return true;
+
+    pthread_mutex_lock(&bank->lock);
+
+    bool exists = tx_status_exists_locked(bank, signature);
+    if (exists) {
+        pthread_mutex_unlock(&bank->lock);
+        return false;
+    }
+
+    if (bank->tx_status_count >= SOL_TX_STATUS_CACHE_SIZE) {
+        pthread_mutex_unlock(&bank->lock);
+        return true; /* cache full: skip reserving */
+    }
+
+    uint32_t bucket = 0;
+    bucket |= (uint32_t)signature->bytes[0];
+    bucket |= (uint32_t)signature->bytes[1] << 8;
+    bucket |= (uint32_t)signature->bytes[2] << 16;
+    bucket |= (uint32_t)signature->bytes[3] << 24;
+    bucket %= TX_STATUS_HASH_SIZE;
+
+    sol_tx_status_node_t* node = sol_calloc(1, sizeof(sol_tx_status_node_t));
+    if (!node) {
+        pthread_mutex_unlock(&bank->lock);
+        return true; /* best-effort */
+    }
+
+    node->entry.signature = *signature;
+    node->entry.slot = bank->slot;
+    node->entry.status = SOL_ERR_INVAL; /* placeholder; updated on completion */
+    node->entry.fee = 0;
+    node->entry.compute_units = 0;
+
+    node->next = bank->tx_status_buckets[bucket];
+    bank->tx_status_buckets[bucket] = node;
+    bank->tx_status_count++;
+
+    pthread_mutex_unlock(&bank->lock);
+    return true;
 }
 
 static bool
@@ -774,6 +1451,77 @@ mix_account_into_accounts_lt_hash(const sol_pubkey_t* pubkey,
     return true;
 }
 
+static size_t
+bank_lt_hash_full_recompute_threads(void) {
+    const char* env = getenv("SOL_LT_HASH_FULL_RECOMP_THREADS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env) {
+            if (v <= 1ul) return 1u;
+            return (size_t)v;
+        }
+    }
+
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 1;
+    size_t threads = (size_t)n;
+
+    /* Full lt_hash recompute is memory-bandwidth heavy. A conservative default
+     * avoids oversubscribing the host when multiple validators run. */
+    if (threads > 8u) threads = 8u;
+    return threads;
+}
+
+typedef struct {
+    sol_accounts_db_t* db;
+    uint32_t           prefixes_per_task; /* number of leading-byte prefixes per task */
+    uint32_t           task_count;         /* total tasks */
+    uint32_t           next_task;          /* atomic via __atomic builtins */
+    sol_lt_hash_t*     partials;           /* [threads] */
+} lt_hash_full_recompute_ctx_t;
+
+typedef struct {
+    lt_hash_full_recompute_ctx_t* ctx;
+    size_t                        idx;
+} lt_hash_full_recompute_thread_arg_t;
+
+static void*
+lt_hash_full_recompute_thread_main(void* arg) {
+    lt_hash_full_recompute_thread_arg_t* a = (lt_hash_full_recompute_thread_arg_t*)arg;
+    if (!a || !a->ctx || !a->ctx->db || !a->ctx->partials) return NULL;
+
+    lt_hash_full_recompute_ctx_t* ctx = a->ctx;
+    sol_lt_hash_t* acc = &ctx->partials[a->idx];
+    sol_lt_hash_identity(acc);
+
+    for (;;) {
+        uint32_t task = __atomic_fetch_add(&ctx->next_task, 1u, __ATOMIC_RELAXED);
+        if (task >= ctx->task_count) {
+            break;
+        }
+
+        uint32_t start_prefix = task * ctx->prefixes_per_task;
+        uint32_t end_prefix = start_prefix + (ctx->prefixes_per_task - 1u);
+        if (end_prefix > 255u) end_prefix = 255u;
+
+        sol_pubkey_t start = {0};
+        sol_pubkey_t end = {0};
+        start.bytes[0] = (uint8_t)start_prefix;
+        memset(start.bytes + 1, 0x00, 31);
+        end.bytes[0] = (uint8_t)end_prefix;
+        memset(end.bytes + 1, 0xFF, 31);
+
+        sol_accounts_db_iterate_pubkey_range(ctx->db,
+                                             &start,
+                                             &end,
+                                             mix_account_into_accounts_lt_hash,
+                                             acc);
+    }
+
+    return NULL;
+}
+
 typedef struct {
     sol_lt_hash_t* out;
     uint64_t       n_updated;    /* prev and curr exist, differ */
@@ -799,6 +1547,48 @@ typedef struct {
     sol_lt_hash_t  other_delta;
     uint64_t       n_other;
 } accounts_lt_hash_delta_ctx_t;
+
+typedef struct {
+    sol_lt_hash_t* out;
+} accounts_lt_hash_fast_ctx_t;
+
+static bool
+apply_local_delta_to_accounts_lt_hash_fast(sol_accounts_db_t* parent,
+                                           const sol_pubkey_t* pubkey,
+                                           const sol_account_t* local_account,
+                                           void* vctx) {
+    accounts_lt_hash_fast_ctx_t* ctx = (accounts_lt_hash_fast_ctx_t*)vctx;
+    if (!ctx || !ctx->out || !pubkey) return false;
+
+    const sol_account_t* curr = local_account;
+    sol_account_t* prev = parent ? sol_accounts_db_load(parent, pubkey) : NULL;
+
+    if (accounts_equal_for_lt_hash(prev, curr)) {
+        sol_account_destroy(prev);
+        return true;
+    }
+
+    sol_lt_hash_t prev_hash;
+    sol_lt_hash_t curr_hash;
+
+    if (prev) {
+        sol_account_lt_hash(pubkey, prev, &prev_hash);
+    } else {
+        sol_lt_hash_identity(&prev_hash);
+    }
+
+    if (curr) {
+        sol_account_lt_hash(pubkey, curr, &curr_hash);
+    } else {
+        sol_lt_hash_identity(&curr_hash);
+    }
+
+    sol_lt_hash_mix_out(ctx->out, &prev_hash);
+    sol_lt_hash_mix_in(ctx->out, &curr_hash);
+
+    sol_account_destroy(prev);
+    return true;
+}
 
 static bool
 apply_local_delta_to_accounts_lt_hash(sol_accounts_db_t* parent,
@@ -986,27 +1776,95 @@ apply_local_delta_to_accounts_lt_hash(sol_accounts_db_t* parent,
 }
 
 static void
+tx_pool_run_lthash_delta(sol_accounts_db_t* parent,
+                         const sol_accounts_db_local_entry_t* entries,
+                         size_t count,
+                         sol_lt_hash_t* out_delta);
+
+static void
 bank_compute_accounts_lt_hash_locked(sol_bank_t* bank) {
     if (!bank || !bank->accounts_db) return;
     if (bank->accounts_lt_hash_computed) return;
+
+    const bool timing = bank_lt_hash_timing_enable();
+    uint64_t t0_ns = 0;
+    if (timing) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        t0_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    }
+
+    const char* timing_method = "none";
+    size_t timing_local_entries = 0;
 
     sol_lt_hash_t lt;
     sol_lt_hash_identity(&lt);
 
     if (sol_accounts_db_is_overlay(bank->accounts_db) && bank->accounts_lt_hash_base_valid) {
         lt = bank->accounts_lt_hash_base;
-        accounts_lt_hash_delta_ctx_t ctx = {.out = &lt, .slot = bank->slot};
 
         /* Optionally dump delta accounts to a TSV file for debugging */
         const char* dump_dir = getenv("SOL_DUMP_DELTA_ACCOUNTS");
         const char* dump_slot_str = getenv("SOL_DUMP_DELTA_SLOT");
         uint64_t dump_slot = dump_slot_str ? strtoull(dump_slot_str, NULL, 10) : 0;
         bool should_dump = dump_dir && dump_dir[0] && (!dump_slot || bank->slot == dump_slot);
-        if (should_dump) {
-            char path[512];
-            snprintf(path, sizeof(path), "%s/delta_accounts.%lu.tsv",
-                     dump_dir, (unsigned long)bank->slot);
-            ctx.dump_fp = fopen(path, "w");
+        if (!should_dump && !bank_lt_hash_diag_enable()) {
+            /* Freeze-time fast path: avoid cloning local overlay accounts when
+             * computing the lt-hash delta. This is safe only once the bank is
+             * frozen (no further overlay mutations). */
+            if (__atomic_load_n(&bank->frozen, __ATOMIC_ACQUIRE)) {
+                sol_accounts_db_local_snapshot_view_t snap = {0};
+                sol_err_t err = sol_accounts_db_snapshot_local_view(bank->accounts_db, &snap);
+                if (err == SOL_OK) {
+                    sol_lt_hash_t delta;
+                    tx_pool_run_lthash_delta(snap.parent, snap.entries, snap.len, &delta);
+                    sol_lt_hash_mix_in(&lt, &delta);
+                    timing_method = "delta_view";
+                    timing_local_entries = snap.len;
+                    sol_accounts_db_local_snapshot_view_free(&snap);
+                } else {
+                    /* Fall back to the clone-based snapshot on failure. */
+                    sol_accounts_db_local_snapshot_t cloned = {0};
+                    sol_err_t cerr = sol_accounts_db_snapshot_local(bank->accounts_db, &cloned);
+                    if (cerr == SOL_OK) {
+                        sol_lt_hash_t delta;
+                        tx_pool_run_lthash_delta(cloned.parent, cloned.entries, cloned.len, &delta);
+                        sol_lt_hash_mix_in(&lt, &delta);
+                        timing_method = "delta_clone_fallback";
+                        timing_local_entries = cloned.len;
+                        sol_accounts_db_local_snapshot_free(&cloned);
+                    } else {
+                        /* Fallback to a full recompute over the merged view. */
+                        sol_lt_hash_identity(&lt);
+                        sol_accounts_db_iterate(bank->accounts_db, mix_account_into_accounts_lt_hash, &lt);
+                        timing_method = "full_recompute_fallback";
+                    }
+                }
+            } else {
+                sol_accounts_db_local_snapshot_t snap = {0};
+                sol_err_t err = sol_accounts_db_snapshot_local(bank->accounts_db, &snap);
+                if (err == SOL_OK) {
+                    sol_lt_hash_t delta;
+                    tx_pool_run_lthash_delta(snap.parent, snap.entries, snap.len, &delta);
+                    sol_lt_hash_mix_in(&lt, &delta);
+                    timing_method = "delta_clone";
+                    timing_local_entries = snap.len;
+                    sol_accounts_db_local_snapshot_free(&snap);
+                } else {
+                    /* Fallback to a full recompute over the merged view. */
+                    sol_lt_hash_identity(&lt);
+                    sol_accounts_db_iterate(bank->accounts_db, mix_account_into_accounts_lt_hash, &lt);
+                    timing_method = "full_recompute_fallback";
+                }
+            }
+        } else {
+            accounts_lt_hash_delta_ctx_t ctx = {.out = &lt, .slot = bank->slot};
+
+            if (should_dump) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/delta_accounts.%lu.tsv",
+                         dump_dir, (unsigned long)bank->slot);
+                ctx.dump_fp = fopen(path, "w");
             if (ctx.dump_fp) {
                 fprintf(ctx.dump_fp, "pubkey\tprev_lamports\tcurr_lamports\tprev_data_len\tcurr_data_len\towner\ttype\texecutable\tdata_hash\tcurr_lthash\tprev_lthash\tprev_data_hash\tprev_owner\tprev_executable\n");
             }
@@ -1014,24 +1872,28 @@ bank_compute_accounts_lt_hash_locked(sol_bank_t* bank) {
             char binpath2[512];
             snprintf(binpath2, sizeof(binpath2), "%s/delta_lthash.%lu.bin",
                      dump_dir, (unsigned long)bank->slot);
-            ctx.dump_bin_fp = fopen(binpath2, "wb");
-        }
+                ctx.dump_bin_fp = fopen(binpath2, "wb");
+            }
 
-        sol_err_t err = sol_accounts_db_iterate_local(
-            bank->accounts_db, apply_local_delta_to_accounts_lt_hash, &ctx);
+            sol_err_t err = sol_accounts_db_iterate_local(
+                bank->accounts_db, apply_local_delta_to_accounts_lt_hash, &ctx);
 
-        if (ctx.dump_fp) fclose(ctx.dump_fp);
-        if (ctx.dump_bin_fp) fclose(ctx.dump_bin_fp);
+            if (ctx.dump_fp) fclose(ctx.dump_fp);
+            if (ctx.dump_bin_fp) fclose(ctx.dump_bin_fp);
 
-        if (err != SOL_OK) {
-            /* Fallback to a full recompute over the merged view. */
-            sol_lt_hash_identity(&lt);
-            sol_accounts_db_iterate(bank->accounts_db, mix_account_into_accounts_lt_hash, &lt);
-        }
+            if (err != SOL_OK) {
+                /* Fallback to a full recompute over the merged view. */
+                sol_lt_hash_identity(&lt);
+                sol_accounts_db_iterate(bank->accounts_db, mix_account_into_accounts_lt_hash, &lt);
+                timing_method = "full_recompute_fallback";
+            } else {
+                timing_method = "delta_iterate_local";
+            }
+            timing_local_entries = (size_t)(ctx.n_updated + ctx.n_created + ctx.n_removed + ctx.n_unchanged);
 
-        /* Dump binary lt_hash files for debugging */
-        if (should_dump) {
-            char binpath[512];
+            /* Dump binary lt_hash files for debugging */
+            if (should_dump) {
+                char binpath[512];
 
             /* Base lt_hash */
             snprintf(binpath, sizeof(binpath), "%s/lt_hash_base.%lu.bin",
@@ -1058,28 +1920,32 @@ bank_compute_accounts_lt_hash_locked(sol_bank_t* bank) {
             char base_b58[64], final_b58[64];
             sol_pubkey_to_base58((const sol_pubkey_t*)&base_cksum, base_b58, sizeof(base_b58));
             sol_pubkey_to_base58((const sol_pubkey_t*)&final_cksum, final_b58, sizeof(final_b58));
-            sol_log_info("lt_hash dump: slot=%lu base_checksum=%s final_checksum=%s",
-                         (unsigned long)bank->slot, base_b58, final_b58);
+            if (bank_lt_hash_diag_enable()) {
+                sol_log_info("lt_hash dump: slot=%lu base_checksum=%s final_checksum=%s",
+                             (unsigned long)bank->slot, base_b58, final_b58);
+            }
         }
 
-        sol_log_info("lt_hash delta: slot=%lu updated=%lu created=%lu removed=%lu unchanged=%lu lamports_stored=%lu data_len=%lu",
-                     (unsigned long)bank->slot,
-                     (unsigned long)ctx.n_updated,
-                     (unsigned long)ctx.n_created,
-                     (unsigned long)ctx.n_removed,
-                     (unsigned long)ctx.n_unchanged,
-                     (unsigned long)ctx.total_lamports_stored,
-                     (unsigned long)ctx.total_data_len);
+            if (bank_lt_hash_diag_enable()) {
+                sol_log_info("lt_hash delta: slot=%lu updated=%lu created=%lu removed=%lu unchanged=%lu lamports_stored=%lu data_len=%lu",
+                             (unsigned long)bank->slot,
+                             (unsigned long)ctx.n_updated,
+                             (unsigned long)ctx.n_created,
+                             (unsigned long)ctx.n_removed,
+                             (unsigned long)ctx.n_unchanged,
+                             (unsigned long)ctx.total_lamports_stored,
+                             (unsigned long)ctx.total_data_len);
+            }
 
-        /* Log sysvar-only lt_hash contribution for diagnostics */
-        if (ctx.n_sysvar > 0) {
-            /* Compute sysvar-only final: base + sysvar_delta */
-            sol_lt_hash_t sysvar_only_final = bank->accounts_lt_hash_base;
-            sol_lt_hash_mix_in(&sysvar_only_final, &ctx.sysvar_delta);
-            sol_blake3_t sysvar_cksum;
-            sol_lt_hash_checksum(&sysvar_only_final, &sysvar_cksum);
-            char sysvar_b58[64];
-            sol_pubkey_to_base58((const sol_pubkey_t*)&sysvar_cksum, sysvar_b58, sizeof(sysvar_b58));
+            /* Log sysvar-only lt_hash contribution for diagnostics */
+            if (ctx.n_sysvar > 0 && bank_lt_hash_diag_enable()) {
+                /* Compute sysvar-only final: base + sysvar_delta */
+                sol_lt_hash_t sysvar_only_final = bank->accounts_lt_hash_base;
+                sol_lt_hash_mix_in(&sysvar_only_final, &ctx.sysvar_delta);
+                sol_blake3_t sysvar_cksum;
+                sol_lt_hash_checksum(&sysvar_only_final, &sysvar_cksum);
+                char sysvar_b58[64];
+                sol_pubkey_to_base58((const sol_pubkey_t*)&sysvar_cksum, sysvar_b58, sizeof(sysvar_b58));
 
             /* Also compute non-sysvar delta checksum */
             sol_lt_hash_t nonsysvar_delta;
@@ -1096,79 +1962,141 @@ bank_compute_accounts_lt_hash_locked(sol_bank_t* bank) {
             char nonsysvar_b58[64];
             sol_pubkey_to_base58((const sol_pubkey_t*)&nonsysvar_cksum, nonsysvar_b58, sizeof(nonsysvar_b58));
 
-            sol_log_info("lt_hash sysvar_diag: slot=%lu n_sysvar=%lu sysvar_only_checksum=%s nonsysvar_delta_checksum=%s",
-                         (unsigned long)bank->slot,
-                         (unsigned long)ctx.n_sysvar,
-                         sysvar_b58,
-                         nonsysvar_b58);
+                sol_log_info("lt_hash sysvar_diag: slot=%lu n_sysvar=%lu sysvar_only_checksum=%s nonsysvar_delta_checksum=%s",
+                             (unsigned long)bank->slot,
+                             (unsigned long)ctx.n_sysvar,
+                             sysvar_b58,
+                             nonsysvar_b58);
 
-            /* Per-owner delta checksums */
-            {
-                sol_blake3_t ck; char b58[64];
+                /* Per-owner delta checksums */
+                {
+                    sol_blake3_t ck; char b58[64];
 
-                sol_lt_hash_checksum(&ctx.vote_delta, &ck);
-                sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
-                sol_log_info("lt_hash owner_diag: slot=%lu vote n=%lu cksum=%s",
-                             (unsigned long)bank->slot, (unsigned long)ctx.n_vote, b58);
+                    sol_lt_hash_checksum(&ctx.vote_delta, &ck);
+                    sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
+                    sol_log_info("lt_hash owner_diag: slot=%lu vote n=%lu cksum=%s",
+                                 (unsigned long)bank->slot, (unsigned long)ctx.n_vote, b58);
 
-                sol_lt_hash_checksum(&ctx.system_delta, &ck);
-                sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
-                sol_log_info("lt_hash owner_diag: slot=%lu system n=%lu cksum=%s",
-                             (unsigned long)bank->slot, (unsigned long)ctx.n_system, b58);
+                    sol_lt_hash_checksum(&ctx.system_delta, &ck);
+                    sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
+                    sol_log_info("lt_hash owner_diag: slot=%lu system n=%lu cksum=%s",
+                                 (unsigned long)bank->slot, (unsigned long)ctx.n_system, b58);
 
-                sol_lt_hash_checksum(&ctx.token_delta, &ck);
-                sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
-                sol_log_info("lt_hash owner_diag: slot=%lu token n=%lu cksum=%s",
-                             (unsigned long)bank->slot, (unsigned long)ctx.n_token, b58);
+                    sol_lt_hash_checksum(&ctx.token_delta, &ck);
+                    sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
+                    sol_log_info("lt_hash owner_diag: slot=%lu token n=%lu cksum=%s",
+                                 (unsigned long)bank->slot, (unsigned long)ctx.n_token, b58);
 
-                sol_lt_hash_checksum(&ctx.stake_delta, &ck);
-                sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
-                sol_log_info("lt_hash owner_diag: slot=%lu stake n=%lu cksum=%s",
-                             (unsigned long)bank->slot, (unsigned long)ctx.n_stake, b58);
+                    sol_lt_hash_checksum(&ctx.stake_delta, &ck);
+                    sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
+                    sol_log_info("lt_hash owner_diag: slot=%lu stake n=%lu cksum=%s",
+                                 (unsigned long)bank->slot, (unsigned long)ctx.n_stake, b58);
 
-                sol_lt_hash_checksum(&ctx.other_delta, &ck);
-                sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
-                sol_log_info("lt_hash owner_diag: slot=%lu other n=%lu cksum=%s",
-                             (unsigned long)bank->slot, (unsigned long)ctx.n_other, b58);
-            }
-
-            /* Dump sysvar-only and nonsysvar deltas as binary files */
-            if (dump_dir && dump_dir[0]) {
-                char binpath[512];
-                snprintf(binpath, sizeof(binpath), "%s/lt_hash_sysvar_delta.%lu.bin",
-                         dump_dir, (unsigned long)bank->slot);
-                FILE* bfp = fopen(binpath, "wb");
-                if (bfp) {
-                    fwrite(ctx.sysvar_delta.v, 1, SOL_LT_HASH_SIZE_BYTES, bfp);
-                    fclose(bfp);
-                }
-                snprintf(binpath, sizeof(binpath), "%s/lt_hash_nonsysvar_delta.%lu.bin",
-                         dump_dir, (unsigned long)bank->slot);
-                bfp = fopen(binpath, "wb");
-                if (bfp) {
-                    fwrite(nonsysvar_delta.v, 1, SOL_LT_HASH_SIZE_BYTES, bfp);
-                    fclose(bfp);
+                    sol_lt_hash_checksum(&ctx.other_delta, &ck);
+                    sol_pubkey_to_base58((const sol_pubkey_t*)&ck, b58, sizeof(b58));
+                    sol_log_info("lt_hash owner_diag: slot=%lu other n=%lu cksum=%s",
+                                 (unsigned long)bank->slot, (unsigned long)ctx.n_other, b58);
                 }
 
-                /* Per-owner delta binary dumps */
-                const char* owner_names[] = {"vote", "system", "token", "stake", "other"};
-                const sol_lt_hash_t* owner_ptrs[] = {
-                    &ctx.vote_delta, &ctx.system_delta, &ctx.token_delta,
-                    &ctx.stake_delta, &ctx.other_delta
-                };
-                for (size_t oi = 0; oi < 5; oi++) {
-                    snprintf(binpath, sizeof(binpath), "%s/lt_hash_%s_delta.%lu.bin",
-                             dump_dir, owner_names[oi], (unsigned long)bank->slot);
+                /* Dump sysvar-only and nonsysvar deltas as binary files */
+                if (dump_dir && dump_dir[0]) {
+                    char binpath[512];
+                    snprintf(binpath, sizeof(binpath), "%s/lt_hash_sysvar_delta.%lu.bin",
+                             dump_dir, (unsigned long)bank->slot);
+                    FILE* bfp = fopen(binpath, "wb");
+                    if (bfp) {
+                        fwrite(ctx.sysvar_delta.v, 1, SOL_LT_HASH_SIZE_BYTES, bfp);
+                        fclose(bfp);
+                    }
+                    snprintf(binpath, sizeof(binpath), "%s/lt_hash_nonsysvar_delta.%lu.bin",
+                             dump_dir, (unsigned long)bank->slot);
                     bfp = fopen(binpath, "wb");
                     if (bfp) {
-                        fwrite(owner_ptrs[oi]->v, 1, SOL_LT_HASH_SIZE_BYTES, bfp);
+                        fwrite(nonsysvar_delta.v, 1, SOL_LT_HASH_SIZE_BYTES, bfp);
                         fclose(bfp);
+                    }
+
+                    /* Per-owner delta binary dumps */
+                    const char* owner_names[] = {"vote", "system", "token", "stake", "other"};
+                    const sol_lt_hash_t* owner_ptrs[] = {
+                        &ctx.vote_delta, &ctx.system_delta, &ctx.token_delta,
+                        &ctx.stake_delta, &ctx.other_delta
+                    };
+                    for (size_t oi = 0; oi < 5; oi++) {
+                        snprintf(binpath, sizeof(binpath), "%s/lt_hash_%s_delta.%lu.bin",
+                                 dump_dir, owner_names[oi], (unsigned long)bank->slot);
+                        bfp = fopen(binpath, "wb");
+                        if (bfp) {
+                            fwrite(owner_ptrs[oi]->v, 1, SOL_LT_HASH_SIZE_BYTES, bfp);
+                            fclose(bfp);
+                        }
                     }
                 }
             }
         }
     } else {
-        sol_accounts_db_iterate(bank->accounts_db, mix_account_into_accounts_lt_hash, &lt);
+        bool used_parallel = false;
+        if (!sol_accounts_db_is_overlay(bank->accounts_db) &&
+            sol_accounts_db_iterate_pubkey_range_supported(bank->accounts_db)) {
+            size_t threads = bank_lt_hash_full_recompute_threads();
+            if (threads > 1u) {
+                const uint32_t prefixes_per_task = 4u; /* 64 tasks total */
+                const uint32_t task_count = (256u + prefixes_per_task - 1u) / prefixes_per_task;
+
+                lt_hash_full_recompute_ctx_t ctx = {
+                    .db = bank->accounts_db,
+                    .prefixes_per_task = prefixes_per_task,
+                    .task_count = task_count,
+                    .next_task = 0u,
+                    .partials = sol_calloc(threads, sizeof(sol_lt_hash_t)),
+                };
+
+                if (ctx.partials) {
+                    lt_hash_full_recompute_thread_arg_t* args =
+                        sol_calloc(threads, sizeof(*args));
+                    pthread_t* tids = sol_calloc(threads > 1u ? (threads - 1u) : 0u, sizeof(*tids));
+
+                    if (args && (threads == 1u || tids)) {
+                        /* Spawn worker threads [1..threads-1], and run worker 0 inline. */
+                        for (size_t i = 0; i < threads; i++) {
+                            args[i] = (lt_hash_full_recompute_thread_arg_t){
+                                .ctx = &ctx,
+                                .idx = i,
+                            };
+                        }
+
+                        for (size_t i = 1; i < threads; i++) {
+                            (void)pthread_create(&tids[i - 1u], NULL,
+                                                 lt_hash_full_recompute_thread_main,
+                                                 &args[i]);
+                        }
+                        (void)lt_hash_full_recompute_thread_main(&args[0]);
+
+                        for (size_t i = 1; i < threads; i++) {
+                            (void)pthread_join(tids[i - 1u], NULL);
+                        }
+
+                        for (size_t i = 0; i < threads; i++) {
+                            sol_lt_hash_mix_in(&lt, &ctx.partials[i]);
+                        }
+                        used_parallel = true;
+                        timing_method = "full_recompute_parallel";
+
+                        sol_free(tids);
+                        sol_free(args);
+                    } else {
+                        sol_free(tids);
+                        sol_free(args);
+                    }
+                    sol_free(ctx.partials);
+                }
+            }
+        }
+
+        if (!used_parallel) {
+            sol_accounts_db_iterate(bank->accounts_db, mix_account_into_accounts_lt_hash, &lt);
+            timing_method = "full_recompute";
+        }
 
         /* For non-overlay banks, the full recompute is the only option. For
          * overlay banks, `accounts_lt_hash_base` must represent the parent
@@ -1177,6 +2105,18 @@ bank_compute_accounts_lt_hash_locked(sol_bank_t* bank) {
             bank->accounts_lt_hash_base = lt;
             bank->accounts_lt_hash_base_valid = true;
         }
+    }
+
+    if (timing) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t t1_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        uint64_t dt_ns = t1_ns - t0_ns;
+        sol_log_info("lt_hash timing: slot=%lu method=%s local_entries=%zu dt=%.2fms",
+                     (unsigned long)bank->slot,
+                     timing_method ? timing_method : "-",
+                     timing_local_entries,
+                     (double)dt_ns / 1000000.0);
     }
 
     bank->accounts_lt_hash = lt;
@@ -1256,11 +2196,18 @@ sol_bank_new(sol_slot_t slot, const sol_hash_t* parent_hash,
         bank->recent_blockhash_count = 1;
     }
 
+    /* Build fast lookup for the recent blockhash queue. */
+    bank_recent_blockhash_map_rebuild(bank);
+
     /* PoH starts from the parent blockhash (or restored latest blockhash).
      * This is distinct from the end-of-slot last entry hash. */
     bank->poh_hash = bank->blockhash;
 
     if (pthread_mutex_init(&bank->lock, NULL) != 0) {
+        if (bank->recent_blockhash_map) {
+            sol_map_destroy(bank->recent_blockhash_map);
+            bank->recent_blockhash_map = NULL;
+        }
         if (bank->owns_accounts_db) {
             sol_accounts_db_destroy(bank->accounts_db);
         }
@@ -1268,7 +2215,14 @@ sol_bank_new(sol_slot_t slot, const sol_hash_t* parent_hash,
         return NULL;
     }
 
+    bank_alt_cache_init(bank);
+
     if (refresh_sysvar_accounts(bank, false) != SOL_OK) {
+        if (bank->recent_blockhash_map) {
+            sol_map_destroy(bank->recent_blockhash_map);
+            bank->recent_blockhash_map = NULL;
+        }
+        bank_alt_cache_destroy(bank);
         pthread_mutex_destroy(&bank->lock);
         if (bank->owns_accounts_db) {
             sol_accounts_db_destroy(bank->accounts_db);
@@ -1283,21 +2237,6 @@ sol_bank_new(sol_slot_t slot, const sol_hash_t* parent_hash,
 sol_bank_t*
 sol_bank_new_from_parent(sol_bank_t* parent, sol_slot_t slot) {
     if (!parent) return NULL;
-
-    /* DEBUG: verify System Program accessible in parent before fork */
-    {
-        sol_account_t* sp = sol_bank_load_account(parent, &SOL_SYSTEM_PROGRAM_ID);
-        if (!sp) {
-            sol_log_error("FORK-DEBUG: System Program NOT FOUND in parent bank (slot=%lu) accounts_db!",
-                          (unsigned long)parent->slot);
-        } else {
-            sol_log_info("FORK-DEBUG: System Program in parent (slot=%lu): lamports=%lu exec=%d",
-                         (unsigned long)parent->slot,
-                         (unsigned long)sp->meta.lamports,
-                         (int)sp->meta.executable);
-            sol_account_destroy(sp);
-        }
-    }
 
     /* Create child bank with a forked AccountsDB view */
     sol_accounts_db_t* forked_db = sol_accounts_db_fork(parent->accounts_db);
@@ -1315,6 +2254,49 @@ sol_bank_new_from_parent(sol_bank_t* parent, sol_slot_t slot) {
      * to be frozen when used as an ancestor for replay. */
     sol_bank_compute_hash(parent, &child->parent_hash);
     child->parent_slot = parent->slot;
+
+    /* Ticks can be "caught up" when intermediate slots are skipped. In that
+     * case, the child slot's entry stream may contain multiple slots worth of
+     * ticks and we must start tick accounting from the parent's tick height.
+     *
+     * If we instead assume tick_height == slot * ticks_per_slot, the bank will
+     * reach max_tick_height too early, overflow subsequent ticks, and fail to
+     * update the final blockhash for the slot. That breaks PoH start hash
+     * validation for the next slot (replay stalls with "Entry hash chain
+     * mismatch at start"). */
+    {
+        uint64_t parent_tick_height = 0;
+        pthread_mutex_lock(&parent->lock);
+        parent_tick_height = parent->tick_height;
+        pthread_mutex_unlock(&parent->lock);
+
+        child->tick_height = parent_tick_height;
+
+        uint64_t delta_slots = 0;
+        if (slot > parent->slot) {
+            delta_slots = (uint64_t)(slot - parent->slot);
+        } else {
+            /* Defensive: ensure we don't underflow when given an unexpected
+             * slot ordering. Keep the default tick ranges in that case. */
+            delta_slots = 1;
+        }
+
+        uint64_t ticks_per_slot = (uint64_t)child->config.ticks_per_slot;
+        if (ticks_per_slot == 0) {
+            ticks_per_slot = 64u;
+        }
+
+        uint64_t max_tick = 0;
+        if (__builtin_mul_overflow(delta_slots, ticks_per_slot, &max_tick) ||
+            __builtin_add_overflow(parent_tick_height, max_tick, &max_tick) ||
+            max_tick < parent_tick_height) {
+            /* Fallback: use the legacy absolute calculation. */
+            child->max_tick_height =
+                (uint64_t)(slot + 1u) * (uint64_t)child->config.ticks_per_slot;
+        } else {
+            child->max_tick_height = max_tick;
+        }
+    }
 
     /* Set zombie filter to the parent slot.  Zero-lamport accounts stored
      * at or before the parent slot are treated as non-existent (matching
@@ -1356,6 +2338,8 @@ sol_bank_new_from_parent(sol_bank_t* parent, sol_slot_t slot) {
 
     pthread_mutex_unlock(&parent->lock);
 
+    bank_recent_blockhash_map_rebuild(child);
+
     /* Sysvars like Clock/SlotHashes must advance for each derived bank.
      * Do this after wiring parent hash so SlotHashes can include parent bank
      * hash immediately (needed for vote verification). */
@@ -1385,6 +2369,12 @@ sol_bank_destroy(sol_bank_t* bank) {
         sol_accounts_db_destroy(bank->accounts_db);
     }
 
+    if (bank->recent_blockhash_map) {
+        sol_map_destroy(bank->recent_blockhash_map);
+        bank->recent_blockhash_map = NULL;
+    }
+
+    bank_alt_cache_destroy(bank);
     pthread_mutex_destroy(&bank->lock);
     sol_free(bank);
 }
@@ -1517,6 +2507,8 @@ sol_bank_set_blockhash(sol_bank_t* bank, const sol_hash_t* blockhash) {
         }
     }
 
+    bank_recent_blockhash_map_rebuild(bank);
+
     bank->hash_computed = false;
     bank->accounts_delta_hash_computed = false;
 
@@ -1551,6 +2543,8 @@ sol_bank_set_recent_blockhash_queue(sol_bank_t* bank,
     bank->blockhash = bank->recent_blockhashes[0].hash;
     bank->poh_hash = bank->blockhash;
     bank->hashes_in_tick = 0;
+
+    bank_recent_blockhash_map_rebuild(bank);
 
     bank->hash_computed = false;
     bank->accounts_delta_hash_computed = false;
@@ -1588,6 +2582,51 @@ sol_bank_set_accounts_lt_hash(sol_bank_t* bank, const sol_lt_hash_t* accounts_lt
     pthread_mutex_unlock(&bank->lock);
 }
 
+bool
+sol_bank_apply_accounts_lt_hash_delta(sol_bank_t* bank,
+                                      const sol_pubkey_t* pubkey,
+                                      const sol_account_t* prev,
+                                      const sol_account_t* curr) {
+    if (!bank || !pubkey) return false;
+
+    sol_lt_hash_t prev_hash;
+    sol_lt_hash_t curr_hash;
+    sol_lt_hash_identity(&prev_hash);
+    sol_lt_hash_identity(&curr_hash);
+
+    if (prev) {
+        sol_account_lt_hash(pubkey, prev, &prev_hash);
+    }
+    if (curr) {
+        sol_account_lt_hash(pubkey, curr, &curr_hash);
+    }
+
+    if (memcmp(prev_hash.v, curr_hash.v, sizeof(prev_hash.v)) == 0) {
+        return true;
+    }
+
+    pthread_mutex_lock(&bank->lock);
+    if (!bank->accounts_lt_hash_computed) {
+        pthread_mutex_unlock(&bank->lock);
+        return false;
+    }
+
+    sol_lt_hash_mix_out(&bank->accounts_lt_hash, &prev_hash);
+    sol_lt_hash_mix_in(&bank->accounts_lt_hash, &curr_hash);
+
+    if (!sol_accounts_db_is_overlay(bank->accounts_db) && bank->accounts_lt_hash_base_valid) {
+        sol_lt_hash_mix_out(&bank->accounts_lt_hash_base, &prev_hash);
+        sol_lt_hash_mix_in(&bank->accounts_lt_hash_base, &curr_hash);
+    }
+
+    /* Bank hash depends on accounts_lt_hash; force recomputation. */
+    bank->hash_computed = false;
+    bank->accounts_delta_hash_computed = false;
+
+    pthread_mutex_unlock(&bank->lock);
+    return true;
+}
+
 void
 sol_bank_accounts_lt_hash_checksum(sol_bank_t* bank, sol_blake3_t* out_checksum) {
     if (!bank || !out_checksum) return;
@@ -1596,6 +2635,17 @@ sol_bank_accounts_lt_hash_checksum(sol_bank_t* bank, sol_blake3_t* out_checksum)
     bank_compute_accounts_lt_hash_locked(bank);
     sol_lt_hash_checksum(&bank->accounts_lt_hash, out_checksum);
     pthread_mutex_unlock(&bank->lock);
+}
+
+bool
+sol_bank_get_accounts_lt_hash(sol_bank_t* bank, sol_lt_hash_t* out_lt_hash) {
+    if (!bank || !out_lt_hash) return false;
+
+    pthread_mutex_lock(&bank->lock);
+    bank_compute_accounts_lt_hash_locked(bank);
+    *out_lt_hash = bank->accounts_lt_hash;
+    pthread_mutex_unlock(&bank->lock);
+    return true;
 }
 
 const sol_hash_t*
@@ -1614,23 +2664,15 @@ sol_bank_set_genesis_hash(sol_bank_t* bank, const sol_hash_t* genesis_hash) {
 uint64_t
 sol_bank_signature_count(const sol_bank_t* bank) {
     if (!bank) return 0;
-
-    pthread_mutex_lock((pthread_mutex_t*)&bank->lock);
-    uint64_t count = bank->signature_count;
-    pthread_mutex_unlock((pthread_mutex_t*)&bank->lock);
-
-    return count;
+    return __atomic_load_n(&bank->signature_count, __ATOMIC_RELAXED);
 }
 
 void
 sol_bank_set_signature_count(sol_bank_t* bank, uint64_t signature_count) {
     if (!bank) return;
-
-    pthread_mutex_lock(&bank->lock);
-    bank->signature_count = signature_count;
-    bank->hash_computed = false;
-    bank->accounts_delta_hash_computed = false;
-    pthread_mutex_unlock(&bank->lock);
+    __atomic_store_n(&bank->signature_count, signature_count, __ATOMIC_RELAXED);
+    BANK_FLAG_CLEAR(bank, hash_computed);
+    BANK_FLAG_CLEAR(bank, accounts_delta_hash_computed);
 }
 
 uint64_t
@@ -1654,17 +2696,332 @@ sol_bank_has_full_ticks(const sol_bank_t* bank) {
     return full;
 }
 
+/* Per-thread override for transaction-local Instructions sysvar.
+ *
+ * Agave exposes the Instructions sysvar via AccountOverrides (virtual account)
+ * so it never becomes shared mutable global state. We use a TLS override to
+ * make parallel transaction execution safe and cheap. */
+static __thread sol_account_t* g_tls_instructions_sysvar = NULL;
+
+/* Cache of "previous visible meta" for accounts loaded during a transaction.
+ * This is used to avoid an extra parent meta lookup during the first store to a
+ * pubkey in an overlay bank (which otherwise hits RocksDB+AppendVec again). */
+typedef struct {
+    uint64_t lamports;
+    uint64_t data_len;
+} bank_prev_meta_hint_t;
+
+static __thread sol_pubkey_map_t* g_tls_prev_meta_hints = NULL;
+
+static inline void
+bank_prev_meta_hints_reset(void) {
+    if (g_tls_prev_meta_hints && g_tls_prev_meta_hints->inner) {
+        sol_map_clear(g_tls_prev_meta_hints->inner);
+    }
+}
+
+static inline void
+bank_prev_meta_hints_record(const sol_pubkey_t* pubkey, const sol_account_t* account) {
+    if (!pubkey || !account) return;
+    if (!g_tls_prev_meta_hints) {
+        g_tls_prev_meta_hints = sol_pubkey_map_new(sizeof(bank_prev_meta_hint_t), 256u);
+        if (!g_tls_prev_meta_hints) return;
+    }
+    bank_prev_meta_hint_t hint = {
+        .lamports = account->meta.lamports,
+        .data_len = account->meta.data_len,
+    };
+    (void)sol_pubkey_map_insert(g_tls_prev_meta_hints, pubkey, &hint);
+}
+
+static inline bool
+bank_prev_meta_hints_get(const sol_pubkey_t* pubkey, bank_prev_meta_hint_t* out) {
+    if (out) {
+        out->lamports = 0;
+        out->data_len = 0;
+    }
+    if (!pubkey || !out || !g_tls_prev_meta_hints) return false;
+    bank_prev_meta_hint_t* hint =
+        (bank_prev_meta_hint_t*)sol_pubkey_map_get(g_tls_prev_meta_hints, pubkey);
+    if (!hint) return false;
+    *out = *hint;
+    return true;
+}
+
+/* Transaction-local undo log.
+ *
+ * This codebase historically implemented rollback by pre-snapshotting every
+ * writable account in the message before execution. That is correct but very
+ * expensive. Instead, record the pre-state lazily on first write and rollback
+ * by restoring only the touched accounts. */
+typedef enum {
+    BANK_TX_UNDO_KIND_MISSING = 0,
+    BANK_TX_UNDO_KIND_TOMBSTONE = 1,
+    BANK_TX_UNDO_KIND_ACCOUNT = 2,
+} bank_tx_undo_kind_t;
+
+typedef struct {
+    sol_pubkey_t         key;
+    bank_tx_undo_kind_t  kind;
+    sol_account_t*       account; /* clone when kind==ACCOUNT */
+    /* Post-state meta for rent-state transition checks. Updated on every store/delete
+     * during an active tx undo scope so we don't re-load accounts from AccountsDB. */
+    uint64_t             post_lamports;
+    size_t               post_data_len;
+    sol_pubkey_t         post_owner;
+    uint8_t              post_executable;
+    uint8_t              post_valid;
+} bank_tx_undo_entry_t;
+
+typedef struct {
+    bool                active;
+    bool                overlay;
+    size_t              len;
+    size_t              cap;
+    bank_tx_undo_entry_t* entries;
+} bank_tx_undo_log_t;
+
+static __thread bank_tx_undo_log_t g_tls_tx_undo = {0};
+
+/* CPI-time account overrides (see sol_bank.h). */
+static __thread sol_bank_account_overrides_t* g_tls_account_overrides = NULL;
+
+sol_bank_account_overrides_t*
+sol_bank_overrides_push(sol_bank_account_overrides_t* overrides) {
+    sol_bank_account_overrides_t* prev = g_tls_account_overrides;
+    if (overrides != NULL) {
+        overrides->prev = prev;
+    }
+    g_tls_account_overrides = overrides;
+    return prev;
+}
+
+void
+sol_bank_overrides_pop(sol_bank_account_overrides_t* prev) {
+    g_tls_account_overrides = prev;
+}
+
+static inline int
+bank_overrides_lookup_idx(const sol_bank_account_overrides_t* ov, const sol_pubkey_t* pubkey) {
+    if (!ov || !pubkey || !ov->keys || !ov->accounts || ov->len == 0) return -1;
+    /* CPI account sets are typically small (<<128); linear scan is fine and branch-friendly. */
+    for (size_t i = 0; i < ov->len; i++) {
+        if (sol_pubkey_eq(&ov->keys[i], pubkey)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static inline const sol_account_t*
+bank_overrides_lookup_ro(const sol_pubkey_t* pubkey) {
+    const sol_bank_account_overrides_t* ov = g_tls_account_overrides;
+    if (!ov) return NULL;
+    int idx = bank_overrides_lookup_idx(ov, pubkey);
+    if (idx < 0) return NULL;
+    if (ov->written && ov->written[(size_t)idx]) {
+        /* Callee wrote this account; bank state is now authoritative. */
+        return NULL;
+    }
+    return &ov->accounts[(size_t)idx];
+}
+
+static inline void
+bank_overrides_mark_written(const sol_pubkey_t* pubkey) {
+    for (sol_bank_account_overrides_t* ov = g_tls_account_overrides;
+         ov != NULL;
+         ov = ov->prev) {
+        if (!ov->written) continue;
+        int idx = bank_overrides_lookup_idx(ov, pubkey);
+        if (idx < 0) continue;
+        ov->written[(size_t)idx] = 1u;
+    }
+}
+
+static inline void
+bank_tx_undo_end(void) {
+    bank_tx_undo_log_t* u = &g_tls_tx_undo;
+    for (size_t i = 0; i < u->len; i++) {
+        if (u->entries[i].account) {
+            sol_account_destroy(u->entries[i].account);
+            u->entries[i].account = NULL;
+        }
+    }
+    u->len = 0;
+    u->active = false;
+    u->overlay = false;
+}
+
+static inline void
+bank_tx_undo_begin(sol_bank_t* bank) {
+    bank_tx_undo_end();
+    bank_tx_undo_log_t* u = &g_tls_tx_undo;
+    u->overlay = (bank && bank->accounts_db) ? sol_accounts_db_is_overlay(bank->accounts_db) : false;
+    u->active = true;
+}
+
+static inline sol_err_t
+bank_tx_undo_record(sol_bank_t* bank,
+                    const sol_pubkey_t* pubkey,
+                    bank_tx_undo_entry_t** out_entry) {
+    bank_tx_undo_log_t* u = &g_tls_tx_undo;
+    if (out_entry) *out_entry = NULL;
+    if (!u->active) return SOL_OK;
+    if (!bank || !bank->accounts_db || !pubkey) return SOL_ERR_INVAL;
+
+    for (size_t i = 0; i < u->len; i++) {
+        if (sol_pubkey_eq(&u->entries[i].key, pubkey)) {
+            if (out_entry) *out_entry = &u->entries[i];
+            return SOL_OK;
+        }
+    }
+
+    if (u->len == u->cap) {
+        size_t new_cap = u->cap ? (u->cap * 2u) : 32u;
+        bank_tx_undo_entry_t* next = sol_realloc_array(bank_tx_undo_entry_t, u->entries, new_cap);
+        if (!next) return SOL_ERR_NOMEM;
+        u->entries = next;
+        u->cap = new_cap;
+    }
+
+    bank_tx_undo_entry_t* e = &u->entries[u->len++];
+    memset(e, 0, sizeof(*e));
+    e->key = *pubkey;
+    if (out_entry) *out_entry = e;
+
+    if (u->overlay) {
+        sol_account_t* local = NULL;
+        sol_accounts_db_local_kind_t kind =
+            sol_accounts_db_get_local_kind(bank->accounts_db, pubkey, &local);
+        if (kind == SOL_ACCOUNTS_DB_LOCAL_ACCOUNT) {
+            e->kind = BANK_TX_UNDO_KIND_ACCOUNT;
+            e->account = local;
+            local = NULL;
+        } else if (kind == SOL_ACCOUNTS_DB_LOCAL_TOMBSTONE) {
+            e->kind = BANK_TX_UNDO_KIND_TOMBSTONE;
+        } else {
+            e->kind = BANK_TX_UNDO_KIND_MISSING;
+        }
+        if (local) {
+            sol_account_destroy(local);
+        }
+        return SOL_OK;
+    }
+
+    /* Non-overlay: capture visible state. */
+    sol_account_t* prev = sol_accounts_db_load(bank->accounts_db, pubkey);
+    if (prev) {
+        e->kind = BANK_TX_UNDO_KIND_ACCOUNT;
+        e->account = prev;
+    } else {
+        e->kind = BANK_TX_UNDO_KIND_MISSING;
+    }
+    return SOL_OK;
+}
+
 sol_account_t*
 sol_bank_load_account(sol_bank_t* bank, const sol_pubkey_t* pubkey) {
     if (!bank || !pubkey) return NULL;
-    return sol_accounts_db_load(bank->accounts_db, pubkey);
+
+    /* The Instructions sysvar is virtual in Agave (transaction-local, not
+     * stored in AccountsDB). When executing transactions (possibly in parallel),
+     * expose it via a per-thread override so programs can read it without a
+     * global shared mutable sysvar account. */
+    if (sol_pubkey_eq(pubkey, &SOL_SYSVAR_INSTRUCTIONS_ID) &&
+        __builtin_expect(g_tls_instructions_sysvar != NULL, 0)) {
+        return sol_account_clone(g_tls_instructions_sysvar);
+    }
+
+    const sol_account_t* ov_acct = bank_overrides_lookup_ro(pubkey);
+    if (__builtin_expect(ov_acct != NULL, 0)) {
+        return sol_account_clone(ov_acct); /* owned clone */
+    }
+
+    sol_account_t* account = sol_accounts_db_load(bank->accounts_db, pubkey);
+    if (account && sol_accounts_db_is_overlay(bank->accounts_db)) {
+        bank_prev_meta_hints_record(pubkey, account);
+    }
+    return account;
 }
 
 sol_account_t*
 sol_bank_load_account_ex(sol_bank_t* bank, const sol_pubkey_t* pubkey,
                          sol_slot_t* out_stored_slot) {
     if (!bank || !pubkey) return NULL;
-    return sol_accounts_db_load_ex(bank->accounts_db, pubkey, out_stored_slot);
+
+    if (sol_pubkey_eq(pubkey, &SOL_SYSVAR_INSTRUCTIONS_ID) &&
+        __builtin_expect(g_tls_instructions_sysvar != NULL, 0)) {
+        if (out_stored_slot) *out_stored_slot = bank->slot;
+        return sol_account_clone(g_tls_instructions_sysvar);
+    }
+
+    const sol_account_t* ov_acct = bank_overrides_lookup_ro(pubkey);
+    if (__builtin_expect(ov_acct != NULL, 0)) {
+        if (out_stored_slot) *out_stored_slot = bank->slot;
+        return sol_account_clone(ov_acct); /* owned clone */
+    }
+
+    sol_account_t* account = sol_accounts_db_load_ex(bank->accounts_db, pubkey, out_stored_slot);
+    if (account && sol_accounts_db_is_overlay(bank->accounts_db)) {
+        bank_prev_meta_hints_record(pubkey, account);
+    }
+    return account;
+}
+
+sol_account_t*
+sol_bank_load_account_view(sol_bank_t* bank, const sol_pubkey_t* pubkey) {
+    if (!bank || !pubkey) return NULL;
+
+    if (sol_pubkey_eq(pubkey, &SOL_SYSVAR_INSTRUCTIONS_ID) &&
+        __builtin_expect(g_tls_instructions_sysvar != NULL, 0)) {
+        return sol_account_clone(g_tls_instructions_sysvar);
+    }
+
+    const sol_account_t* ov_acct = bank_overrides_lookup_ro(pubkey);
+    if (__builtin_expect(ov_acct != NULL, 0)) {
+        sol_account_t* view = sol_calloc(1u, sizeof(*view));
+        if (!view) return NULL;
+        view->meta = ov_acct->meta;
+        view->data = ov_acct->data;
+        view->data_borrowed = true;
+        return view;
+    }
+
+    sol_account_t* account = sol_accounts_db_load_view(bank->accounts_db, pubkey);
+    if (account && sol_accounts_db_is_overlay(bank->accounts_db)) {
+        bank_prev_meta_hints_record(pubkey, account);
+    }
+    return account;
+}
+
+sol_account_t*
+sol_bank_load_account_view_ex(sol_bank_t* bank, const sol_pubkey_t* pubkey,
+                              sol_slot_t* out_stored_slot) {
+    if (!bank || !pubkey) return NULL;
+
+    if (sol_pubkey_eq(pubkey, &SOL_SYSVAR_INSTRUCTIONS_ID) &&
+        __builtin_expect(g_tls_instructions_sysvar != NULL, 0)) {
+        if (out_stored_slot) *out_stored_slot = bank->slot;
+        return sol_account_clone(g_tls_instructions_sysvar);
+    }
+
+    const sol_account_t* ov_acct = bank_overrides_lookup_ro(pubkey);
+    if (__builtin_expect(ov_acct != NULL, 0)) {
+        if (out_stored_slot) *out_stored_slot = bank->slot;
+        sol_account_t* view = sol_calloc(1u, sizeof(*view));
+        if (!view) return NULL;
+        view->meta = ov_acct->meta;
+        view->data = ov_acct->data;
+        view->data_borrowed = true;
+        return view;
+    }
+
+    sol_account_t* account =
+        sol_accounts_db_load_view_ex(bank->accounts_db, pubkey, out_stored_slot);
+    if (account && sol_accounts_db_is_overlay(bank->accounts_db)) {
+        bank_prev_meta_hints_record(pubkey, account);
+    }
+    return account;
 }
 
 void
@@ -1681,68 +3038,151 @@ sol_err_t
 sol_bank_store_account(sol_bank_t* bank, const sol_pubkey_t* pubkey,
                        const sol_account_t* account) {
     if (!bank || !pubkey || !account) return SOL_ERR_INVAL;
-    if (bank->frozen) return SOL_ERR_SHUTDOWN;
+    if (__atomic_load_n(&bank->frozen, __ATOMIC_ACQUIRE)) return SOL_ERR_SHUTDOWN;
+
+    /* If CPI overrides are active, this pubkey is now written by the callee. */
+    bank_overrides_mark_written(pubkey);
+
+    bank_tx_undo_entry_t* undo_e = NULL;
+    sol_err_t undo_err = bank_tx_undo_record(bank, pubkey, &undo_e);
+    if (undo_err != SOL_OK) return undo_err;
+
+    /* Writes to a non-overlay AccountsDB can invalidate cached ALT table state.
+     * For overlay banks, bank_alt_cache_get() detects local writes by checking
+     * the overlay layer before serving from cache. */
+    if (!sol_accounts_db_is_overlay(bank->accounts_db)) {
+        bank_alt_cache_invalidate(bank, pubkey);
+    }
 
     /* Track BankHashStats for parity debugging.
      * Agave's BankHashStats::update() counts 0-lamport stores as "removed",
      * non-zero as "updated".  executable/data_len/lamports_stored are always
      * accumulated regardless of lamport value. */
     if (account->meta.lamports == 0) {
-        bank->stats.num_removed_accounts++;
+        BANK_STAT_INC(bank, num_removed_accounts);
     } else {
-        bank->stats.num_updated_accounts++;
+        BANK_STAT_INC(bank, num_updated_accounts);
     }
-    bank->stats.num_lamports_stored += account->meta.lamports;
-    bank->stats.total_data_len += account->meta.data_len;
-    if (account->meta.executable) bank->stats.num_executable_accounts++;
+    BANK_STAT_ADD(bank, num_lamports_stored, account->meta.lamports);
+    BANK_STAT_ADD(bank, total_data_len, account->meta.data_len);
+    if (account->meta.executable) BANK_STAT_INC(bank, num_executable_accounts);
 
-    /* This can be called from within `sol_bank_process_transaction` while
-     * holding `bank->lock` (e.g., native programs). Avoid deadlocking by
-     * opportunistically taking the lock if available. */
-    if (pthread_mutex_trylock(&bank->lock) == 0) {
-        bank->hash_computed = false;
-        bank->accounts_delta_hash_computed = false;
-        bank->accounts_lt_hash_computed = false;
-        sol_err_t err = sol_accounts_db_store_versioned(bank->accounts_db,
-                                                        pubkey,
-                                                        account,
-                                                        bank->slot,
-                                                        0);
-        pthread_mutex_unlock(&bank->lock);
-        return err;
+    BANK_FLAG_CLEAR(bank, hash_computed);
+    BANK_FLAG_CLEAR(bank, accounts_delta_hash_computed);
+    BANK_FLAG_CLEAR(bank, accounts_lt_hash_computed);
+
+    /* First write to a pubkey in an overlay triggers a parent meta lookup to
+     * adjust stats.  If we already loaded the prior version during this tx, use
+     * that meta to avoid duplicate RocksDB+AppendVec IO. */
+    if (sol_accounts_db_is_overlay(bank->accounts_db)) {
+        bank_prev_meta_hint_t prev = {0};
+        if (bank_prev_meta_hints_get(pubkey, &prev)) {
+            bool prev_exists = (prev.lamports != 0);
+            sol_err_t err = sol_accounts_db_store_versioned_with_prev_meta(bank->accounts_db,
+                                                                           pubkey,
+                                                                           account,
+                                                                           bank->slot,
+                                                                           0,
+                                                                           prev_exists,
+                                                                           prev.lamports,
+                                                                           prev.data_len);
+            if (err == SOL_OK && undo_e) {
+                undo_e->post_lamports = account->meta.lamports;
+                undo_e->post_data_len = account->meta.data_len;
+                undo_e->post_owner = account->meta.owner;
+                undo_e->post_executable = account->meta.executable ? 1u : 0u;
+                undo_e->post_valid = 1u;
+            }
+            return err;
+        }
     }
 
-    bank->hash_computed = false;
-    bank->accounts_delta_hash_computed = false;
-    bank->accounts_lt_hash_computed = false;
-    return sol_accounts_db_store_versioned(bank->accounts_db,
-                                           pubkey,
-                                           account,
-                                           bank->slot,
-                                           0);
+    sol_err_t err = sol_accounts_db_store_versioned(bank->accounts_db,
+                                                    pubkey,
+                                                    account,
+                                                    bank->slot,
+                                                    0);
+    if (err == SOL_OK && undo_e) {
+        undo_e->post_lamports = account->meta.lamports;
+        undo_e->post_data_len = account->meta.data_len;
+        undo_e->post_owner = account->meta.owner;
+        undo_e->post_executable = account->meta.executable ? 1u : 0u;
+        undo_e->post_valid = 1u;
+    }
+    return err;
 }
 
 static sol_err_t
 bank_delete_account(sol_bank_t* bank, const sol_pubkey_t* pubkey) {
     if (!bank || !pubkey) return SOL_ERR_INVAL;
-    if (bank->frozen) return SOL_ERR_SHUTDOWN;
+    if (__atomic_load_n(&bank->frozen, __ATOMIC_ACQUIRE)) return SOL_ERR_SHUTDOWN;
+
+    /* Deleting also counts as a write for CPI override purposes. */
+    bank_overrides_mark_written(pubkey);
+
+    bank_tx_undo_entry_t* undo_e = NULL;
+    sol_err_t undo_err = bank_tx_undo_record(bank, pubkey, &undo_e);
+    if (undo_err != SOL_OK) return undo_err;
 
     /* Track BankHashStats for parity debugging */
-    bank->stats.num_removed_accounts++;
+    BANK_STAT_INC(bank, num_removed_accounts);
 
-    if (pthread_mutex_trylock(&bank->lock) == 0) {
-        bank->hash_computed = false;
-        bank->accounts_delta_hash_computed = false;
-        bank->accounts_lt_hash_computed = false;
-        sol_err_t err = sol_accounts_db_delete_versioned(bank->accounts_db, pubkey, bank->slot, 0);
-        pthread_mutex_unlock(&bank->lock);
-        return err;
+    BANK_FLAG_CLEAR(bank, hash_computed);
+    BANK_FLAG_CLEAR(bank, accounts_delta_hash_computed);
+    BANK_FLAG_CLEAR(bank, accounts_lt_hash_computed);
+    sol_err_t err = sol_accounts_db_delete_versioned(bank->accounts_db, pubkey, bank->slot, 0);
+    if (err == SOL_OK && undo_e) {
+        undo_e->post_lamports = 0;
+        undo_e->post_data_len = 0;
+        undo_e->post_owner = (sol_pubkey_t){{0}};
+        undo_e->post_executable = 0u;
+        undo_e->post_valid = 1u;
+    }
+    return err;
+}
+
+static void
+bank_tx_undo_rollback(sol_bank_t* bank) {
+    bank_tx_undo_log_t* u = &g_tls_tx_undo;
+    if (!u->active || u->len == 0) {
+        bank_tx_undo_end();
+        return;
     }
 
-    bank->hash_computed = false;
-    bank->accounts_delta_hash_computed = false;
-    bank->accounts_lt_hash_computed = false;
-    return sol_accounts_db_delete_versioned(bank->accounts_db, pubkey, bank->slot, 0);
+    /* Disable recording while we apply the rollback. */
+    u->active = false;
+
+    if (!bank || !bank->accounts_db) {
+        bank_tx_undo_end();
+        return;
+    }
+
+    for (size_t i = u->len; i > 0; i--) {
+        bank_tx_undo_entry_t* e = &u->entries[i - 1u];
+        switch (e->kind) {
+            case BANK_TX_UNDO_KIND_ACCOUNT:
+                if (e->account) {
+                    (void)sol_bank_store_account(bank, &e->key, e->account);
+                } else {
+                    /* Defensive: treat missing account snapshot as delete. */
+                    (void)bank_delete_account(bank, &e->key);
+                }
+                break;
+            case BANK_TX_UNDO_KIND_TOMBSTONE:
+                (void)bank_delete_account(bank, &e->key);
+                break;
+            case BANK_TX_UNDO_KIND_MISSING:
+            default:
+                if (u->overlay) {
+                    (void)sol_accounts_db_clear_override(bank->accounts_db, &e->key);
+                } else {
+                    (void)bank_delete_account(bank, &e->key);
+                }
+                break;
+        }
+    }
+
+    bank_tx_undo_end();
 }
 
 static uint64_t
@@ -1987,42 +3427,89 @@ bank_resolve_v0_message_accounts(const sol_bank_t* bank,
     uint16_t readonly_cursor = 0;
 
     for (uint16_t li = 0; li < lookup_len; li++) {
-        sol_account_t* table_account = sol_accounts_db_load(bank->accounts_db, &lookups[li].table_key);
-        if (!table_account) {
-            return SOL_ERR_TX_SANITIZE;
-        }
+        const sol_alt_state_t* state = NULL;
+        sol_err_t cache_err =
+            bank_alt_cache_get((sol_bank_t*)bank, &lookups[li].table_key, &state);
+        if (cache_err == SOL_ERR_NOT_IMPLEMENTED) {
+            sol_account_t* table_account =
+                sol_accounts_db_load(bank->accounts_db, &lookups[li].table_key);
+            if (!table_account) {
+                return SOL_ERR_TX_SANITIZE;
+            }
 
-        if (!sol_pubkey_eq(&table_account->meta.owner, &SOL_ADDRESS_LOOKUP_TABLE_ID)) {
+            if (!sol_pubkey_eq(&table_account->meta.owner, &SOL_ADDRESS_LOOKUP_TABLE_ID)) {
+                sol_account_destroy(table_account);
+                return SOL_ERR_TX_SANITIZE;
+            }
+
+            sol_alt_state_t tmp_state;
+            sol_alt_state_init(&tmp_state);
+
+            sol_err_t deser_err = sol_alt_deserialize(&tmp_state,
+                                                      table_account->data,
+                                                      (size_t)table_account->meta.data_len);
             sol_account_destroy(table_account);
-            return SOL_ERR_TX_SANITIZE;
+            if (deser_err != SOL_OK) {
+                sol_alt_state_free(&tmp_state);
+                return SOL_ERR_TX_SANITIZE;
+            }
+
+            if (!sol_alt_is_active(&tmp_state, sol_bank_slot(bank))) {
+                sol_alt_state_free(&tmp_state);
+                return SOL_ERR_TX_SANITIZE;
+            }
+            state = &tmp_state;
+
+            for (uint16_t wi = 0; wi < lookups[li].writable_indices_len; wi++) {
+                if ((uint32_t)writable_base + (uint32_t)writable_cursor >= out_cap) {
+                    sol_alt_state_free(&tmp_state);
+                    return SOL_ERR_OVERFLOW;
+                }
+                const sol_pubkey_t* addr =
+                    sol_alt_get_address(state, lookups[li].writable_indices[wi]);
+                if (!addr) {
+                    sol_alt_state_free(&tmp_state);
+                    return SOL_ERR_TX_SANITIZE;
+                }
+                uint16_t out_idx = (uint16_t)(writable_base + writable_cursor);
+                out_keys[out_idx] = *addr;
+                out_signer[out_idx] = false;
+                out_writable[out_idx] = true;
+                writable_cursor++;
+            }
+
+            for (uint16_t ri = 0; ri < lookups[li].readonly_indices_len; ri++) {
+                if ((uint32_t)readonly_base + (uint32_t)readonly_cursor >= out_cap) {
+                    sol_alt_state_free(&tmp_state);
+                    return SOL_ERR_OVERFLOW;
+                }
+                const sol_pubkey_t* addr =
+                    sol_alt_get_address(state, lookups[li].readonly_indices[ri]);
+                if (!addr) {
+                    sol_alt_state_free(&tmp_state);
+                    return SOL_ERR_TX_SANITIZE;
+                }
+                uint16_t out_idx = (uint16_t)(readonly_base + readonly_cursor);
+                out_keys[out_idx] = *addr;
+                out_signer[out_idx] = false;
+                out_writable[out_idx] = false;
+                readonly_cursor++;
+            }
+
+            sol_alt_state_free(&tmp_state);
+            continue;
         }
-
-        sol_alt_state_t state;
-        sol_alt_state_init(&state);
-
-        sol_err_t deser_err = sol_alt_deserialize(&state,
-                                                  table_account->data,
-                                                  (size_t)table_account->meta.data_len);
-        sol_account_destroy(table_account);
-        if (deser_err != SOL_OK) {
-            sol_alt_state_free(&state);
-            return SOL_ERR_TX_SANITIZE;
-        }
-
-        if (!sol_alt_is_active(&state, sol_bank_slot(bank))) {
-            sol_alt_state_free(&state);
+        if (cache_err != SOL_OK || !state) {
             return SOL_ERR_TX_SANITIZE;
         }
 
         for (uint16_t wi = 0; wi < lookups[li].writable_indices_len; wi++) {
             if ((uint32_t)writable_base + (uint32_t)writable_cursor >= out_cap) {
-                sol_alt_state_free(&state);
                 return SOL_ERR_OVERFLOW;
             }
             const sol_pubkey_t* addr =
-                sol_alt_get_address(&state, lookups[li].writable_indices[wi]);
+                sol_alt_get_address(state, lookups[li].writable_indices[wi]);
             if (!addr) {
-                sol_alt_state_free(&state);
                 return SOL_ERR_TX_SANITIZE;
             }
             uint16_t out_idx = (uint16_t)(writable_base + writable_cursor);
@@ -2034,13 +3521,11 @@ bank_resolve_v0_message_accounts(const sol_bank_t* bank,
 
         for (uint16_t ri = 0; ri < lookups[li].readonly_indices_len; ri++) {
             if ((uint32_t)readonly_base + (uint32_t)readonly_cursor >= out_cap) {
-                sol_alt_state_free(&state);
                 return SOL_ERR_OVERFLOW;
             }
             const sol_pubkey_t* addr =
-                sol_alt_get_address(&state, lookups[li].readonly_indices[ri]);
+                sol_alt_get_address(state, lookups[li].readonly_indices[ri]);
             if (!addr) {
-                sol_alt_state_free(&state);
                 return SOL_ERR_TX_SANITIZE;
             }
             uint16_t out_idx = (uint16_t)(readonly_base + readonly_cursor);
@@ -2050,7 +3535,6 @@ bank_resolve_v0_message_accounts(const sol_bank_t* bank,
             readonly_cursor++;
         }
 
-        sol_alt_state_free(&state);
     }
 
     if (writable_cursor != total_writable || readonly_cursor != total_readonly) {
@@ -2175,6 +3659,182 @@ sol_bank_resolve_transaction_accounts(const sol_bank_t* bank,
     return SOL_OK;
 }
 
+/* ---- v0 message resolution caching (scheduler fast path) ----
+ *
+ * The deterministic batching scheduler must resolve v0 account keys to build
+ * lock sets. Transaction execution also needs resolved keys/flags. Resolving
+ * twice per tx (scheduler + execution) is expensive, so we opportunistically
+ * cache resolved v0 accounts/flags in the transaction's sol_message_t for the
+ * duration of the scheduling call.
+ *
+ * These caches are ephemeral: we restore the message fields before returning so
+ * callers never observe dangling pointers.
+ */
+
+typedef struct {
+    sol_message_t*       msg;
+    const sol_pubkey_t*  saved_resolved_accounts;
+    uint16_t             saved_resolved_accounts_len;
+    bool*                saved_is_writable;
+    bool*                saved_is_signer;
+} bank_v0_msg_patch_t;
+
+typedef struct {
+    sol_arena_t*          arena;
+    bank_v0_msg_patch_t*  patches;
+    size_t                patches_len;
+    size_t                patches_cap;
+} bank_v0_resolve_cache_t;
+
+static uint16_t
+bank_v0_resolved_len_hint(const sol_transaction_t* tx, sol_err_t* out_err) {
+    if (out_err) *out_err = SOL_OK;
+    if (!tx) {
+        if (out_err) *out_err = SOL_ERR_INVAL;
+        return 0;
+    }
+    if (tx->message.version != SOL_MESSAGE_VERSION_V0) {
+        if (out_err) *out_err = SOL_ERR_INVAL;
+        return 0;
+    }
+    if (!tx->message.account_keys || tx->message.account_keys_len == 0) {
+        if (out_err) *out_err = SOL_ERR_TX_MALFORMED;
+        return 0;
+    }
+
+    size_t static_len = (size_t)tx->message.account_keys_len;
+    size_t total_writable = 0;
+    size_t total_readonly = 0;
+
+    if (tx->message.address_lookups_len > 0) {
+        if (!tx->message.address_lookups) {
+            if (out_err) *out_err = SOL_ERR_TX_MALFORMED;
+            return 0;
+        }
+        for (uint8_t i = 0; i < tx->message.address_lookups_len; i++) {
+            total_writable += (size_t)tx->message.address_lookups[i].writable_indices_len;
+            total_readonly += (size_t)tx->message.address_lookups[i].readonly_indices_len;
+        }
+    }
+
+    size_t resolved = static_len + total_writable + total_readonly;
+    if (resolved == 0 || resolved > SOL_MAX_MESSAGE_ACCOUNTS || resolved > UINT16_MAX) {
+        if (out_err) *out_err = SOL_ERR_TX_TOO_LARGE;
+        return 0;
+    }
+
+    return (uint16_t)resolved;
+}
+
+static sol_err_t
+bank_v0_cache_resolve(sol_bank_t* bank,
+                      const sol_transaction_t* tx,
+                      bank_v0_resolve_cache_t* cache) {
+    if (!bank || !tx) return SOL_ERR_INVAL;
+    if (tx->message.version != SOL_MESSAGE_VERSION_V0) return SOL_ERR_INVAL;
+    if (!cache || !cache->patches || cache->patches_cap == 0) return SOL_ERR_NOMEM;
+
+    sol_message_t* msg = (sol_message_t*)&tx->message;
+
+    /* If already resolved (by caller or earlier fast path), reuse it. */
+    if (msg->resolved_accounts_len != 0 &&
+        msg->resolved_accounts &&
+        msg->is_writable &&
+        msg->is_signer) {
+        return SOL_OK;
+    }
+
+    if (cache->patches_len >= cache->patches_cap) {
+        return SOL_ERR_OVERFLOW;
+    }
+
+    sol_err_t hint_err = SOL_OK;
+    uint16_t hint_len = bank_v0_resolved_len_hint(tx, &hint_err);
+    if (hint_err != SOL_OK) {
+        return hint_err;
+    }
+
+    if (!cache->arena) {
+        /* Larger chunks reduce allocator overhead for big blocks. */
+        cache->arena = sol_arena_new(4u * 1024u * 1024u);
+        if (!cache->arena) return SOL_ERR_NOMEM;
+    }
+
+    sol_pubkey_t* resolved_keys = sol_arena_alloc_array(cache->arena, sol_pubkey_t, hint_len);
+    bool* resolved_writable = sol_arena_alloc_array(cache->arena, bool, hint_len);
+    bool* resolved_signer = sol_arena_alloc_array(cache->arena, bool, hint_len);
+    if (!resolved_keys || !resolved_writable || !resolved_signer) {
+        return SOL_ERR_NOMEM;
+    }
+
+    uint16_t resolved_len = 0;
+    sol_err_t err = bank_resolve_v0_message_accounts(bank,
+                                                     tx,
+                                                     resolved_keys,
+                                                     resolved_writable,
+                                                     resolved_signer,
+                                                     hint_len,
+                                                     &resolved_len);
+    if (err != SOL_OK) {
+        return err;
+    }
+    if (resolved_len == 0 || resolved_len > hint_len) {
+        return SOL_ERR_TX_MALFORMED;
+    }
+
+    bank_v0_msg_patch_t* p = &cache->patches[cache->patches_len++];
+    p->msg = msg;
+    p->saved_resolved_accounts = msg->resolved_accounts;
+    p->saved_resolved_accounts_len = msg->resolved_accounts_len;
+    p->saved_is_writable = msg->is_writable;
+    p->saved_is_signer = msg->is_signer;
+
+    msg->resolved_accounts = resolved_keys;
+    msg->resolved_accounts_len = resolved_len;
+    msg->is_writable = resolved_writable;
+    msg->is_signer = resolved_signer;
+
+    return SOL_OK;
+}
+
+static void
+bank_v0_cache_restore(bank_v0_resolve_cache_t* cache) {
+    if (!cache || !cache->patches) return;
+    for (size_t i = cache->patches_len; i > 0; i--) {
+        bank_v0_msg_patch_t* p = &cache->patches[i - 1u];
+        if (!p->msg) continue;
+        p->msg->resolved_accounts = p->saved_resolved_accounts;
+        p->msg->resolved_accounts_len = p->saved_resolved_accounts_len;
+        p->msg->is_writable = p->saved_is_writable;
+        p->msg->is_signer = p->saved_is_signer;
+    }
+    cache->patches_len = 0;
+}
+
+static void
+bank_v0_cache_destroy(bank_v0_resolve_cache_t* cache) {
+    if (!cache) return;
+    bank_v0_cache_restore(cache);
+    if (cache->arena) {
+        sol_arena_destroy(cache->arena);
+        cache->arena = NULL;
+    }
+    sol_free(cache->patches);
+    cache->patches = NULL;
+    cache->patches_cap = 0;
+}
+
+/* Reset the cache for reuse: restore patched messages, then reset the arena.
+ * This avoids per-slot allocations/free churn during replay. */
+static void
+bank_v0_cache_reset(bank_v0_resolve_cache_t* cache) {
+    if (!cache) return;
+    bank_v0_cache_restore(cache);
+    if (cache->arena) {
+        sol_arena_reset(cache->arena);
+    }
+}
+
 uint64_t
 sol_bank_calculate_fee(const sol_bank_t* bank, const sol_transaction_t* tx) {
     if (!bank || !tx) return 0;
@@ -2253,6 +3913,14 @@ sol_bank_calculate_fee(const sol_bank_t* bank, const sol_transaction_t* tx) {
 
 static bool
 bank_is_blockhash_valid_locked(const sol_bank_t* bank, const sol_hash_t* blockhash) {
+    if (!bank || !blockhash) {
+        return false;
+    }
+
+    if (__builtin_expect(bank->recent_blockhash_map != NULL, 1)) {
+        return sol_map_get(bank->recent_blockhash_map, blockhash) != NULL;
+    }
+
     for (size_t i = 0; i < bank->recent_blockhash_count; i++) {
         if (memcmp(bank->recent_blockhashes[i].hash.bytes,
                    blockhash->bytes, 32) == 0) {
@@ -2378,6 +4046,15 @@ bank_lamports_per_signature_for_blockhash_locked(const sol_bank_t* bank,
         return 0;
     }
 
+    if (__builtin_expect(bank->recent_blockhash_map != NULL, 1)) {
+        uint64_t* fee = (uint64_t*)sol_map_get(bank->recent_blockhash_map, blockhash);
+        if (fee) {
+            return *fee;
+        }
+        /* Fallback to current bank config if the blockhash isn't found. */
+        return bank->config.lamports_per_signature;
+    }
+
     for (size_t i = 0; i < bank->recent_blockhash_count; i++) {
         if (memcmp(bank->recent_blockhashes[i].hash.bytes,
                    blockhash->bytes, SOL_HASH_SIZE) == 0) {
@@ -2413,6 +4090,44 @@ sol_bank_can_afford_fee(sol_bank_t* bank, const sol_pubkey_t* payer,
     return can_afford;
 }
 
+sol_err_t
+sol_bank_verify_hash_against_slot_hashes(sol_bank_t* bank, sol_slot_t slot, const sol_hash_t* hash) {
+    if (!bank || !hash) {
+        return SOL_ERR_INVAL;
+    }
+
+    if (__builtin_expect(bank->cached_slot_hashes_valid, 1)) {
+        const sol_hash_t* expected = sol_slot_hashes_get(&bank->cached_slot_hashes, slot);
+        if (!expected || !sol_hash_eq(expected, hash)) {
+            return SOL_ERR_SLOT_HASH_MISMATCH;
+        }
+        return SOL_OK;
+    }
+
+    /* Slow path (should be rare): load+deserialize SlotHashes directly. Do NOT
+     * populate the cache here to avoid races in the parallel transaction path. */
+    sol_account_t* slot_hashes_account =
+        sol_bank_load_account_view(bank, &SOL_SYSVAR_SLOT_HASHES_ID);
+    if (!slot_hashes_account) {
+        return SOL_ERR_SLOT_HASH_MISMATCH;
+    }
+
+    sol_slot_hashes_t slot_hashes;
+    sol_slot_hashes_init(&slot_hashes);
+    sol_err_t err = sol_slot_hashes_deserialize(
+        &slot_hashes, slot_hashes_account->data, slot_hashes_account->meta.data_len);
+    sol_account_destroy(slot_hashes_account);
+    if (err != SOL_OK) {
+        return err;
+    }
+
+    const sol_hash_t* expected = sol_slot_hashes_get(&slot_hashes, slot);
+    if (!expected || !sol_hash_eq(expected, hash)) {
+        return SOL_ERR_SLOT_HASH_MISMATCH;
+    }
+    return SOL_OK;
+}
+
 static void
 fill_invoke_sysvars(sol_invoke_context_t* ctx, const sol_bank_t* bank) {
     if (!ctx || !bank) {
@@ -2421,31 +4136,30 @@ fill_invoke_sysvars(sol_invoke_context_t* ctx, const sol_bank_t* bank) {
 
     sol_clock_t clock;
     sol_clock_init(&clock);
-    bool have_clock = false;
-    if (bank->accounts_db) {
+
+    if (__builtin_expect(bank->cached_clock_valid, 1)) {
+        clock = bank->cached_clock;
+    } else if (bank->accounts_db) {
+        /* Fallback (should be rare): load Clock sysvar from AccountsDB. */
         sol_account_t* clock_acct =
             sol_accounts_db_load(bank->accounts_db, &SOL_SYSVAR_CLOCK_ID);
         if (clock_acct && clock_acct->meta.data_len >= SOL_CLOCK_SIZE) {
-            if (sol_clock_deserialize(&clock, clock_acct->data, clock_acct->meta.data_len) == SOL_OK) {
-                have_clock = true;
+            (void)sol_clock_deserialize(&clock, clock_acct->data, clock_acct->meta.data_len);
+        } else {
+            clock.slot = bank->slot;
+            clock.epoch = bank->epoch;
+            clock.unix_timestamp = unix_timestamp_for_slot(bank, bank->slot);
+            uint64_t epoch_start_slot_u64 = 0;
+            if (__builtin_mul_overflow((uint64_t)bank->epoch,
+                                       bank->config.slots_per_epoch,
+                                       &epoch_start_slot_u64)) {
+                epoch_start_slot_u64 = 0;
             }
+            clock.epoch_start_timestamp =
+                (ulong)unix_timestamp_for_slot(bank, (sol_slot_t)epoch_start_slot_u64);
+            clock.leader_schedule_epoch = clock.epoch;
         }
         sol_account_destroy(clock_acct);
-    }
-
-    if (!have_clock) {
-        clock.slot = bank->slot;
-        clock.epoch = bank->epoch;
-        clock.unix_timestamp = unix_timestamp_for_slot(bank, bank->slot);
-        uint64_t epoch_start_slot_u64 = 0;
-        if (__builtin_mul_overflow((uint64_t)bank->epoch,
-                                   bank->config.slots_per_epoch,
-                                   &epoch_start_slot_u64)) {
-            epoch_start_slot_u64 = 0;
-        }
-        clock.epoch_start_timestamp =
-            (ulong)unix_timestamp_for_slot(bank, (sol_slot_t)epoch_start_slot_u64);
-        clock.leader_schedule_epoch = clock.epoch;
     }
     ctx->clock = clock;
 
@@ -2498,84 +4212,82 @@ store_sysvar_account(sol_bank_t* bank,
     return err;
 }
 
+static inline void
+bank_set_instructions_sysvar_current(sol_account_t* account,
+                                     uint16_t current_idx) {
+    if (!account || !account->data) {
+        return;
+    }
+
+    size_t len = (size_t)account->meta.data_len;
+    if (len < 4u) {
+        return;
+    }
+
+    uint16_t count = 0;
+    memcpy(&count, account->data, 2);
+
+    /* Current instruction index is stored in the header after the offset table. */
+    size_t current_off = 2u + (size_t)count * 2u;
+    if (len < current_off + 2u) {
+        return;
+    }
+    memcpy(account->data + current_off, &current_idx, 2u);
+}
+
 static sol_err_t
-update_instructions_sysvar_account(sol_bank_t* bank,
-                                   const sol_transaction_t* tx,
-                                   uint16_t current_idx) {
-    if (!bank || !tx) {
+bank_build_instructions_sysvar_override(sol_bank_t* bank,
+                                        const sol_transaction_t* tx,
+                                        const bool* demoted_is_writable,
+                                        uint16_t demoted_is_writable_len,
+                                        sol_account_t** out_account) {
+    if (!bank || !bank->accounts_db || !tx || !out_account) {
         return SOL_ERR_INVAL;
     }
 
-    const sol_message_t* msg = &tx->message;
-    const sol_pubkey_t* account_keys = msg->resolved_accounts_len
-        ? msg->resolved_accounts : msg->account_keys;
-    uint16_t account_keys_len = msg->resolved_accounts_len
-        ? msg->resolved_accounts_len : (uint16_t)msg->account_keys_len;
-
-    /* Compute demoted is_writable flags matching Agave's SanitizedMessage::is_writable().
-     * Demotions: reserved account keys → not writable,
-     *            program_id accounts → not writable (when upgradeable loader not present). */
-    bool demoted_is_writable[SOL_MAX_MESSAGE_ACCOUNTS];
-
-    bool upgradeable_loader_present = false;
-    for (uint16_t k = 0; k < account_keys_len; k++) {
-        if (sol_pubkey_eq(&account_keys[k], &SOL_BPF_LOADER_UPGRADEABLE_ID)) {
-            upgradeable_loader_present = true;
-            break;
-        }
-    }
-
-    for (uint16_t i = 0; i < account_keys_len && i < SOL_MAX_MESSAGE_ACCOUNTS; i++) {
-        bool raw_writable;
-        if (msg->is_writable && i < account_keys_len) {
-            raw_writable = msg->is_writable[i];
-        } else {
-            raw_writable = sol_message_is_writable_index(msg, (uint8_t)i);
-        }
-        demoted_is_writable[i] = raw_writable;
-        if (!raw_writable) continue;
-        /* Fee payer (index 0) is always writable — skip demotion */
-        if (i == 0) continue;
-
-        /* Demote reserved account keys */
-        if (is_reserved_account_key(&account_keys[i])) {
-            demoted_is_writable[i] = false;
-            continue;
-        }
-
-        /* Demote program_id accounts when upgradeable loader not present */
-        if (!upgradeable_loader_present) {
-            for (uint8_t j = 0; j < msg->instructions_len; j++) {
-                if (msg->instructions[j].program_id_index == (uint8_t)i) {
-                    demoted_is_writable[i] = false;
-                    break;
-                }
-            }
-        }
-    }
-
+    /* Determine required buffer size. */
     uint8_t scratch[1];
     size_t needed = sizeof(scratch);
-    sol_err_t err = sol_instructions_sysvar_serialize(tx, current_idx,
-                        demoted_is_writable, account_keys_len, scratch, &needed);
+    sol_err_t err = sol_instructions_sysvar_serialize(tx, 0u,
+                                                      demoted_is_writable,
+                                                      demoted_is_writable_len,
+                                                      scratch,
+                                                      &needed);
     if (err != SOL_OK && err != SOL_ERR_INVAL) {
         return err;
     }
 
-    uint8_t* data = sol_alloc(needed);
-    if (!data) {
-        return SOL_ERR_NOMEM;
+    /* Clone existing sysvar meta (lamports/owner/rent_epoch) when present. */
+    sol_account_t* account =
+        sol_accounts_db_load(bank->accounts_db, &SOL_SYSVAR_INSTRUCTIONS_ID);
+    if (!account) {
+        account = sol_account_new(1, needed, &SOL_SYSVAR_PROGRAM_ID);
+        if (!account) {
+            return SOL_ERR_NOMEM;
+        }
+    } else {
+        sol_err_t resize_err = sol_account_resize(account, needed);
+        if (resize_err != SOL_OK) {
+            sol_account_destroy(account);
+            return resize_err;
+        }
     }
 
+    /* Serialize directly into the tx-local override account. */
     size_t written = needed;
-    err = sol_instructions_sysvar_serialize(tx, current_idx,
-              demoted_is_writable, account_keys_len, data, &written);
-    if (err == SOL_OK) {
-        err = store_sysvar_account(bank, &SOL_SYSVAR_INSTRUCTIONS_ID, data, written);
+    err = sol_instructions_sysvar_serialize(tx, 0u,
+                                            demoted_is_writable,
+                                            demoted_is_writable_len,
+                                            account->data,
+                                            &written);
+    if (err != SOL_OK) {
+        sol_account_destroy(account);
+        return err;
     }
+    account->meta.data_len = (ulong)written;
 
-    sol_free(data);
-    return err;
+    *out_account = account;
+    return SOL_OK;
 }
 
 static sol_err_t
@@ -2607,7 +4319,7 @@ store_sysvar_account_if_needed(sol_bank_t* bank,
                     same_data = memcmp(existing->data, data, data_len) == 0;
                 }
             }
-            if (!(same_len && same_data)) {
+            if (!(same_len && same_data) && bank_sysvar_diag_enable()) {
                 char pk_b58[SOL_PUBKEY_BASE58_LEN] = {0};
                 sol_pubkey_to_base58(pubkey, pk_b58, sizeof(pk_b58));
                 sol_log_warn("sysvar_data_mismatch: pubkey=%s old_len=%lu new_len=%lu",
@@ -2759,13 +4471,17 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
      * When `overwrite_existing` is false, we only need to ensure the sysvar
      * exists. Avoid computing stake-weighted timestamps in that case because
      * the store helper will no-op on existing accounts anyway. */
+
+    /* Cache the currently visible Clock sysvar once per bank. Many instructions
+     * consult it and repeated AccountsDB loads are expensive. */
+    sol_clock_t prev_clock;
+    sol_clock_init(&prev_clock);
+    bool have_prev_clock = load_visible_clock_sysvar(bank, &prev_clock);
+
     if (overwrite_existing ||
         !sol_accounts_db_exists(bank->accounts_db, &SOL_SYSVAR_CLOCK_ID)) {
         sol_clock_t clock;
         sol_clock_init(&clock);
-        sol_clock_t prev_clock;
-        sol_clock_init(&prev_clock);
-        bool have_prev_clock = load_visible_clock_sysvar(bank, &prev_clock);
 
         /* The Clock sysvar should be computed once per bank at slot boundary.
          * `refresh_sysvar_accounts()` is also called on the last tick to update
@@ -2895,13 +4611,15 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
                 clock.epoch_start_timestamp = epoch_start_ts;
             }
 
-            sol_log_info("CLOCK_DIAG: slot=%lu epoch=%lu unix_ts=%ld epoch_start_ts=%ld leader_sched_epoch=%lu have_median=%d",
-                         (unsigned long)clock.slot,
-                         (unsigned long)clock.epoch,
-                         (long)clock.unix_timestamp,
-                         (long)clock.epoch_start_timestamp,
-                         (unsigned long)clock.leader_schedule_epoch,
-                         (int)have_median);
+            if (bank_sysvar_diag_enable()) {
+                sol_log_info("CLOCK_DIAG: slot=%lu epoch=%lu unix_ts=%ld epoch_start_ts=%ld leader_sched_epoch=%lu have_median=%d",
+                             (unsigned long)clock.slot,
+                             (unsigned long)clock.epoch,
+                             (long)clock.unix_timestamp,
+                             (long)clock.epoch_start_timestamp,
+                             (unsigned long)clock.leader_schedule_epoch,
+                             (int)have_median);
+            }
         }
 
         uint8_t clock_data[SOL_CLOCK_SIZE];
@@ -2909,6 +4627,16 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
         SOL_TRY(store_sysvar_account_if_needed(bank, &SOL_SYSVAR_CLOCK_ID,
                                                clock_data, sizeof(clock_data),
                                                overwrite_existing));
+
+        bank->cached_clock = clock;
+        bank->cached_clock_valid = true;
+    } else {
+        /* Clock exists and we intentionally did not recompute it. Use the
+         * visible value as the bank's cached Clock. */
+        if (have_prev_clock) {
+            bank->cached_clock = prev_clock;
+            bank->cached_clock_valid = true;
+        }
     }
 
     /* Rent, EpochSchedule, and Fees are static sysvars that Agave only writes
@@ -2992,9 +4720,14 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
     }
 
     /* Slot hashes: updated every slot, contains recent parent bank hashes. */
-    if (overwrite_existing || !sol_accounts_db_exists(bank->accounts_db, &SOL_SYSVAR_SLOT_HASHES_ID)) {
+    {
+        bool need_update =
+            overwrite_existing ||
+            !sol_accounts_db_exists(bank->accounts_db, &SOL_SYSVAR_SLOT_HASHES_ID);
+
         sol_slot_hashes_t slot_hashes;
         sol_slot_hashes_init(&slot_hashes);
+        bool cache_valid = false;
 
         sol_account_t* slot_hashes_acct =
             sol_accounts_db_load(bank->accounts_db, &SOL_SYSVAR_SLOT_HASHES_ID);
@@ -3002,33 +4735,52 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
             sol_err_t sh_err = sol_slot_hashes_deserialize(
                 &slot_hashes, slot_hashes_acct->data, slot_hashes_acct->meta.data_len);
             sol_account_destroy(slot_hashes_acct);
-            if (sh_err != SOL_OK) {
+            if (sh_err == SOL_OK) {
+                cache_valid = true;
+            } else if (need_update) {
+                /* If we're overwriting/creating anyway, treat corrupt/missing
+                 * data as empty and proceed. */
                 sol_slot_hashes_init(&slot_hashes);
+                cache_valid = true;
             }
+        } else if (need_update) {
+            cache_valid = true;
         }
 
-        if (bank->slot != 0 && !sol_hash_is_zero(&bank->parent_hash)) {
-            (void)sol_slot_hashes_add(&slot_hashes, bank->parent_slot, &bank->parent_hash);
-        }
+        if (need_update) {
+            if (bank->slot != 0 && !sol_hash_is_zero(&bank->parent_hash)) {
+                (void)sol_slot_hashes_add(&slot_hashes, bank->parent_slot, &bank->parent_hash);
+            }
 
-        size_t slot_hashes_size = 8 + slot_hashes.len * (8 + 32);
-        uint8_t* slot_hashes_data = sol_alloc(slot_hashes_size);
-        if (!slot_hashes_data) {
-            return SOL_ERR_NOMEM;
-        }
+            size_t slot_hashes_size = 8 + slot_hashes.len * (8 + 32);
+            uint8_t* slot_hashes_data = sol_alloc(slot_hashes_size);
+            if (!slot_hashes_data) {
+                return SOL_ERR_NOMEM;
+            }
 
-        sol_err_t sh_ser_err =
-            sol_slot_hashes_serialize(&slot_hashes, slot_hashes_data, slot_hashes_size);
-        if (sh_ser_err != SOL_OK) {
+            sol_err_t sh_ser_err =
+                sol_slot_hashes_serialize(&slot_hashes, slot_hashes_data, slot_hashes_size);
+            if (sh_ser_err != SOL_OK) {
+                sol_free(slot_hashes_data);
+                return sh_ser_err;
+            }
+
+            sol_err_t sh_store_err =
+                store_sysvar_account(bank, &SOL_SYSVAR_SLOT_HASHES_ID,
+                                     slot_hashes_data, slot_hashes_size);
             sol_free(slot_hashes_data);
-            return sh_ser_err;
+            SOL_TRY(sh_store_err);
+
+            /* We just (re)built it, so it's safe to cache. */
+            cache_valid = true;
         }
 
-        sol_err_t sh_store_err =
-            store_sysvar_account(bank, &SOL_SYSVAR_SLOT_HASHES_ID,
-                                 slot_hashes_data, slot_hashes_size);
-        sol_free(slot_hashes_data);
-        SOL_TRY(sh_store_err);
+        if (cache_valid) {
+            bank->cached_slot_hashes = slot_hashes;
+            bank->cached_slot_hashes_valid = true;
+        } else {
+            bank->cached_slot_hashes_valid = false;
+        }
     }
 
     /* Slot history — In Agave, the SlotHistory sysvar is updated at freeze()
@@ -3086,8 +4838,7 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
 
     /* Only update once per bank at the slot boundary (during bank creation). */
     bool at_slot_start =
-        overwrite_existing &&
-        bank->tick_height == (uint64_t)bank->slot * bank->config.ticks_per_slot;
+        overwrite_existing;
     bool is_epoch_start_slot =
         bank->config.slots_per_epoch > 0 &&
         ((uint64_t)bank->slot % bank->config.slots_per_epoch) == 0;
@@ -3233,131 +4984,49 @@ update_slot_history_sysvar(sol_bank_t* bank) {
 /*
  * Execute a single instruction
  */
+static inline void
+invoke_ctx_reset_top_level(sol_invoke_context_t* ctx) {
+    if (!ctx) return;
+    /* Each top-level instruction starts a fresh CPI stack and has no prior
+     * return data (Agave semantics). */
+    ctx->stack_height = 1;
+    ctx->compute_units_accounted = 0;
+    ctx->return_data_len = 0;
+    memset(&ctx->return_data_program, 0, sizeof(ctx->return_data_program));
+}
+
 static sol_err_t
-execute_instruction(sol_bank_t* bank, const sol_transaction_t* tx,
-                   const sol_compiled_instruction_t* instr,
-                   uint8_t instruction_index,
-                   const sol_compute_budget_t* compute_budget,
-                   sol_compute_meter_t* compute_meter,
-                   sol_instruction_trace_t* instruction_trace) {
-    const sol_message_t* msg = &tx->message;
-    const sol_pubkey_t* account_keys = tx->message.resolved_accounts_len
-        ? tx->message.resolved_accounts
-        : tx->message.account_keys;
-    uint16_t account_keys_len = tx->message.resolved_accounts_len
-        ? tx->message.resolved_accounts_len
-        : (uint16_t)tx->message.account_keys_len;
-
-    if (account_keys_len > UINT8_MAX) {
-        return SOL_ERR_TX_TOO_LARGE;
+execute_instruction_prepared(sol_invoke_context_t* ctx,
+                             const sol_compiled_instruction_t* instr,
+                             uint8_t instruction_index) {
+    if (!ctx || !instr || !ctx->account_keys) {
+        return SOL_ERR_INVAL;
     }
 
-    bool local_is_writable[SOL_MAX_MESSAGE_ACCOUNTS];
-    bool local_is_signer[SOL_MAX_MESSAGE_ACCOUNTS];
-    const bool* is_writable = NULL;
-    const bool* is_signer = NULL;
-
-    /* Build is_writable from base flags, then apply Agave-compatible demotion.
-     * Agave's SanitizedMessage::is_writable() demotes reserved account keys
-     * (sysvars, builtins) and accounts used as program_id unless the
-     * upgradeable loader is present.  Fee payer (index 0) is always writable. */
-    if (msg->version == SOL_MESSAGE_VERSION_V0 &&
-        msg->resolved_accounts_len != 0 &&
-        msg->is_writable &&
-        account_keys_len == msg->resolved_accounts_len) {
-        memcpy(local_is_writable, msg->is_writable,
-               account_keys_len * sizeof(bool));
-    } else {
-        for (uint16_t i = 0; i < account_keys_len; i++) {
-            local_is_writable[i] = sol_message_is_writable_index(msg, (uint8_t)i);
-        }
-    }
-
-    /* Check if upgradeable loader is present in account keys */
-    bool upgradeable_loader_present = false;
-    for (uint16_t i = 0; i < account_keys_len; i++) {
-        if (sol_pubkey_eq(&account_keys[i], &SOL_BPF_LOADER_UPGRADEABLE_ID)) {
-            upgradeable_loader_present = true;
-            break;
-        }
-    }
-
-    /* Demote reserved keys and program IDs (skip fee payer at index 0) */
-    for (uint16_t i = 1; i < account_keys_len; i++) {
-        if (!local_is_writable[i]) continue;
-
-        /* Demote reserved account keys (sysvars, builtins, native loader) */
-        if (is_reserved_account_key(&account_keys[i])) {
-            local_is_writable[i] = false;
-            continue;
-        }
-
-        /* Demote accounts used as program_id when upgradeable loader not present */
-        if (!upgradeable_loader_present) {
-            for (uint8_t j = 0; j < msg->instructions_len; j++) {
-                if (msg->instructions[j].program_id_index == (uint8_t)i) {
-                    local_is_writable[i] = false;
-                    break;
-                }
-            }
-        }
-    }
-    is_writable = local_is_writable;
-
-    if (msg->version == SOL_MESSAGE_VERSION_V0 &&
-        msg->resolved_accounts_len != 0 &&
-        msg->is_signer &&
-        account_keys_len == msg->resolved_accounts_len) {
-        is_signer = msg->is_signer;
-    } else {
-        for (uint16_t i = 0; i < account_keys_len; i++) {
-            local_is_signer[i] = sol_message_is_signer(msg, (uint8_t)i);
-        }
-        is_signer = local_is_signer;
-    }
-
-    /* Get program ID */
-    if (!account_keys || instr->program_id_index >= account_keys_len) {
+    if (instr->program_id_index >= ctx->account_keys_len) {
         return SOL_ERR_PROGRAM_NOT_FOUND;
     }
 
-    const sol_pubkey_t* program_id = &account_keys[instr->program_id_index];
+    /* Reset per-top-level-instruction context. */
+    invoke_ctx_reset_top_level(ctx);
 
-    /* Build invoke context for native programs */
-    sol_invoke_context_t ctx = {
-        .bank = bank,
-        .account_keys = account_keys,
-        .account_keys_len = (uint8_t)account_keys_len,
-        .is_writable = is_writable,
-        .is_signer = is_signer,
-        .account_indices = instr->account_indices,
-        .account_indices_len = instr->account_indices_len,
-        .instruction_data = instr->data,
-        .instruction_data_len = instr->data_len,
-        .program_id = *program_id,
-        .tx_signature = sol_transaction_signature(tx),
-        .num_signers = tx->message.header.num_required_signatures,
-        .stack_height = 1,
-        .compute_budget = compute_budget,
-        .compute_meter = compute_meter,
-        .compute_units_accounted = 0,
-        .transaction = tx,
-        .current_instruction_index = instruction_index,
-        .instruction_trace = instruction_trace,
-    };
-    fill_invoke_sysvars(&ctx, bank);
+    ctx->account_indices = instr->account_indices;
+    ctx->account_indices_len = instr->account_indices_len;
+    ctx->instruction_data = instr->data;
+    ctx->instruction_data_len = instr->data_len;
+    ctx->program_id = ctx->account_keys[instr->program_id_index];
+    ctx->current_instruction_index = instruction_index;
 
-    return sol_program_execute(&ctx);
+    return sol_program_execute(ctx);
 }
 
 static void
 rollback_snapshot_restore(sol_bank_t* bank,
                           const sol_transaction_t* tx,
                           sol_account_t* const* rollback_accounts,
+                          const uint8_t* rollback_mask,
                           const uint8_t* rollback_local_kinds,
-                          size_t rollback_accounts_len,
-                          sol_account_t* rollback_instructions_sysvar,
-                          sol_accounts_db_local_kind_t rollback_instructions_sysvar_kind) {
+                          size_t rollback_accounts_len) {
     if (!bank || !tx) {
         return;
     }
@@ -3376,6 +5045,22 @@ rollback_snapshot_restore(sol_bank_t* bank,
             break;
         }
         const sol_pubkey_t* key = &account_keys[i];
+
+        /* For non-snapshotted accounts, we still want to clean up any new local
+         * overrides created during a failed transaction for accounts that were
+         * NOT previously in the overlay. This prevents the overlay from
+         * accumulating read-only entries on repeated failures. */
+        if (rollback_mask && rollback_mask[i] == 0) {
+            if (overlay && rollback_local_kinds) {
+                sol_accounts_db_local_kind_t kind =
+                    (sol_accounts_db_local_kind_t)rollback_local_kinds[i];
+                if (kind == SOL_ACCOUNTS_DB_LOCAL_MISSING) {
+                    (void)sol_accounts_db_clear_override(bank->accounts_db, key);
+                }
+            }
+            continue; /* not snapshotted */
+        }
+
         if (!overlay) {
             if (rollback_accounts && rollback_accounts[i]) {
                 (void)sol_bank_store_account(bank, key, rollback_accounts[i]);
@@ -3403,37 +5088,6 @@ rollback_snapshot_restore(sol_bank_t* bank,
                 (void)sol_accounts_db_clear_override(bank->accounts_db, key);
                 break;
         }
-    }
-
-    if (!overlay) {
-        if (rollback_instructions_sysvar) {
-            (void)sol_bank_store_account(bank,
-                                         &SOL_SYSVAR_INSTRUCTIONS_ID,
-                                         rollback_instructions_sysvar);
-        } else {
-            (void)bank_delete_account(bank, &SOL_SYSVAR_INSTRUCTIONS_ID);
-        }
-        return;
-    }
-
-    switch (rollback_instructions_sysvar_kind) {
-        case SOL_ACCOUNTS_DB_LOCAL_ACCOUNT:
-            if (rollback_instructions_sysvar) {
-                (void)sol_bank_store_account(bank,
-                                             &SOL_SYSVAR_INSTRUCTIONS_ID,
-                                             rollback_instructions_sysvar);
-            } else {
-                (void)sol_accounts_db_clear_override(bank->accounts_db,
-                                                    &SOL_SYSVAR_INSTRUCTIONS_ID);
-            }
-            break;
-        case SOL_ACCOUNTS_DB_LOCAL_TOMBSTONE:
-            (void)bank_delete_account(bank, &SOL_SYSVAR_INSTRUCTIONS_ID);
-            break;
-        case SOL_ACCOUNTS_DB_LOCAL_MISSING:
-        default:
-            (void)sol_accounts_db_clear_override(bank->accounts_db, &SOL_SYSVAR_INSTRUCTIONS_ID);
-            break;
     }
 }
 
@@ -3514,19 +5168,16 @@ advance_nonce_on_failure(sol_bank_t* bank, const sol_transaction_t* tx) {
 static void
 rollback_snapshot_free(sol_account_t** rollback_accounts,
                        size_t rollback_accounts_len,
-                       uint8_t* rollback_local_kinds,
-                       sol_account_t* rollback_instructions_sysvar) {
+                       uint8_t* rollback_mask,
+                       uint8_t* rollback_local_kinds) {
     for (size_t i = 0; i < rollback_accounts_len; i++) {
         if (rollback_accounts && rollback_accounts[i]) {
             sol_account_destroy(rollback_accounts[i]);
         }
     }
     sol_free(rollback_accounts);
+    sol_free(rollback_mask);
     sol_free(rollback_local_kinds);
-
-    if (rollback_instructions_sysvar) {
-        sol_account_destroy(rollback_instructions_sysvar);
-    }
 }
 
 /* Debug: log the first N pre-validation rejections per bank */
@@ -3535,15 +5186,20 @@ log_prevalidation_rejection(const sol_bank_t* bank,
                             const sol_transaction_t* tx,
                             const char* reason,
                             sol_err_t err) {
+    /* This is expensive (base58 formatting); keep it at debug level. */
+    if (sol_log_get_level() > SOL_LOG_DEBUG) {
+        return;
+    }
+
     uint64_t total_rejected =
-        bank->stats.rejected_sanitize +
-        bank->stats.rejected_duplicate +
-        bank->stats.rejected_v0_resolve +
-        bank->stats.rejected_compute_budget +
-        bank->stats.rejected_blockhash +
-        bank->stats.rejected_fee_payer_missing +
-        bank->stats.rejected_insufficient_funds +
-        bank->stats.rejected_signature;
+        __atomic_load_n(&bank->stats.rejected_sanitize, __ATOMIC_RELAXED) +
+        __atomic_load_n(&bank->stats.rejected_duplicate, __ATOMIC_RELAXED) +
+        __atomic_load_n(&bank->stats.rejected_v0_resolve, __ATOMIC_RELAXED) +
+        __atomic_load_n(&bank->stats.rejected_compute_budget, __ATOMIC_RELAXED) +
+        __atomic_load_n(&bank->stats.rejected_blockhash, __ATOMIC_RELAXED) +
+        __atomic_load_n(&bank->stats.rejected_fee_payer_missing, __ATOMIC_RELAXED) +
+        __atomic_load_n(&bank->stats.rejected_insufficient_funds, __ATOMIC_RELAXED) +
+        __atomic_load_n(&bank->stats.rejected_signature, __ATOMIC_RELAXED);
     if (total_rejected > 50) return; /* limit logging */
 
     const sol_signature_t* sig = sol_transaction_signature(tx);
@@ -3561,26 +5217,25 @@ log_prevalidation_rejection(const sol_bank_t* bank,
     sol_pubkey_to_base58((const sol_pubkey_t*)&tx->message.recent_blockhash,
                          bh_b58, sizeof(bh_b58));
 
-    sol_log_info("prevalidation_reject: slot=%lu reason=%s err=%d sig=%s nsigs=%u ver=%s payer=%s blockhash=%s",
-                 (unsigned long)bank->slot,
-                 reason, (int)err,
-                 sig_b58[0] ? sig_b58 : "?",
-                 (unsigned)tx->signatures_len,
-                 tx->message.version == SOL_MESSAGE_VERSION_V0 ? "v0" : "legacy",
-                 payer_b58[0] ? payer_b58 : "?",
-                 bh_b58[0] ? bh_b58 : "?");
+    sol_log_debug("prevalidation_reject: slot=%lu reason=%s err=%d sig=%s nsigs=%u ver=%s payer=%s blockhash=%s",
+                  (unsigned long)bank->slot,
+                  reason, (int)err,
+                  sig_b58[0] ? sig_b58 : "?",
+                  (unsigned)tx->signatures_len,
+                  tx->message.version == SOL_MESSAGE_VERSION_V0 ? "v0" : "legacy",
+                  payer_b58[0] ? payer_b58 : "?",
+                  bh_b58[0] ? bh_b58 : "?");
 }
 
-sol_tx_result_t
-sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
+static sol_tx_result_t
+sol_bank_process_transaction_impl(sol_bank_t* bank,
+                                  const sol_transaction_t* tx,
+                                  bool enable_tx_status_cache) {
     sol_tx_result_t result = {0};
     sol_compute_budget_t compute_budget = {0};
     sol_compute_meter_t compute_meter = {0};
-    sol_account_t** rollback_accounts = NULL;
-    size_t rollback_accounts_len = 0;
-    sol_account_t* rollback_instructions_sysvar = NULL;
-    uint8_t* rollback_local_kinds = NULL;
-    sol_accounts_db_local_kind_t rollback_instructions_sysvar_kind = SOL_ACCOUNTS_DB_LOCAL_MISSING;
+    sol_err_t budget_err = SOL_OK;
+    sol_account_t* tx_instructions_sysvar = NULL;
     bool resolved_override = false;
     const sol_pubkey_t* saved_resolved_accounts = NULL;
     uint16_t saved_resolved_accounts_len = 0;
@@ -3590,54 +5245,57 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
     bool resolved_is_writable[SOL_MAX_MESSAGE_ACCOUNTS];
     bool resolved_is_signer[SOL_MAX_MESSAGE_ACCOUNTS];
     sol_instruction_trace_t instruction_trace = {0};
+    const sol_signature_t* tx_sig = NULL;
+    bool reserved_tx_status = false;
+
+    uint64_t slow_tx_thresh_ns = bank_slow_tx_threshold_ns();
+    uint64_t slow_tx_t0 = slow_tx_thresh_ns ? bank_monotonic_ns() : 0;
+
+    /* Clear TLS overrides in case the caller reuses a worker thread. */
+    g_tls_instructions_sysvar = NULL;
+    bank_prev_meta_hints_reset();
+    bank_tx_undo_end();
 
     if (!bank || !tx) {
         result.status = SOL_ERR_INVAL;
         return result;
     }
 
-    if (bank->frozen) {
+    if (__atomic_load_n(&bank->frozen, __ATOMIC_ACQUIRE)) {
         result.status = SOL_ERR_SHUTDOWN;
         return result;
     }
 
-    pthread_mutex_lock(&bank->lock);
-    bank->hash_computed = false;
-    bank->accounts_delta_hash_computed = false;
-    bank->accounts_lt_hash_computed = false;
+    /* Transaction execution can be parallelized. Avoid holding the bank mutex
+     * across instruction execution; only use it for tx-status bookkeeping. */
+    BANK_FLAG_CLEAR(bank, hash_computed);
+    BANK_FLAG_CLEAR(bank, accounts_delta_hash_computed);
+    BANK_FLAG_CLEAR(bank, accounts_lt_hash_computed);
 
-    /* Ensure sysvar accounts exist. Bank creation paths already refresh sysvars
-     * at slot boundaries; avoid recomputing stake-weighted timestamps on every
-     * transaction. */
-    if (!sol_accounts_db_exists(bank->accounts_db, &SOL_SYSVAR_CLOCK_ID)) {
-        sol_err_t sysvar_err = refresh_sysvar_accounts(bank, false);
-        if (sysvar_err != SOL_OK) {
-            result.status = sysvar_err;
-            bank->stats.transactions_failed++;
-            goto unlock_and_return;
-        }
-    }
-
-    bank->stats.transactions_processed++;
+    BANK_STAT_INC(bank, transactions_processed);
 
     /* Basic transaction validation */
     sol_err_t sanitize_err = sol_transaction_sanitize(tx);
     if (sanitize_err != SOL_OK) {
         result.status = sanitize_err;
-        bank->stats.transactions_failed++;
-        bank->stats.rejected_sanitize++;
+        BANK_STAT_INC(bank, transactions_failed);
+        BANK_STAT_INC(bank, rejected_sanitize);
         log_prevalidation_rejection(bank, tx, "sanitize", sanitize_err);
         goto unlock_and_return;
     }
 
-    /* Reject duplicate transactions */
-    const sol_signature_t* tx_sig = sol_transaction_signature(tx);
-    if (tx_sig && tx_status_exists_locked(bank, tx_sig)) {
-        result.status = SOL_ERR_TX_ALREADY_PROCESSED;
-        bank->stats.transactions_failed++;
-        bank->stats.rejected_duplicate++;
-        log_prevalidation_rejection(bank, tx, "duplicate", SOL_ERR_TX_ALREADY_PROCESSED);
-        goto unlock_and_return;
+    /* Reject duplicate transactions (in parallel processing this is handled
+     * before execution to avoid lock contention in the hot path). */
+    tx_sig = sol_transaction_signature(tx);
+    if (enable_tx_status_cache && tx_sig) {
+        if (!tx_status_reserve(bank, tx_sig)) {
+            result.status = SOL_ERR_TX_ALREADY_PROCESSED;
+            BANK_STAT_INC(bank, transactions_failed);
+            BANK_STAT_INC(bank, rejected_duplicate);
+            log_prevalidation_rejection(bank, tx, "duplicate", SOL_ERR_TX_ALREADY_PROCESSED);
+            goto unlock_and_return;
+        }
+        reserved_tx_status = true;
     }
 
     /* Agave's per-bank signature_count (hashed into the frozen bank-hash)
@@ -3648,93 +5306,147 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
      * load_and_execute_transactions, which is after dedup but before
      * blockhash/fee-payer/balance checks.  Precompile signature counts
      * are used for fee calculation but are *not* included here. */
-    bank->signature_count += (uint64_t)tx->signatures_len;
+    BANK_U64_ADD(bank, signature_count, (uint64_t)tx->signatures_len);
 
     if (tx->message.version == SOL_MESSAGE_VERSION_V0) {
-        uint16_t resolved_len = 0;
-        sol_err_t resolve_err = bank_resolve_v0_message_accounts(bank,
-                                                                 tx,
-                                                                 resolved_accounts,
-                                                                 resolved_is_writable,
-                                                                 resolved_is_signer,
-                                                                 SOL_MAX_MESSAGE_ACCOUNTS,
-                                                                 &resolved_len);
-        if (resolve_err != SOL_OK) {
-            result.status = resolve_err;
-            bank->stats.transactions_failed++;
-            bank->stats.rejected_v0_resolve++;
-            log_prevalidation_rejection(bank, tx, "v0_resolve", resolve_err);
-            goto unlock_and_return;
-        }
+        sol_message_t* msg = (sol_message_t*)&tx->message;
+        uint16_t resolved_len = msg->resolved_accounts_len;
 
-        /* Our invoke context uses u8 lengths. Bail out if the message is too large. */
-        if (resolved_len > UINT8_MAX) {
-            result.status = SOL_ERR_TX_TOO_LARGE;
-            bank->stats.transactions_failed++;
-            bank->stats.rejected_v0_resolve++;
-            goto unlock_and_return;
-        }
+        bool have_cached =
+            (resolved_len != 0 &&
+             msg->resolved_accounts &&
+             msg->is_writable &&
+             msg->is_signer);
 
-        /* Validate compiled instruction indices against resolved account keys. */
-        for (uint8_t i = 0; i < tx->message.instructions_len; i++) {
-            const sol_compiled_instruction_t* ix = &tx->message.instructions[i];
-            if (ix->program_id_index >= resolved_len) {
-                result.status = SOL_ERR_TX_MALFORMED;
-                bank->stats.transactions_failed++;
-                bank->stats.rejected_v0_resolve++;
+        if (!have_cached) {
+            resolved_len = 0;
+            sol_err_t resolve_err = bank_resolve_v0_message_accounts(bank,
+                                                                     tx,
+                                                                     resolved_accounts,
+                                                                     resolved_is_writable,
+                                                                     resolved_is_signer,
+                                                                     SOL_MAX_MESSAGE_ACCOUNTS,
+                                                                     &resolved_len);
+            if (resolve_err != SOL_OK) {
+                result.status = resolve_err;
+                BANK_STAT_INC(bank, transactions_failed);
+                BANK_STAT_INC(bank, rejected_v0_resolve);
+                log_prevalidation_rejection(bank, tx, "v0_resolve", resolve_err);
                 goto unlock_and_return;
             }
-            for (uint8_t j = 0; j < ix->account_indices_len; j++) {
-                if (ix->account_indices[j] >= resolved_len) {
+
+            /* Our invoke context uses u8 lengths. Bail out if the message is too large. */
+            if (resolved_len > UINT8_MAX) {
+                result.status = SOL_ERR_TX_TOO_LARGE;
+                BANK_STAT_INC(bank, transactions_failed);
+                BANK_STAT_INC(bank, rejected_v0_resolve);
+                goto unlock_and_return;
+            }
+
+            /* Validate compiled instruction indices against resolved account keys. */
+            for (uint8_t i = 0; i < tx->message.instructions_len; i++) {
+                const sol_compiled_instruction_t* ix = &tx->message.instructions[i];
+                if (ix->program_id_index >= resolved_len) {
                     result.status = SOL_ERR_TX_MALFORMED;
-                    bank->stats.transactions_failed++;
-                    bank->stats.rejected_v0_resolve++;
+                    BANK_STAT_INC(bank, transactions_failed);
+                    BANK_STAT_INC(bank, rejected_v0_resolve);
                     goto unlock_and_return;
+                }
+                for (uint8_t j = 0; j < ix->account_indices_len; j++) {
+                    if (ix->account_indices[j] >= resolved_len) {
+                        result.status = SOL_ERR_TX_MALFORMED;
+                        BANK_STAT_INC(bank, transactions_failed);
+                        BANK_STAT_INC(bank, rejected_v0_resolve);
+                        goto unlock_and_return;
+                    }
+                }
+            }
+
+            /* Temporarily attach resolved keys/flags for execution. */
+            saved_resolved_accounts = msg->resolved_accounts;
+            saved_resolved_accounts_len = msg->resolved_accounts_len;
+            saved_is_writable = msg->is_writable;
+            saved_is_signer = msg->is_signer;
+            msg->resolved_accounts = resolved_accounts;
+            msg->resolved_accounts_len = resolved_len;
+            msg->is_writable = resolved_is_writable;
+            msg->is_signer = resolved_is_signer;
+            resolved_override = true;
+        } else {
+            /* Cached resolution path: validate indices and continue. */
+            if (resolved_len > UINT8_MAX) {
+                result.status = SOL_ERR_TX_TOO_LARGE;
+                BANK_STAT_INC(bank, transactions_failed);
+                BANK_STAT_INC(bank, rejected_v0_resolve);
+                goto unlock_and_return;
+            }
+
+            for (uint8_t i = 0; i < tx->message.instructions_len; i++) {
+                const sol_compiled_instruction_t* ix = &tx->message.instructions[i];
+                if (ix->program_id_index >= resolved_len) {
+                    result.status = SOL_ERR_TX_MALFORMED;
+                    BANK_STAT_INC(bank, transactions_failed);
+                    BANK_STAT_INC(bank, rejected_v0_resolve);
+                    goto unlock_and_return;
+                }
+                for (uint8_t j = 0; j < ix->account_indices_len; j++) {
+                    if (ix->account_indices[j] >= resolved_len) {
+                        result.status = SOL_ERR_TX_MALFORMED;
+                        BANK_STAT_INC(bank, transactions_failed);
+                        BANK_STAT_INC(bank, rejected_v0_resolve);
+                        goto unlock_and_return;
+                    }
                 }
             }
         }
-
-        sol_message_t* msg = (sol_message_t*)&tx->message;
-        saved_resolved_accounts = msg->resolved_accounts;
-        saved_resolved_accounts_len = msg->resolved_accounts_len;
-        saved_is_writable = msg->is_writable;
-        saved_is_signer = msg->is_signer;
-        msg->resolved_accounts = resolved_accounts;
-        msg->resolved_accounts_len = resolved_len;
-        msg->is_writable = resolved_is_writable;
-        msg->is_signer = resolved_is_signer;
-        resolved_override = true;
     }
 
-    /* 0. Parse compute budget and initialize compute meter.
-     * In Agave, CB parse errors (duplicate instructions, deprecated type 0)
-     * are checked AFTER fee charging.  Store the error and continue so that
-     * fee deduction still occurs. */
-    sol_err_t budget_err = sol_compute_budget_parse(&compute_budget, tx);
-    sol_compute_meter_init(&compute_meter, compute_budget.compute_unit_limit);
+    /* 1. Verify blockhash is recent (and fetch lamports_per_signature). */
+    bool recent_ok = false;
+    uint64_t lamports_per_signature = bank->config.lamports_per_signature;
+    if (bank->recent_blockhash_map) {
+        uint64_t* fee = (uint64_t*)sol_map_get(bank->recent_blockhash_map, &tx->message.recent_blockhash);
+        if (fee) {
+            recent_ok = true;
+            lamports_per_signature = *fee;
+        }
+    } else {
+        /* Fallback (should be rare): linear scan. */
+        recent_ok = bank_is_blockhash_valid_locked(bank, &tx->message.recent_blockhash);
+        if (recent_ok) {
+            lamports_per_signature =
+                bank_lamports_per_signature_for_blockhash_locked(bank, &tx->message.recent_blockhash);
+        }
+    }
 
-    /* 1. Verify blockhash is recent */
-    bool recent_ok = bank_is_blockhash_valid_locked(bank, &tx->message.recent_blockhash);
     uint64_t nonce_lamports_per_signature = 0;
     bool use_nonce_fee = false;
     if (!recent_ok) {
         if (bank_try_get_durable_nonce_fee_calculator(bank, tx, &nonce_lamports_per_signature)) {
             recent_ok = true;
             use_nonce_fee = true;
+            lamports_per_signature = nonce_lamports_per_signature;
         }
     }
     if (!recent_ok) {
         result.status = SOL_ERR_TX_BLOCKHASH;
-        bank->stats.transactions_failed++;
-        bank->stats.rejected_blockhash++;
+        BANK_STAT_INC(bank, transactions_failed);
+        BANK_STAT_INC(bank, rejected_blockhash);
         log_prevalidation_rejection(bank, tx, "blockhash", SOL_ERR_TX_BLOCKHASH);
         goto unlock_and_return;
     }
 
-    /* 2. Calculate fee (deterministic per blockhash). */
-    uint64_t lamports_per_signature = use_nonce_fee
-        ? nonce_lamports_per_signature
-        : bank_lamports_per_signature_for_blockhash_locked(bank, &tx->message.recent_blockhash);
+    /* 2. Parse compute budget and initialize compute meter.
+     * In Agave, CB parse errors (duplicate instructions, deprecated type 0)
+     * are checked AFTER fee charging. Store the error and continue so that
+     * fee deduction still occurs.
+     *
+     * Doing this after blockhash validation avoids work for transactions that
+     * fail the blockhash check (common in some replay datasets). */
+    budget_err = sol_compute_budget_parse(&compute_budget, tx);
+    sol_compute_meter_init(&compute_meter, compute_budget.compute_unit_limit);
+
+    /* 3. Calculate fee (deterministic per blockhash). */
     uint64_t precompile_signatures = bank_count_precompile_signatures(tx);
 
     uint64_t signature_fee_count = (uint64_t)tx->signatures_len + precompile_signatures;
@@ -3742,54 +5454,58 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
     uint64_t priority_fee = sol_compute_budget_priority_fee(&compute_budget);
     result.fee = base_fee + priority_fee;
 
-    /* 3. Get fee payer */
+    /* 4. Get fee payer */
     const sol_pubkey_t* fee_payer = sol_message_fee_payer(&tx->message);
     if (!fee_payer) {
         result.status = SOL_ERR_TX_MALFORMED;
-        bank->stats.transactions_failed++;
-        bank->stats.rejected_fee_payer_missing++;
+        BANK_STAT_INC(bank, transactions_failed);
+        BANK_STAT_INC(bank, rejected_fee_payer_missing);
         goto unlock_and_return;
     }
 
-    /* 4. Check fee payer can afford fee */
-    sol_account_t* payer_account = sol_bank_load_account(bank, fee_payer);
+    /* 5. Check fee payer can afford fee */
+    /* Fee payer data is not mutated (only lamports/rent_epoch), so avoid the
+     * owned/copying load path (AppendVec pread) and use a view when possible. */
+    sol_account_t* payer_account = sol_bank_load_account_view(bank, fee_payer);
     if (!payer_account) {
         result.status = SOL_ERR_TX_ACCOUNT_NOT_FOUND;
-        bank->stats.transactions_failed++;
-        bank->stats.rejected_fee_payer_missing++;
-        /* Debug: trace the chain to understand why account is missing */
-        char b58[45];
-        sol_pubkey_to_base58(fee_payer, b58, sizeof(b58));
-        sol_log_warn("FEE_PAYER_TRACE slot=%lu pubkey=%s",
-                     (unsigned long)bank->slot, b58);
-        sol_accounts_db_trace_load(bank->accounts_db, fee_payer);
+        BANK_STAT_INC(bank, transactions_failed);
+        BANK_STAT_INC(bank, rejected_fee_payer_missing);
+        if (bank_fee_payer_trace_enable()) {
+            /* Debug: trace the chain to understand why account is missing. */
+            char b58[45];
+            sol_pubkey_to_base58(fee_payer, b58, sizeof(b58));
+            sol_log_warn("FEE_PAYER_TRACE slot=%lu pubkey=%s",
+                         (unsigned long)bank->slot, b58);
+            sol_accounts_db_trace_load(bank->accounts_db, fee_payer);
+        }
         log_prevalidation_rejection(bank, tx, "fee_payer_missing", SOL_ERR_TX_ACCOUNT_NOT_FOUND);
         goto unlock_and_return;
     }
 
     if (payer_account->meta.lamports < result.fee) {
         result.status = SOL_ERR_TX_INSUFFICIENT_FUNDS;
-        bank->stats.transactions_failed++;
-        bank->stats.rejected_insufficient_funds++;
+        BANK_STAT_INC(bank, transactions_failed);
+        BANK_STAT_INC(bank, rejected_insufficient_funds);
         log_prevalidation_rejection(bank, tx, "insufficient_funds", SOL_ERR_TX_INSUFFICIENT_FUNDS);
         sol_account_destroy(payer_account);
         goto unlock_and_return;
     }
 
-    /* 5. Verify signatures */
-    bank->stats.signatures_verified += tx->signatures_len;
+    /* 6. Verify signatures */
+    BANK_STAT_ADD(bank, signatures_verified, (uint64_t)tx->signatures_len);
 
     if (!bank_skip_signature_verify() &&
         !sol_transaction_verify_signatures(tx, NULL)) {
         result.status = SOL_ERR_TX_SIGNATURE;
-        bank->stats.transactions_failed++;
-        bank->stats.rejected_signature++;
+        BANK_STAT_INC(bank, transactions_failed);
+        BANK_STAT_INC(bank, rejected_signature);
         log_prevalidation_rejection(bank, tx, "signature", SOL_ERR_TX_SIGNATURE);
         sol_account_destroy(payer_account);
         goto unlock_and_return;
     }
 
-    /* 5.5 Fix rent_epoch for fee payer.
+    /* 6.5 Fix rent_epoch for fee payer.
      * In Agave, collect_rent_from_account() is called during account loading.
      * For rent-exempt accounts with rent_epoch != UINT64_MAX, it sets
      * rent_epoch to UINT64_MAX.  This must happen before fee deduction so the
@@ -3834,7 +5550,7 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
 
         if (!fee_rent_ok) {
             result.status = SOL_ERR_TX_INSUFFICIENT_FUNDS_FOR_RENT;
-            bank->stats.transactions_failed++;
+            BANK_STAT_INC(bank, transactions_failed);
             sol_account_destroy(payer_account);
             goto unlock_and_return;
         }
@@ -3845,16 +5561,16 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
     (void)sol_bank_store_account(bank, fee_payer, payer_account);
     sol_account_destroy(payer_account);
 
-    bank->stats.total_fees_collected += result.fee;
-    bank->stats.total_priority_fees_collected += priority_fee;
+    BANK_STAT_ADD(bank, total_fees_collected, result.fee);
+    BANK_STAT_ADD(bank, total_priority_fees_collected, priority_fee);
 
     /* Check deferred compute budget parse error AFTER fee deduction.
      * In Agave, DuplicateInstruction / InvalidInstructionData from the CB
      * processor still charges the fee but skips execution. */
     if (budget_err != SOL_OK) {
         result.status = budget_err;
-        bank->stats.transactions_failed++;
-        bank->stats.rejected_compute_budget++;
+        BANK_STAT_INC(bank, transactions_failed);
+        BANK_STAT_INC(bank, rejected_compute_budget);
         log_prevalidation_rejection(bank, tx, "compute_budget", budget_err);
         goto unlock_and_return;
     }
@@ -3864,11 +5580,11 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
          * This preserves signature_count semantics and helps isolate early
          * validation errors without executing programs. */
         result.status = SOL_OK;
-        bank->stats.transactions_succeeded++;
+        BANK_STAT_INC(bank, transactions_succeeded);
         goto unlock_and_return;
     }
 
-    /* 6.5 Snapshot accounts for rollback (after fee deduction) */
+    /* 6.5 Prepare for instruction execution (after fee deduction). */
     const sol_pubkey_t* tx_account_keys = tx->message.resolved_accounts_len
         ? tx->message.resolved_accounts
         : tx->message.account_keys;
@@ -3876,55 +5592,103 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
         ? (size_t)tx->message.resolved_accounts_len
         : (size_t)tx->message.account_keys_len;
 
-    rollback_accounts_len = tx_account_keys_len;
-    rollback_accounts = sol_calloc(rollback_accounts_len, sizeof(sol_account_t*));
-    if (!rollback_accounts) {
-        result.status = SOL_ERR_NOMEM;
-        bank->stats.transactions_failed++;
-        goto unlock_and_return;
-    }
+    /* Compute demoted is_writable flags matching Agave's SanitizedMessage::is_writable().
+     * This is used for rollback snapshotting and other post-fee checks. */
+    bool demoted_is_writable[SOL_MAX_MESSAGE_ACCOUNTS];
+    memset(demoted_is_writable, 0, sizeof(demoted_is_writable));
 
-    bool overlay = sol_accounts_db_is_overlay(bank->accounts_db);
-    if (overlay) {
-        rollback_local_kinds = sol_calloc(rollback_accounts_len, sizeof(uint8_t));
-        if (!rollback_local_kinds) {
-            result.status = SOL_ERR_NOMEM;
-            bank->stats.transactions_failed++;
-            sol_free(rollback_accounts);
-            rollback_accounts = NULL;
-            goto unlock_and_return;
-        }
-    }
-
-    for (size_t i = 0; i < rollback_accounts_len; i++) {
-        if (!tx_account_keys || i >= tx_account_keys_len) {
+    bool upgradeable_loader_present = false;
+    for (size_t i = 0; i < tx_account_keys_len && i < SOL_MAX_MESSAGE_ACCOUNTS; i++) {
+        if (sol_pubkey_eq(&tx_account_keys[i], &SOL_BPF_LOADER_UPGRADEABLE_ID)) {
+            upgradeable_loader_present = true;
             break;
         }
-        const sol_pubkey_t* key = &tx_account_keys[i];
-        if (!overlay) {
-            rollback_accounts[i] = sol_accounts_db_load(bank->accounts_db, key);
+    }
+
+    for (size_t i = 0; i < tx_account_keys_len && i < SOL_MAX_MESSAGE_ACCOUNTS; i++) {
+        bool raw_writable;
+        if (tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+            tx->message.resolved_accounts_len != 0 &&
+            tx->message.is_writable &&
+            i < (size_t)tx->message.resolved_accounts_len) {
+            raw_writable = tx->message.is_writable[i];
+        } else {
+            raw_writable = sol_message_is_writable_index(&tx->message, (uint8_t)i);
+        }
+
+        demoted_is_writable[i] = raw_writable;
+        if (!raw_writable) continue;
+
+        /* Fee payer (index 0) is always writable — skip demotion */
+        if (i == 0) continue;
+
+        /* Demote reserved account keys */
+        if (is_reserved_account_key(&tx_account_keys[i])) {
+            demoted_is_writable[i] = false;
             continue;
         }
 
-        sol_account_t* local = NULL;
-        sol_accounts_db_local_kind_t kind =
-            sol_accounts_db_get_local_kind(bank->accounts_db, key, &local);
-        rollback_local_kinds[i] = (uint8_t)kind;
-        rollback_accounts[i] = (kind == SOL_ACCOUNTS_DB_LOCAL_ACCOUNT) ? local : NULL;
-
-        (void)expected_post_fee_lamports; /* used by diagnostics when enabled */
-    }
-
-    if (!overlay) {
-        rollback_instructions_sysvar =
-            sol_accounts_db_load(bank->accounts_db, &SOL_SYSVAR_INSTRUCTIONS_ID);
-    } else {
-        rollback_instructions_sysvar_kind = sol_accounts_db_get_local_kind(
-            bank->accounts_db, &SOL_SYSVAR_INSTRUCTIONS_ID, &rollback_instructions_sysvar);
-        if (rollback_instructions_sysvar_kind != SOL_ACCOUNTS_DB_LOCAL_ACCOUNT) {
-            rollback_instructions_sysvar = NULL;
+        /* Demote program_id accounts when upgradeable loader not present */
+        if (!upgradeable_loader_present) {
+            for (uint8_t j = 0; j < tx->message.instructions_len; j++) {
+                if (tx->message.instructions[j].program_id_index == (uint8_t)i) {
+                    demoted_is_writable[i] = false;
+                    break;
+                }
+            }
         }
     }
+
+    /* The Instructions sysvar is virtual in Agave. Our implementation updates it
+     * by storing a real account into AccountsDB, which is expensive. Only do so
+     * when a program may actually read it (precompiles or explicitly passed as
+     * an account). */
+    bool needs_instructions_sysvar = false;
+    for (size_t i = 0; i < tx_account_keys_len && i < SOL_MAX_MESSAGE_ACCOUNTS; i++) {
+        if (sol_pubkey_eq(&tx_account_keys[i], &SOL_SYSVAR_INSTRUCTIONS_ID)) {
+            needs_instructions_sysvar = true;
+            break;
+        }
+    }
+    if (!needs_instructions_sysvar) {
+        for (uint8_t i = 0; i < tx->message.instructions_len; i++) {
+            const sol_compiled_instruction_t* ix = &tx->message.instructions[i];
+            if (!tx_account_keys || (size_t)ix->program_id_index >= tx_account_keys_len) continue;
+            const sol_pubkey_t* pid = &tx_account_keys[ix->program_id_index];
+            if (sol_pubkey_eq(pid, &SOL_ED25519_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_SECP256K1_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_SECP256R1_PROGRAM_ID)) {
+                needs_instructions_sysvar = true;
+                break;
+            }
+        }
+    }
+
+    /* Build a tx-local Instructions sysvar override if required. This avoids
+     * a global mutable sysvar account (needed for parallel tx execution) and
+     * eliminates per-instruction AccountsDB stores. */
+    if (needs_instructions_sysvar) {
+        sol_err_t sysvar_err = bank_build_instructions_sysvar_override(
+            bank,
+            tx,
+            demoted_is_writable,
+            (uint16_t)tx_account_keys_len,
+            &tx_instructions_sysvar);
+        if (sysvar_err != SOL_OK) {
+            result.status = sysvar_err;
+            result.compute_units_used = compute_meter.consumed;
+            BANK_STAT_ADD(bank, compute_units_used, result.compute_units_used);
+            BANK_STAT_INC(bank, transactions_failed);
+            if (use_nonce_fee) advance_nonce_on_failure(bank, tx);
+            goto unlock_and_return;
+        }
+
+        g_tls_instructions_sysvar = tx_instructions_sysvar;
+    }
+
+    /* From here onward, account stores/deletes must be rollbackable if an
+     * instruction fails. Use a tx-local undo log recorded on first write. */
+    bank_tx_undo_begin(bank);
 
     /* Fix rent_epoch for all writable accounts before execution.
      * In Agave, collect_rent_from_account() is called during account loading
@@ -3935,65 +5699,97 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
      * (matching Agave, where only fee payer and nonce retain their fixup).
      * Skip fee payer (index 0) since it was already fixed above. */
     for (size_t ri = 1; ri < tx_account_keys_len; ri++) {
-        if (!bank_message_is_writable_resolved_index(&tx->message, (uint8_t)ri))
+        if (ri < SOL_MAX_MESSAGE_ACCOUNTS && !demoted_is_writable[ri])
             continue;
-        sol_account_t* wa = sol_accounts_db_load(bank->accounts_db, &tx_account_keys[ri]);
-        if (!wa || wa->meta.lamports == 0) {
+        sol_account_t* wa_view = sol_accounts_db_load_view(bank->accounts_db, &tx_account_keys[ri]);
+        if (!wa_view || wa_view->meta.lamports == 0) {
+            if (wa_view) sol_account_destroy(wa_view);
+            continue;
+        }
+
+        bool needs_fix =
+            (wa_view->meta.rent_epoch != UINT64_MAX) &&
+            sol_account_is_rent_exempt(wa_view,
+                                      bank->config.rent_per_byte_year,
+                                      bank->config.rent_exemption_threshold);
+
+        if (needs_fix) {
+            if (!wa_view->data_borrowed) {
+                /* We already have an owned copy (e.g. overlay/in-memory). */
+                wa_view->meta.rent_epoch = UINT64_MAX;
+                (void)sol_bank_store_account(bank, &tx_account_keys[ri], wa_view);
+                sol_account_destroy(wa_view);
+                continue;
+            }
+
+            /* Borrowed view (AppendVec mmap). Reload an owned copy only when needed. */
+            sol_account_destroy(wa_view);
+            wa_view = NULL;
+
+            sol_account_t* wa = sol_accounts_db_load(bank->accounts_db, &tx_account_keys[ri]);
+            if (wa && wa->meta.lamports != 0 &&
+                wa->meta.rent_epoch != UINT64_MAX &&
+                sol_account_is_rent_exempt(wa,
+                                          bank->config.rent_per_byte_year,
+                                          bank->config.rent_exemption_threshold)) {
+                wa->meta.rent_epoch = UINT64_MAX;
+                (void)sol_bank_store_account(bank, &tx_account_keys[ri], wa);
+            }
             if (wa) sol_account_destroy(wa);
             continue;
         }
-        if (wa->meta.rent_epoch != UINT64_MAX &&
-            sol_account_is_rent_exempt(wa,
-                                        bank->config.rent_per_byte_year,
-                                        bank->config.rent_exemption_threshold)) {
-            wa->meta.rent_epoch = UINT64_MAX;
-            (void)sol_bank_store_account(bank, &tx_account_keys[ri], wa);
-        }
-        sol_account_destroy(wa);
+
+        sol_account_destroy(wa_view);
     }
+
+    /* Prepare an invoke context template once per transaction and reuse it for
+     * all top-level instructions. This avoids re-deriving demoted writable and
+     * signer flags per instruction (hot path). */
+    bool local_is_signer[SOL_MAX_MESSAGE_ACCOUNTS];
+    const bool* is_signer_view = NULL;
+    if (tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+        tx->message.resolved_accounts_len != 0 &&
+        tx->message.is_signer &&
+        tx_account_keys_len == (size_t)tx->message.resolved_accounts_len) {
+        is_signer_view = tx->message.is_signer;
+    } else {
+        for (size_t si = 0; si < tx_account_keys_len && si < SOL_MAX_MESSAGE_ACCOUNTS; si++) {
+            local_is_signer[si] = sol_message_is_signer(&tx->message, (uint8_t)si);
+        }
+        is_signer_view = local_is_signer;
+    }
+
+    sol_invoke_context_t invoke_ctx = {
+        .bank = bank,
+        .account_keys = tx_account_keys,
+        .account_keys_len = (uint8_t)tx_account_keys_len,
+        .is_writable = demoted_is_writable,
+        .is_signer = is_signer_view,
+        .tx_signature = sol_transaction_signature(tx),
+        .num_signers = tx->message.header.num_required_signatures,
+        .stack_height = 1,
+        .compute_budget = &compute_budget,
+        .compute_meter = &compute_meter,
+        .compute_units_accounted = 0,
+        .transaction = tx,
+        .current_instruction_index = 0,
+        .instruction_trace = &instruction_trace,
+    };
+    fill_invoke_sysvars(&invoke_ctx, bank);
 
     /* 7. Execute instructions */
     for (uint8_t i = 0; i < tx->message.instructions_len; i++) {
         const sol_compiled_instruction_t* instr = &tx->message.instructions[i];
-
-        sol_err_t instr_sysvar_err = update_instructions_sysvar_account(bank, tx, i);
-        if (instr_sysvar_err != SOL_OK) {
-            result.status = instr_sysvar_err;
-            result.compute_units_used = compute_meter.consumed;
-            bank->stats.compute_units_used += result.compute_units_used;
-            bank->stats.transactions_failed++;
-            /* Roll back all account writes from this transaction */
-            rollback_snapshot_restore(bank, tx, rollback_accounts, rollback_local_kinds,
-                                     rollback_accounts_len, rollback_instructions_sysvar,
-                                     rollback_instructions_sysvar_kind);
-            if (use_nonce_fee) advance_nonce_on_failure(bank, tx);
-
-            /* Record failed transaction status */
-            const sol_signature_t* sig = sol_transaction_signature(tx);
-            if (sig) {
-                pthread_mutex_unlock(&bank->lock);
-                sol_bank_record_tx_status(bank, sig, result.status,
-                                         result.fee, result.compute_units_used);
-                pthread_mutex_lock(&bank->lock);
-            }
-
-            rollback_snapshot_free(rollback_accounts, rollback_accounts_len,
-                                   rollback_local_kinds,
-                                   rollback_instructions_sysvar);
-            rollback_accounts = NULL;
-            rollback_accounts_len = 0;
-            rollback_instructions_sysvar = NULL;
-            rollback_local_kinds = NULL;
-
-            goto unlock_and_return;
+        if (tx_instructions_sysvar) {
+            bank_set_instructions_sysvar_current(tx_instructions_sysvar, (uint16_t)i);
         }
 
-        sol_err_t instr_err = execute_instruction(bank, tx, instr, i, &compute_budget, &compute_meter, &instruction_trace);
+        sol_err_t instr_err = execute_instruction_prepared(&invoke_ctx, instr, i);
         if (instr_err != SOL_OK) {
             result.status = instr_err;
             result.compute_units_used = compute_meter.consumed;
-            bank->stats.compute_units_used += result.compute_units_used;
-            bank->stats.transactions_failed++;
+            BANK_STAT_ADD(bank, compute_units_used, result.compute_units_used);
+            BANK_STAT_INC(bank, transactions_failed);
 
             /* Log execution failure details for debugging */
             {
@@ -4013,77 +5809,102 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
                 if (dbg_sig) {
                     sol_signature_to_base58(dbg_sig, sig_b58, sizeof(sig_b58));
                 }
-                sol_log_info("execution_failed: slot=%lu instr=%u program=%s err=%d(%s) "
+                sol_log_debug("execution_failed: slot=%lu instr=%u program=%s err=%d(%s) "
                              "cu=%lu sig=%s",
                              (unsigned long)bank->slot, (unsigned)i, prog_b58,
                              instr_err, sol_err_str(instr_err),
                              (unsigned long)compute_meter.consumed,
                              sig_b58[0] ? sig_b58 : "none");
             }
-            /* Roll back all account writes from this transaction */
-            rollback_snapshot_restore(bank, tx, rollback_accounts, rollback_local_kinds,
-                                     rollback_accounts_len, rollback_instructions_sysvar,
-                                     rollback_instructions_sysvar_kind);
+            /* Roll back all account writes from this transaction. */
+            bank_tx_undo_rollback(bank);
             if (use_nonce_fee) advance_nonce_on_failure(bank, tx);
-
-            /* Record failed transaction status */
-            const sol_signature_t* sig = sol_transaction_signature(tx);
-            if (sig) {
-                pthread_mutex_unlock(&bank->lock);
-                sol_bank_record_tx_status(bank, sig, result.status,
-                                         result.fee, result.compute_units_used);
-                pthread_mutex_lock(&bank->lock);
-            }
-
-            rollback_snapshot_free(rollback_accounts, rollback_accounts_len,
-                                   rollback_local_kinds,
-                                   rollback_instructions_sysvar);
-            rollback_accounts = NULL;
-            rollback_accounts_len = 0;
-            rollback_instructions_sysvar = NULL;
-            rollback_local_kinds = NULL;
 
             goto unlock_and_return;
         }
     }
 
     /* Post-execution rent state transition check (InsufficientFundsForRent).
-     * After all instructions execute successfully, verify that no writable
-     * account transitioned into an invalid rent state.  Agave performs this
-     * check in TransactionAccountStateInfo::verify_changes(). */
+     *
+     * The exact Agave logic checks all writable accounts in the message. We can
+     * safely restrict this to accounts that were actually written during this
+     * transaction (i.e., entries in the undo log). An account that did not have
+     * any store/delete cannot have changed lamports/data_len, so it cannot have
+     * transitioned into an invalid rent state. */
     {
         sol_err_t rent_err = SOL_OK;
         uint8_t rent_fail_index = 0;
+        sol_pubkey_t rent_fail_key = {0};
+        uint64_t rent_pre_lamports = 0;
+        size_t rent_pre_data_len = 0;
+        uint64_t rent_post_lamports = 0;
+        size_t rent_post_data_len = 0;
 
-        for (size_t ri = 0; ri < tx_account_keys_len; ri++) {
-            if (!bank_message_is_writable_resolved_index(&tx->message, (uint8_t)ri))
-                continue;
+        const bank_tx_undo_log_t* undo = &g_tls_tx_undo;
+        for (size_t ui = 0; ui < undo->len; ui++) {
+            const bank_tx_undo_entry_t* ue = &undo->entries[ui];
+
+            /* Find key in message account list (for writability). */
+            size_t ri = (size_t)-1;
+            for (size_t ti = 0; ti < tx_account_keys_len && ti < SOL_MAX_MESSAGE_ACCOUNTS; ti++) {
+                if (sol_pubkey_eq(&tx_account_keys[ti], &ue->key)) {
+                    ri = ti;
+                    break;
+                }
+            }
+            if (ri == (size_t)-1) continue;
+            if (ri < SOL_MAX_MESSAGE_ACCOUNTS && !demoted_is_writable[ri]) continue;
 
             /* Skip the incinerator account */
-            if (sol_pubkey_eq(&tx_account_keys[ri], &SOL_INCINERATOR_ID))
-                continue;
+            if (sol_pubkey_eq(&ue->key, &SOL_INCINERATOR_ID)) continue;
 
-            /* Get pre-execution state from rollback snapshot.
-             * In overlay mode, rollback_accounts[ri] is NULL when the
-             * account was not in the local overlay before execution.
-             * In that case, load the pre-state from the PARENT DB
-             * (which includes changes from prior slots in the chain). */
-            const sol_account_t* pre = rollback_accounts[ri];
-            sol_account_t* pre_from_root = NULL;
-            if (!pre && rollback_local_kinds &&
-                rollback_local_kinds[ri] == (uint8_t)SOL_ACCOUNTS_DB_LOCAL_MISSING) {
-                sol_accounts_db_t* parent_db = sol_accounts_db_get_parent(bank->accounts_db);
-                pre_from_root = parent_db ? sol_accounts_db_load(parent_db, &tx_account_keys[ri]) : NULL;
-                pre = pre_from_root;
+            uint64_t pre_lamports = 0;
+            size_t pre_data_len = 0;
+
+            if (ue->kind == BANK_TX_UNDO_KIND_ACCOUNT && ue->account) {
+                pre_lamports = ue->account->meta.lamports;
+                pre_data_len = ue->account->meta.data_len;
+            } else if (ue->kind == BANK_TX_UNDO_KIND_TOMBSTONE) {
+                pre_lamports = 0;
+                pre_data_len = 0;
+            } else {
+                if (undo->overlay) {
+                    bank_prev_meta_hint_t prev = {0};
+                    if (bank_prev_meta_hints_get(&ue->key, &prev)) {
+                        pre_lamports = prev.lamports;
+                        pre_data_len = prev.data_len;
+                    } else {
+                        sol_accounts_db_t* parent_db = sol_accounts_db_get_parent(bank->accounts_db);
+                        sol_account_t* pre_acc = parent_db ? sol_accounts_db_load_view(parent_db, &ue->key) : NULL;
+                        if (pre_acc) {
+                            pre_lamports = pre_acc->meta.lamports;
+                            pre_data_len = pre_acc->meta.data_len;
+                            sol_account_destroy(pre_acc);
+                        }
+                    }
+                }
             }
-            uint64_t pre_lamports = pre ? pre->meta.lamports : 0;
-            size_t   pre_data_len = pre ? pre->meta.data_len : 0;
 
-            /* Get post-execution state from current accounts DB */
-            sol_account_t* post = sol_accounts_db_load(bank->accounts_db,
-                                                        &tx_account_keys[ri]);
-            uint64_t post_lamports = post ? post->meta.lamports : 0;
-            size_t   post_data_len = post ? post->meta.data_len : 0;
+            uint64_t post_lamports = 0;
+            size_t post_data_len = 0;
+            sol_pubkey_t post_owner = (sol_pubkey_t){{0}};
+            bool post_executable = false;
+            if (ue->post_valid) {
+                post_lamports = ue->post_lamports;
+                post_data_len = ue->post_data_len;
+                post_owner = ue->post_owner;
+                post_executable = ue->post_executable != 0;
+            } else {
+                /* Defensive fallback: should not happen for undo-tracked writes. */
+                sol_account_t* post_acc = sol_accounts_db_load_view(bank->accounts_db, &ue->key);
+                if (post_acc) {
+                    post_lamports = post_acc->meta.lamports;
+                    post_data_len = post_acc->meta.data_len;
+                    post_owner = post_acc->meta.owner;
+                    post_executable = post_acc->meta.executable;
+                    sol_account_destroy(post_acc);
+                }
+            }
 
             uint64_t rent_per_byte = bank->config.rent_per_byte_year;
             uint64_t rent_thresh   = bank->config.rent_exemption_threshold;
@@ -4094,10 +5915,6 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
                                                                 rent_per_byte,
                                                                 rent_thresh);
 
-            /* Determine pre and post rent states:
-             *   Uninitialized = lamports == 0
-             *   RentExempt    = lamports >= minimum
-             *   RentPaying    = 0 < lamports < minimum */
             enum { RS_UNINIT, RS_RENT_PAYING, RS_RENT_EXEMPT } pre_state, post_state;
             if (pre_lamports == 0)           pre_state = RS_UNINIT;
             else if (pre_lamports >= pre_min) pre_state = RS_RENT_EXEMPT;
@@ -4107,31 +5924,36 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
             else if (post_lamports >= post_min) post_state = RS_RENT_EXEMPT;
             else                                post_state = RS_RENT_PAYING;
 
-            /* Check transition validity:
-             *   -> Uninitialized: always OK
-             *   -> RentExempt:    always OK
-             *   -> RentPaying:    only OK if was already RentPaying with same
-             *                     data_size and lamports did not increase */
             bool transition_ok;
             if (post_state == RS_UNINIT || post_state == RS_RENT_EXEMPT) {
                 transition_ok = true;
             } else {
-                /* post_state == RS_RENT_PAYING */
-                if (pre_state == RS_RENT_PAYING &&
-                    post_data_len == pre_data_len &&
-                    post_lamports <= pre_lamports) {
-                    transition_ok = true;
-                } else {
-                    transition_ok = false;
-                }
-            }
+                /* Prevent transactions from creating rent-paying accounts
+                 * with data (or changing a rent-exempt account into rent-paying).
+                 *
+                 * Exception: system-owned, non-executable, zero-data "dust"
+                 * accounts can be created via SystemProgram::Transfer. */
+                bool is_system_dust =
+                    (pre_state == RS_UNINIT) &&
+                    (post_data_len == 0) &&
+                    (!post_executable) &&
+                    sol_pubkey_eq(&post_owner, &SOL_SYSTEM_PROGRAM_ID);
 
-            if (post) sol_account_destroy(post);
-            if (pre_from_root) sol_account_destroy(pre_from_root);
+                bool was_rent_paying_no_resize =
+                    (pre_state == RS_RENT_PAYING) &&
+                    (post_data_len == pre_data_len);
+
+                transition_ok = is_system_dust || was_rent_paying_no_resize;
+            }
 
             if (!transition_ok) {
                 rent_err = SOL_ERR_TX_INSUFFICIENT_FUNDS_FOR_RENT;
                 rent_fail_index = (uint8_t)ri;
+                rent_fail_key = ue->key;
+                rent_pre_lamports = pre_lamports;
+                rent_pre_data_len = pre_data_len;
+                rent_post_lamports = post_lamports;
+                rent_post_data_len = post_data_len;
                 break;
             }
         }
@@ -4139,57 +5961,33 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
         if (rent_err != SOL_OK) {
             result.status = rent_err;
             result.compute_units_used = compute_meter.consumed;
-            bank->stats.compute_units_used += result.compute_units_used;
-            bank->stats.transactions_failed++;
+            BANK_STAT_ADD(bank, compute_units_used, result.compute_units_used);
+            BANK_STAT_INC(bank, transactions_failed);
 
-            {
+            if (bank_rent_diag_enable()) {
                 const sol_signature_t* rent_sig = sol_transaction_signature(tx);
                 char rent_sig_b58[SOL_SIGNATURE_BASE58_LEN] = {0};
                 if (rent_sig) sol_signature_to_base58(rent_sig, rent_sig_b58, sizeof(rent_sig_b58));
                 char acct_b58[45] = {0};
-                sol_pubkey_to_base58(&tx_account_keys[rent_fail_index], acct_b58, sizeof(acct_b58));
-                /* Load pre/post for diagnostic */
-                const sol_account_t* diag_pre = rollback_accounts[rent_fail_index];
-                sol_account_t* diag_post = sol_accounts_db_load(bank->accounts_db,
-                                                                 &tx_account_keys[rent_fail_index]);
+                sol_pubkey_to_base58(&rent_fail_key, acct_b58, sizeof(acct_b58));
                 sol_log_info("rent_state_check_failed: slot=%lu account_index=%u sig=%s "
                              "account=%s pre_lamports=%lu pre_data_len=%zu "
                              "post_lamports=%lu post_data_len=%zu is_writable=%d",
                              (unsigned long)bank->slot, (unsigned)rent_fail_index,
                              rent_sig_b58[0] ? rent_sig_b58 : "none",
                              acct_b58,
-                             diag_pre ? (unsigned long)diag_pre->meta.lamports : 0UL,
-                             diag_pre ? diag_pre->meta.data_len : 0UL,
-                             diag_post ? (unsigned long)diag_post->meta.lamports : 0UL,
-                             diag_post ? diag_post->meta.data_len : 0UL,
-                             (int)bank_message_is_writable_resolved_index(&tx->message,
-                                                                          (uint8_t)rent_fail_index));
-                if (diag_post) sol_account_destroy(diag_post);
+                             (unsigned long)rent_pre_lamports,
+                             rent_pre_data_len,
+                             (unsigned long)rent_post_lamports,
+                             rent_post_data_len,
+                             (int)((rent_fail_index < SOL_MAX_MESSAGE_ACCOUNTS)
+                                   ? demoted_is_writable[rent_fail_index]
+                                   : 0));
             }
 
-            /* Roll back all account writes from this transaction */
-            rollback_snapshot_restore(bank, tx, rollback_accounts, rollback_local_kinds,
-                                     rollback_accounts_len, rollback_instructions_sysvar,
-                                     rollback_instructions_sysvar_kind);
+            /* Roll back all account writes from this transaction. */
+            bank_tx_undo_rollback(bank);
             if (use_nonce_fee) advance_nonce_on_failure(bank, tx);
-
-            /* Record failed transaction status */
-            const sol_signature_t* sig = sol_transaction_signature(tx);
-            if (sig) {
-                pthread_mutex_unlock(&bank->lock);
-                sol_bank_record_tx_status(bank, sig, result.status,
-                                         result.fee, result.compute_units_used);
-                pthread_mutex_lock(&bank->lock);
-            }
-
-            rollback_snapshot_free(rollback_accounts, rollback_accounts_len,
-                                   rollback_local_kinds,
-                                   rollback_instructions_sysvar);
-            rollback_accounts = NULL;
-            rollback_accounts_len = 0;
-            rollback_instructions_sysvar = NULL;
-            rollback_local_kinds = NULL;
-
             goto unlock_and_return;
         }
     }
@@ -4197,144 +5995,23 @@ sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
     /* Success */
     result.status = SOL_OK;
     result.compute_units_used = compute_meter.consumed;
-    bank->stats.compute_units_used += result.compute_units_used;
-    bank->stats.transactions_succeeded++;
+    BANK_STAT_ADD(bank, compute_units_used, result.compute_units_used);
+    BANK_STAT_INC(bank, transactions_succeeded);
 
-    /* Restore Instructions sysvar to pre-transaction state.
-     * In Agave the Instructions sysvar is virtual (only available during
-     * instruction execution) and never persists in the accounts DB.  Our
-     * implementation stores it as a real account via
-     * update_instructions_sysvar_account(), so we must clean it up after
-     * the transaction to avoid polluting the lt_hash. */
-    {
-        bool overlay = rollback_local_kinds != NULL;
-        if (!overlay) {
-            if (rollback_instructions_sysvar) {
-                (void)sol_bank_store_account(bank,
-                                             &SOL_SYSVAR_INSTRUCTIONS_ID,
-                                             rollback_instructions_sysvar);
-            } else {
-                (void)bank_delete_account(bank, &SOL_SYSVAR_INSTRUCTIONS_ID);
-            }
-        } else {
-            switch (rollback_instructions_sysvar_kind) {
-                case SOL_ACCOUNTS_DB_LOCAL_ACCOUNT:
-                    if (rollback_instructions_sysvar) {
-                        (void)sol_bank_store_account(bank,
-                                                     &SOL_SYSVAR_INSTRUCTIONS_ID,
-                                                     rollback_instructions_sysvar);
-                    } else {
-                        (void)sol_accounts_db_clear_override(bank->accounts_db,
-                                                            &SOL_SYSVAR_INSTRUCTIONS_ID);
-                    }
-                    break;
-                case SOL_ACCOUNTS_DB_LOCAL_TOMBSTONE:
-                    (void)bank_delete_account(bank, &SOL_SYSVAR_INSTRUCTIONS_ID);
-                    break;
-                case SOL_ACCOUNTS_DB_LOCAL_MISSING:
-                default:
-                    (void)sol_accounts_db_clear_override(bank->accounts_db,
-                                                        &SOL_SYSVAR_INSTRUCTIONS_ID);
-                    break;
-            }
-        }
-    }
-
-    /* Per-transaction lamport conservation check (diagnostic).
-     * Use the rollback snapshot for accounts that WERE in the overlay
-     * (LOCAL_ACCOUNT), and load from parent DB for accounts that were
-     * NOT in the overlay (LOCAL_MISSING). This avoids false positives
-     * from pre-existing parent DB accounts. */
-    {
-        bool has_overlay = rollback_local_kinds != NULL;
-        int128 pre_total = 0;
-        int128 post_total = 0;
-        for (size_t ci = 0; ci < rollback_accounts_len && ci < tx_account_keys_len; ci++) {
-            uint64_t pre_lam;
-            if (rollback_accounts[ci]) {
-                pre_lam = rollback_accounts[ci]->meta.lamports;
-            } else if (has_overlay && rollback_local_kinds[ci] == (uint8_t)SOL_ACCOUNTS_DB_LOCAL_MISSING) {
-                /* Account was not in overlay before execution — load from PARENT DB
-                 * (not root!) to get correct pre-lamports. The parent chain includes
-                 * changes from prior slots. For successful txns (no rollback), the
-                 * current overlay contains post-execution state, so we must skip it. */
-                sol_accounts_db_t* parent_db = sol_accounts_db_get_parent(bank->accounts_db);
-                sol_account_t* parent_acc = parent_db ? sol_accounts_db_load(parent_db, &tx_account_keys[ci]) : NULL;
-                pre_lam = parent_acc ? parent_acc->meta.lamports : 0;
-                if (parent_acc) sol_account_destroy(parent_acc);
-            } else {
-                pre_lam = 0;
-            }
-            pre_total += (int128)pre_lam;
-            sol_account_t* post_acc = sol_accounts_db_load(bank->accounts_db, &tx_account_keys[ci]);
-            uint64_t post_lam = post_acc ? post_acc->meta.lamports : 0;
-            post_total += (int128)post_lam;
-            if (post_acc) sol_account_destroy(post_acc);
-        }
-        int128 lamport_delta = post_total - pre_total;
-        if (lamport_delta != 0) {
-            const sol_signature_t* csig = sol_transaction_signature(tx);
-            char csig_b58[SOL_SIGNATURE_BASE58_LEN] = {0};
-            if (csig) sol_signature_to_base58(csig, csig_b58, sizeof(csig_b58));
-            char fp_b58[SOL_PUBKEY_BASE58_LEN] = {0};
-            sol_pubkey_to_base58(fee_payer, fp_b58, sizeof(fp_b58));
-            sol_log_info("LAMPORT_VIOLATION: slot=%lu delta=%lld fee=%lu payer=%s sig=%s accounts=%zu",
-                         (unsigned long)bank->slot, (long long)(int64_t)lamport_delta,
-                         (unsigned long)result.fee, fp_b58,
-                         csig_b58[0] ? csig_b58 : "none",
-                         rollback_accounts_len);
-            for (size_t ci = 0; ci < rollback_accounts_len && ci < tx_account_keys_len && ci < 32; ci++) {
-                uint64_t pre_lam;
-                const char* pre_src;
-                if (rollback_accounts[ci]) {
-                    pre_lam = rollback_accounts[ci]->meta.lamports;
-                    pre_src = "clone";
-                } else if (has_overlay && rollback_local_kinds[ci] == (uint8_t)SOL_ACCOUNTS_DB_LOCAL_MISSING) {
-                    sol_accounts_db_t* parent_db2 = sol_accounts_db_get_parent(bank->accounts_db);
-                    sol_account_t* parent_acc = parent_db2 ? sol_accounts_db_load(parent_db2, &tx_account_keys[ci]) : NULL;
-                    pre_lam = parent_acc ? parent_acc->meta.lamports : 0;
-                    if (parent_acc) sol_account_destroy(parent_acc);
-                    pre_src = "parent";
-                } else {
-                    pre_lam = 0;
-                    pre_src = has_overlay ? "tomb/0" : "noovl";
-                }
-                sol_account_t* post_acc = sol_accounts_db_load(bank->accounts_db, &tx_account_keys[ci]);
-                uint64_t post_lam = post_acc ? post_acc->meta.lamports : 0;
-                if (pre_lam != post_lam) {
-                    char ak_b58[SOL_PUBKEY_BASE58_LEN] = {0};
-                    sol_pubkey_to_base58(&tx_account_keys[ci], ak_b58, sizeof(ak_b58));
-                    sol_log_info("  account[%zu] %s pre=%lu post=%lu diff=%lld src=%s",
-                                ci, ak_b58, (unsigned long)pre_lam, (unsigned long)post_lam,
-                                (long long)((int64_t)post_lam - (int64_t)pre_lam), pre_src);
-                }
-                if (post_acc) sol_account_destroy(post_acc);
-            }
-        }
-    }
-
-    /* Discard rollback snapshot */
-    rollback_snapshot_free(rollback_accounts, rollback_accounts_len,
-                           rollback_local_kinds,
-                           rollback_instructions_sysvar);
-    rollback_accounts = NULL;
-    rollback_accounts_len = 0;
-    rollback_instructions_sysvar = NULL;
-    rollback_local_kinds = NULL;
-
-    /* Record successful transaction status */
-    const sol_signature_t* sig = sol_transaction_signature(tx);
-    if (sig) {
-        pthread_mutex_unlock(&bank->lock);
-        sol_bank_record_tx_status(bank, sig, result.status,
-                                 result.fee, result.compute_units_used);
-        pthread_mutex_lock(&bank->lock);
-    }
+    /* Instructions sysvar is tx-local and provided via TLS override (not stored
+     * into AccountsDB), so no post-tx cleanup is necessary here. */
 
     goto unlock_and_return;
 
 unlock_and_return:
     sol_instruction_trace_destroy(&instruction_trace);
+    g_tls_instructions_sysvar = NULL;
+    bank_prev_meta_hints_reset();
+    bank_tx_undo_end();
+    if (tx_instructions_sysvar) {
+        sol_account_destroy(tx_instructions_sysvar);
+        tx_instructions_sysvar = NULL;
+    }
     if (resolved_override) {
         sol_message_t* msg = (sol_message_t*)&tx->message;
         msg->resolved_accounts = saved_resolved_accounts;
@@ -4343,15 +6020,53 @@ unlock_and_return:
         msg->is_signer = saved_is_signer;
     }
 
+    /* Update the reserved tx-status entry for all non-duplicate sanitized txs,
+     * including early-exit paths like SOL_SKIP_INSTRUCTION_EXEC. */
+    if (enable_tx_status_cache && reserved_tx_status && tx_sig) {
+        sol_bank_record_tx_status(bank,
+                                  tx_sig,
+                                  result.status,
+                                  result.fee,
+                                  result.compute_units_used);
+    }
+
+    if (slow_tx_t0) {
+        uint64_t dt_ns = bank_monotonic_ns() - slow_tx_t0;
+        if (dt_ns >= slow_tx_thresh_ns) {
+            char sig_b58[SOL_SIGNATURE_BASE58_LEN] = {0};
+            if (tx_sig) {
+                sol_signature_to_base58(tx_sig, sig_b58, sizeof(sig_b58));
+            }
+
+            const sol_pubkey_t* payer = sol_message_fee_payer(&tx->message);
+            char payer_b58[SOL_PUBKEY_BASE58_LEN] = {0};
+            if (payer) {
+                sol_pubkey_to_base58(payer, payer_b58, sizeof(payer_b58));
+            }
+
+            sol_log_info("SLOW_TX: slot=%lu dur_ms=%.3f err=%d cu=%lu fee=%lu payer=%s sig=%s",
+                         (unsigned long)bank->slot,
+                         (double)dt_ns / 1e6,
+                         result.status,
+                         (unsigned long)result.compute_units_used,
+                         (unsigned long)result.fee,
+                         payer_b58[0] ? payer_b58 : "none",
+                         sig_b58[0] ? sig_b58 : "none");
+        }
+    }
+
     /* Log per-transaction result for parity comparison.
      * Only enabled when SOL_LOG_TX_RESULTS env var is set (checked once). */
     {
         static int log_tx_results = -1;
-        if (__builtin_expect(log_tx_results < 0, 0)) {
+        int ltr = __atomic_load_n(&log_tx_results, __ATOMIC_ACQUIRE);
+        if (__builtin_expect(ltr < 0, 0)) {
             const char* env = getenv("SOL_LOG_TX_RESULTS");
-            log_tx_results = (env && env[0] && env[0] != '0') ? 1 : 0;
+            int enabled = (env && env[0] && env[0] != '0') ? 1 : 0;
+            __atomic_store_n(&log_tx_results, enabled, __ATOMIC_RELEASE);
+            ltr = enabled;
         }
-        if (__builtin_expect(log_tx_results, 0)) {
+        if (__builtin_expect(ltr != 0, 0)) {
             const sol_signature_t* tx_sig = sol_transaction_signature(tx);
             char tx_sig_b58[SOL_SIGNATURE_BASE58_LEN] = {0};
             if (tx_sig) {
@@ -4370,19 +6085,3097 @@ unlock_and_return:
         }
     }
 
-    pthread_mutex_unlock(&bank->lock);
     return result;
+}
+
+sol_tx_result_t
+sol_bank_process_transaction(sol_bank_t* bank, const sol_transaction_t* tx) {
+    return sol_bank_process_transaction_impl(bank, tx, true);
+}
+
+static sol_tx_result_t
+sol_bank_process_transaction_parallel(sol_bank_t* bank, const sol_transaction_t* tx) {
+    return sol_bank_process_transaction_impl(bank, tx, false);
+}
+
+/* ---- Upgradeable ProgramData address cache (for parallel scheduling) ---- */
+
+typedef struct {
+    pthread_rwlock_t  lock;
+    bool              inited;
+    sol_pubkey_map_t* map; /* program_id -> programdata pubkey (all-zero = not upgradeable/unknown) */
+} bank_progdata_cache_t;
+
+static bank_progdata_cache_t g_bank_progdata_cache;
+static pthread_once_t        g_bank_progdata_cache_once = PTHREAD_ONCE_INIT;
+
+static void
+bank_progdata_cache_destroy(void) {
+    bank_progdata_cache_t* c = &g_bank_progdata_cache;
+    if (!c->inited) return;
+    if (c->map) {
+        sol_pubkey_map_destroy(c->map);
+        c->map = NULL;
+    }
+    pthread_rwlock_destroy(&c->lock);
+    c->inited = false;
+}
+
+static void
+bank_progdata_cache_init_once(void) {
+    bank_progdata_cache_t* c = &g_bank_progdata_cache;
+    memset(c, 0, sizeof(*c));
+    if (pthread_rwlock_init(&c->lock, NULL) != 0) {
+        return;
+    }
+    c->map = sol_pubkey_map_new(sizeof(sol_pubkey_t), 1024u);
+    c->inited = true;
+    atexit(bank_progdata_cache_destroy);
+}
+
+static inline bool
+bank_progdata_cache_available(void) {
+    (void)pthread_once(&g_bank_progdata_cache_once, bank_progdata_cache_init_once);
+    return g_bank_progdata_cache.inited && g_bank_progdata_cache.map != NULL;
+}
+
+/* Returns: 1 = hit with non-zero ProgramData pubkey
+ *          0 = hit with negative cache (zero pubkey)
+ *         -1 = miss / cache unavailable */
+static int
+bank_progdata_cache_get(const sol_pubkey_t* program_id, sol_pubkey_t* out_programdata) {
+    if (out_programdata) {
+        memset(out_programdata, 0, sizeof(*out_programdata));
+    }
+    if (!program_id || !out_programdata) return -1;
+    if (!bank_progdata_cache_available()) return -1;
+
+    bank_progdata_cache_t* c = &g_bank_progdata_cache;
+    pthread_rwlock_rdlock(&c->lock);
+    sol_pubkey_t* slot = (sol_pubkey_t*)sol_pubkey_map_get(c->map, program_id);
+    if (!slot) {
+        pthread_rwlock_unlock(&c->lock);
+        return -1;
+    }
+    *out_programdata = *slot;
+    pthread_rwlock_unlock(&c->lock);
+    return sol_pubkey_is_zero(out_programdata) ? 0 : 1;
+}
+
+static void
+bank_progdata_cache_put(const sol_pubkey_t* program_id, const sol_pubkey_t* programdata) {
+    if (!program_id || !programdata) return;
+    if (!bank_progdata_cache_available()) return;
+
+    bank_progdata_cache_t* c = &g_bank_progdata_cache;
+    pthread_rwlock_wrlock(&c->lock);
+    sol_pubkey_t val = *programdata;
+    (void)sol_pubkey_map_insert(c->map, program_id, &val);
+    pthread_rwlock_unlock(&c->lock);
+}
+
+void
+sol_bank_programdata_cache_invalidate_program(const sol_pubkey_t* program_id) {
+    if (!program_id) return;
+    if (!bank_progdata_cache_available()) return;
+
+    bank_progdata_cache_t* c = &g_bank_progdata_cache;
+    pthread_rwlock_wrlock(&c->lock);
+    if (c->map) {
+        (void)sol_pubkey_map_remove(c->map, program_id);
+    }
+    pthread_rwlock_unlock(&c->lock);
+}
+
+void
+sol_bank_programdata_cache_invalidate_programdata(const sol_pubkey_t* programdata_id) {
+    (void)programdata_id;
+    /* Conservatively clear the cache. Upgrades/extensions are rare and the cache
+     * is tiny (hot programs). Keeping a reverse map isn't worth it. */
+    if (!bank_progdata_cache_available()) return;
+
+    bank_progdata_cache_t* c = &g_bank_progdata_cache;
+    pthread_rwlock_wrlock(&c->lock);
+    if (c->map) {
+        sol_map_clear(c->map->inner);
+    }
+    pthread_rwlock_unlock(&c->lock);
+}
+
+/* Best-effort: for an upgradeable BPF program account, extract its ProgramData
+ * address (which is implicitly read when executing the program). */
+static bool
+bank_get_upgradeable_programdata_pubkey(sol_bank_t* bank,
+                                        const sol_pubkey_t* program_id,
+                                        sol_pubkey_t* out_programdata) {
+    if (out_programdata) {
+        memset(out_programdata, 0, sizeof(*out_programdata));
+    }
+    if (!bank || !bank->accounts_db || !program_id || !out_programdata) {
+        return false;
+    }
+
+    /* Hot path: program-id -> ProgramData is stable and reused for many txs.
+     * Avoid re-loading the program account for every transaction. */
+    int cached = bank_progdata_cache_get(program_id, out_programdata);
+    if (cached == 1) return true;
+    if (cached == 0) return false;
+
+    sol_account_t* program_account = sol_accounts_db_load(bank->accounts_db, program_id);
+    if (!program_account) {
+        sol_pubkey_t zero = {0};
+        bank_progdata_cache_put(program_id, &zero);
+        return false;
+    }
+
+    bool ok = false;
+    if (sol_pubkey_eq(&program_account->meta.owner, &SOL_BPF_LOADER_UPGRADEABLE_ID) &&
+        program_account->data &&
+        program_account->meta.data_len >= (4u + 32u)) {
+        uint32_t typ = 0;
+        memcpy(&typ, program_account->data, 4u);
+        if (typ == 2u) { /* UpgradeableLoaderState::Program */
+            memcpy(out_programdata->bytes, program_account->data + 4u, 32u);
+            ok = !sol_pubkey_is_zero(out_programdata);
+        }
+    }
+
+    if (ok) {
+        bank_progdata_cache_put(program_id, out_programdata);
+    } else {
+        sol_pubkey_t zero = {0};
+        bank_progdata_cache_put(program_id, &zero);
+    }
+
+    sol_account_destroy(program_account);
+    return ok;
+}
+
+/* ---- Parallel transaction execution (deterministic batching) ---- */
+
+static inline uint64_t
+bank_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+typedef struct {
+    uint64_t seq_calls;
+    uint64_t seq_txs;
+    uint64_t seq_ns;
+    uint64_t par_calls;
+    uint64_t par_txs;
+    uint64_t par_ns;
+} tx_pool_stats_t;
+
+static __thread tx_pool_stats_t* g_tls_tx_pool_stats = NULL;
+
+static bool
+tx_pool_stats_enabled(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) return v != 0;
+    const char* env = getenv("SOL_TX_POOL_STATS");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+typedef enum {
+    TX_POOL_JOB_NONE = 0,
+    TX_POOL_JOB_TXS = 1,
+    TX_POOL_JOB_TX_PTRS = 2,
+    TX_POOL_JOB_LT_HASH_DELTA = 3,
+    TX_POOL_JOB_TX_DAG_PTRS = 4,
+} tx_pool_job_kind_t;
+
+struct sol_tx_pool;
+
+typedef struct {
+    struct sol_tx_pool* p;
+    size_t              thread_idx;
+} tx_pool_worker_ctx_t;
+
+typedef struct sol_tx_pool {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    pthread_cond_t  done;
+    pthread_t*      threads;
+    tx_pool_worker_ctx_t* worker_ctx;
+    size_t          nthreads; /* worker threads (excluding caller thread) */
+    bool            stop;
+    bool            has_job;
+    bool            inited;
+    uint64_t        job_id; /* increments per job; prevents worker re-entering same job */
+    tx_pool_job_kind_t job_kind;
+
+    /* Job (valid while has_job==true) */
+    sol_bank_t*              bank;
+    const sol_transaction_t* txs;
+    const sol_transaction_t* const* tx_ptrs;
+    bool                     use_ptrs;
+    bool                     skip_tx_status;
+    sol_tx_result_t*         results;
+    size_t                   start;
+    size_t                   end;
+    /* DAG scheduler job */
+    const uint32_t*          dag_adj_head;   /* [end) tx-indexed adjacency list heads */
+    const uint32_t*          dag_edge_to;    /* [edge_count) */
+    const uint32_t*          dag_edge_next;  /* [edge_count) */
+    uint32_t*                dag_indegree;   /* [end) */
+    uint32_t*                dag_ready_next; /* [end) tx-indexed ready-stack next pointers */
+    volatile uint32_t        dag_ready_head; /* tx index or UINT32_MAX */
+    volatile uint32_t        dag_remaining;  /* number of txs remaining in this DAG segment */
+    /* LtHash delta job */
+    const sol_accounts_db_local_entry_t* lthash_entries;
+    sol_accounts_db_t*                  lthash_parent;
+    sol_lt_hash_t*                      lthash_partials; /* [nthreads + 1] incl caller */
+    size_t                   next;   /* atomic fetch-add cursor (0..len) */
+    size_t                   active; /* participants remaining (threads + caller) */
+    size_t                   wake;   /* number of worker threads permitted to join this job */
+} sol_tx_pool_t;
+
+static sol_tx_pool_t      g_tx_pool;
+static pthread_once_t     g_tx_pool_once = PTHREAD_ONCE_INIT;
+
+static bool
+tx_parallel_enabled(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) {
+        return v != 0;
+    }
+
+    /* Default: enabled. Set SOL_TX_PARALLEL=0 to disable. */
+    int enabled = 1;
+    const char* env = getenv("SOL_TX_PARALLEL");
+    if (env && env[0] != '\0') {
+        while (*env && isspace((unsigned char)*env)) env++;
+        if (*env == '0' || *env == 'n' || *env == 'N' || *env == 'f' || *env == 'F') {
+            enabled = 0;
+        }
+    }
+
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+tx_wave_sched_enabled(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) return v != 0;
+
+    /* Default: enabled. Set SOL_TX_WAVE_SCHED=0 to use the legacy contiguous
+     * batching scheduler. */
+    int enabled = 1;
+    const char* env = getenv("SOL_TX_WAVE_SCHED");
+    if (env && env[0] != '\0') {
+        while (*env && isspace((unsigned char)*env)) env++;
+        if (*env == '0' || *env == 'n' || *env == 'N' || *env == 'f' || *env == 'F') {
+            enabled = 0;
+        }
+    }
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+tx_dag_sched_enabled(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) return v != 0;
+
+    /* Default: disabled.
+     *
+     * The DAG scheduler is an experimental optimization. On busy mainnet
+     * blocks it can become overly conservative and leave many workers spinning,
+     * inflating slot replay times. Users can re-enable it explicitly via
+     * SOL_TX_DAG_SCHED=1 for experimentation. */
+    int enabled = 0;
+    const char* env = getenv("SOL_TX_DAG_SCHED");
+    if (env && env[0] != '\0') {
+        while (*env && isspace((unsigned char)*env)) env++;
+        if (*env == '0' || *env == 'n' || *env == 'N' || *env == 'f' || *env == 'F') {
+            enabled = 0;
+        } else {
+            enabled = 1;
+        }
+    }
+
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static size_t
+tx_worker_target(void) {
+    const char* env = getenv("SOL_TX_WORKERS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env) {
+            if (v <= 1ul) return 1u;
+            return (size_t)v;
+        }
+    }
+
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) n = 1;
+    /* Default to a moderate worker count.
+     *
+     * Replay on mainnet is extremely CPU-heavy (SBF execution + account loads).
+     * On large machines, the previous cap of 8 workers left a lot of CPU idle,
+     * making it difficult to keep up with wall-clock slot times.
+     *
+     * This still isn't meant to scale linearly with core count due to
+     * shared-state contention and per-wave overhead.  Users can override via
+     * SOL_TX_WORKERS if they want to experiment. */
+    size_t workers = (size_t)n;
+    /* The tx-exec pool is the primary replay throughput lever.  On large
+     * machines (e.g. 96+ cores), the previous cap of 32 workers leaves too much
+     * CPU idle and makes it difficult to catch up to the cluster head. */
+    /* Prefer to use SMT on 128-core EPYC-class hosts (often 256 logical CPUs).
+     * Cap to a reasonable upper bound to avoid runaway thread counts on exotic
+     * hosts; users can still override via SOL_TX_WORKERS. */
+    if (workers > 256u) workers = 256u;
+    return workers;
+}
+
+static size_t
+tx_pool_min_batch(void) {
+    /* Minimum range size to dispatch onto the tx thread-pool.  The default is
+     * conservative: many small "waves" are highly contended, and waking threads
+     * can be more expensive than just running them sequentially. */
+    static size_t cached = 0;
+    size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != 0u, 1)) return v;
+
+    /* Default: balance pool coordination overhead vs parallelism.
+     *
+     * Mainnet workloads often produce many small waves. Parallelizing extremely
+     * small waves (e.g. 2-3 txs) can cost more in wake/sync overhead than it
+     * saves; but leaving medium waves (4-7 txs) sequential leaves a lot of
+     * throughput on the table. Users can still override via
+     * SOL_TX_POOL_MIN_BATCH for experimentation. */
+    size_t min_batch = 2u;
+    const char* env = getenv("SOL_TX_POOL_MIN_BATCH");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env && x > 0ul) {
+            min_batch = (size_t)x;
+        }
+    }
+
+    /* Parallelizing a single tx range does not help and adds overhead. */
+    if (min_batch < 2u) min_batch = 2u;
+    if (min_batch > 1024u) min_batch = 1024u;
+
+    __atomic_store_n(&cached, min_batch, __ATOMIC_RELEASE);
+    return min_batch;
+}
+
+/* ---- Parallel transaction execution (DAG scheduler) ---- */
+
+#define TX_POOL_DAG_NONE UINT32_MAX
+
+static inline void
+tx_pool_dag_ready_push(volatile uint32_t* head, uint32_t* next, uint32_t node) {
+    if (!head || !next) return;
+    uint32_t old = __atomic_load_n(head, __ATOMIC_RELAXED);
+    for (;;) {
+        next[node] = old;
+        if (__atomic_compare_exchange_n(head,
+                                        &old,
+                                        node,
+                                        false,
+                                        __ATOMIC_RELEASE,
+                                        __ATOMIC_RELAXED)) {
+            return;
+        }
+        /* old updated with current head; retry */
+    }
+}
+
+/* Push a pre-linked chain (head..tail) onto the global ready stack using a single
+ * CAS. This reduces contention on `ready_head` under high worker counts. */
+static inline void
+tx_pool_dag_ready_push_chain(volatile uint32_t* head,
+                             uint32_t* next,
+                             uint32_t chain_head,
+                             uint32_t chain_tail) {
+    if (!head || !next) return;
+    if (chain_head == TX_POOL_DAG_NONE || chain_tail == TX_POOL_DAG_NONE) return;
+
+    uint32_t old = __atomic_load_n(head, __ATOMIC_RELAXED);
+    for (;;) {
+        next[chain_tail] = old;
+        if (__atomic_compare_exchange_n(head,
+                                        &old,
+                                        chain_head,
+                                        false,
+                                        __ATOMIC_RELEASE,
+                                        __ATOMIC_RELAXED)) {
+            return;
+        }
+        /* old updated with current head; retry */
+    }
+}
+
+static inline bool
+tx_pool_dag_ready_pop(volatile uint32_t* head, uint32_t* next, uint32_t* out_node) {
+    if (!head || !next || !out_node) return false;
+    uint32_t old = __atomic_load_n(head, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (old == TX_POOL_DAG_NONE) return false;
+        uint32_t nxt = next[old];
+        if (__atomic_compare_exchange_n(head,
+                                        &old,
+                                        nxt,
+                                        false,
+                                        __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+            *out_node = old;
+            return true;
+        }
+        /* old updated with current head; retry */
+    }
+}
+
+/* Pop up to `max_nodes` nodes from the global ready stack in one CAS.
+ *
+ * This reduces contention on `ready_head` under high worker counts.
+ *
+ * The returned list is terminated by `out_stop` (which is the new global head
+ * after the pop). Callers should treat the local list as:
+ *   node = out_head;
+ *   while (node != out_stop) { ...; node = next[node]; }
+ *
+ * NOTE: We deliberately do NOT mutate next[tail] to terminate the list because
+ * other threads may still be traversing the old list prior to a failed CAS. */
+static inline bool
+tx_pool_dag_ready_pop_chain(volatile uint32_t* head,
+                            uint32_t* next,
+                            uint32_t* out_head,
+                            uint32_t* out_stop,
+                            unsigned max_nodes) {
+    if (!head || !next || !out_head || !out_stop || max_nodes == 0u) return false;
+
+    uint32_t old = __atomic_load_n(head, __ATOMIC_ACQUIRE);
+    for (;;) {
+        if (old == TX_POOL_DAG_NONE) return false;
+
+        uint32_t tail = old;
+        unsigned n = 1u;
+        while (n < max_nodes) {
+            uint32_t nxt = next[tail];
+            if (nxt == TX_POOL_DAG_NONE) break;
+            tail = nxt;
+            n++;
+        }
+
+        uint32_t new_head = next[tail];
+
+        if (__atomic_compare_exchange_n(head,
+                                        &old,
+                                        new_head,
+                                        false,
+                                        __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+            *out_head = old;
+            *out_stop = new_head;
+            return true;
+        }
+
+        /* old updated with current head; retry */
+    }
+}
+
+static inline void
+tx_pool_cpu_pause(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause");
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
+
+static inline bool
+tx_pool_big_core_host(void) {
+    /* Avoid scheduler yields on big hosts: `sched_yield()` can introduce
+     * millisecond-scale latency when the runqueue is saturated, which shows up
+     * as replay "pauses" and inflates p95/p99 slot times. */
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) return v != 0;
+
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int big = (ncpu >= 64) ? 1 : 0;
+    __atomic_store_n(&cached, big, __ATOMIC_RELEASE);
+    return big != 0;
+}
+
+static inline unsigned
+tx_pool_dag_pop_batch(void) {
+    /* Tuning knob for the DAG scheduler. Very large pop batches cause work
+     * hoarding (few workers active, others spin on an empty global queue) and
+     * amplify ready-queue traversal costs. Keep the default small on big-core
+     * machines; allow override for experimentation. */
+    static unsigned cached = 0u;
+    unsigned v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != 0u, 1)) return v;
+
+    unsigned pop = 16u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu > 0 && ncpu <= 16) pop = 64u;
+    else if (ncpu > 0 && ncpu <= 32) pop = 32u;
+
+    const char* env = getenv("SOL_TX_DAG_POP_BATCH");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env && x > 0ul) pop = (unsigned)x;
+    }
+
+    if (pop < 1u) pop = 1u;
+    if (pop > 256u) pop = 256u;
+
+    __atomic_store_n(&cached, pop, __ATOMIC_RELEASE);
+    return pop;
+}
+
+static void
+tx_pool_run_dag_worker(sol_bank_t* bank,
+                       const sol_transaction_t* const* tx_ptrs,
+                       sol_tx_result_t* results,
+                       bool skip_tx_status,
+                       const uint32_t* adj_head,
+                       const uint32_t* edge_to,
+                       const uint32_t* edge_next,
+                       uint32_t* indegree,
+                       uint32_t* ready_next,
+                       volatile uint32_t* ready_head,
+                       volatile uint32_t* remaining) {
+    if (!bank || !tx_ptrs || !results || !adj_head || !edge_to || !edge_next ||
+        !indegree || !ready_next || !ready_head || !remaining) {
+        return;
+    }
+
+    /* Each worker keeps a small local list of ready nodes to reduce contention
+     * on the global ready stack (ready_head). The list is terminated by
+     * `local_stop` (the global head value after the batch pop). */
+    uint32_t local_head = TX_POOL_DAG_NONE;
+    uint32_t local_stop = TX_POOL_DAG_NONE;
+
+    unsigned idle_spins = 0;
+    const unsigned pop_batch = tx_pool_dag_pop_batch();
+    for (;;) {
+        uint32_t node = TX_POOL_DAG_NONE;
+
+        if (local_head != local_stop) {
+            node = local_head;
+            local_head = ready_next[node];
+        } else {
+            /* Refill from the global ready stack in batches.
+             *
+             * On large machines, popping a longer chain reduces contention on
+             * ready_head and lowers tail latency (fewer CAS loops). */
+            if (!tx_pool_dag_ready_pop_chain(ready_head,
+                                             ready_next,
+                                             &local_head,
+                                             &local_stop,
+                                             pop_batch)) {
+                /* No ready work at the moment. If remaining>0, other txs must be
+                 * executing. Avoid `sched_yield()` hot-looping: a short PAUSE
+                 * spin reduces context switch overhead when the ready queue
+                 * refills quickly. */
+                if (__atomic_load_n(remaining, __ATOMIC_RELAXED) == 0u) return;
+
+                /* Favor spinning over yielding on large-core hosts: yield can
+                 * introduce scheduling latency that shows up as "pauses"
+                 * between ready txs. */
+                if (idle_spins < 1048576u) {
+                    tx_pool_cpu_pause();
+                    idle_spins++;
+                } else {
+                    idle_spins = 0;
+                    if (!tx_pool_big_core_host()) {
+                        sched_yield();
+                    }
+                }
+                continue;
+            }
+
+            node = local_head;
+            local_head = ready_next[node];
+        }
+        idle_spins = 0;
+
+        const sol_transaction_t* tx = tx_ptrs[node];
+        if (tx) {
+            results[node] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx)
+                : sol_bank_process_transaction(bank, tx);
+        }
+
+        /* Publish dependents that have reached indegree==0. */
+        uint32_t ready_chain_head = TX_POOL_DAG_NONE;
+        uint32_t ready_chain_tail = TX_POOL_DAG_NONE;
+        for (uint32_t e = adj_head[node]; e != TX_POOL_DAG_NONE; e = edge_next[e]) {
+            uint32_t succ = edge_to[e];
+            if (__atomic_sub_fetch(&indegree[succ], 1u, __ATOMIC_RELAXED) == 0u) {
+                if (ready_chain_head == TX_POOL_DAG_NONE) {
+                    ready_chain_head = succ;
+                    ready_chain_tail = succ;
+                    /* tail->next will be filled on flush */
+                    ready_next[succ] = TX_POOL_DAG_NONE;
+                } else {
+                    ready_next[succ] = ready_chain_head;
+                    ready_chain_head = succ;
+                }
+            }
+        }
+
+        if (ready_chain_head != TX_POOL_DAG_NONE) {
+            tx_pool_dag_ready_push_chain(ready_head, ready_next, ready_chain_head, ready_chain_tail);
+        }
+
+        if (__atomic_fetch_sub(remaining, 1u, __ATOMIC_RELAXED) == 1u) {
+            return;
+        }
+    }
+}
+
+static void*
+tx_pool_worker_main(void* arg) {
+    tx_pool_worker_ctx_t* w = (tx_pool_worker_ctx_t*)arg;
+    sol_tx_pool_t* p = w ? (sol_tx_pool_t*)w->p : NULL;
+    size_t worker_idx = w ? w->thread_idx : 0u;
+    if (!p) return NULL;
+    uint64_t seen_job_id = 0;
+    for (;;) {
+        tx_pool_job_kind_t kind = TX_POOL_JOB_NONE;
+        sol_bank_t* bank = NULL;
+        const sol_transaction_t* txs = NULL;
+        const sol_transaction_t* const* tx_ptrs = NULL;
+        bool use_ptrs = false;
+        bool skip_tx_status = false;
+        sol_tx_result_t* results = NULL;
+        const uint32_t* dag_adj_head = NULL;
+        const uint32_t* dag_edge_to = NULL;
+        const uint32_t* dag_edge_next = NULL;
+        uint32_t* dag_indegree = NULL;
+        uint32_t* dag_ready_next = NULL;
+        volatile uint32_t* dag_ready_head = NULL;
+        volatile uint32_t* dag_remaining = NULL;
+        const sol_accounts_db_local_entry_t* lthash_entries = NULL;
+        sol_accounts_db_t* lthash_parent = NULL;
+        sol_lt_hash_t* lthash_partials = NULL;
+        size_t start = 0;
+        size_t end = 0;
+
+        pthread_mutex_lock(&p->mu);
+        while (!p->stop && (!p->has_job || p->job_id == seen_job_id || p->wake == 0u)) {
+            pthread_cond_wait(&p->cv, &p->mu);
+        }
+        if (p->stop) {
+            pthread_mutex_unlock(&p->mu);
+            return NULL;
+        }
+        /* Snapshot job fields under the mutex so we never re-read shared state
+         * while the main thread prepares the next job. */
+        p->wake--;
+        seen_job_id = p->job_id;
+        kind = p->job_kind;
+        bank = p->bank;
+        txs = p->txs;
+        tx_ptrs = p->tx_ptrs;
+        use_ptrs = p->use_ptrs;
+        skip_tx_status = p->skip_tx_status;
+        results = p->results;
+        dag_adj_head = p->dag_adj_head;
+        dag_edge_to = p->dag_edge_to;
+        dag_edge_next = p->dag_edge_next;
+        dag_indegree = p->dag_indegree;
+        dag_ready_next = p->dag_ready_next;
+        dag_ready_head = &p->dag_ready_head;
+        dag_remaining = &p->dag_remaining;
+        lthash_entries = p->lthash_entries;
+        lthash_parent = p->lthash_parent;
+        lthash_partials = p->lthash_partials;
+        start = p->start;
+        end = p->end;
+        pthread_mutex_unlock(&p->mu);
+
+        size_t len = end - start;
+        if (kind == TX_POOL_JOB_LT_HASH_DELTA) {
+            sol_lt_hash_t* delta = NULL;
+            if (lthash_partials && worker_idx < (p->nthreads + 1u)) {
+                delta = &lthash_partials[worker_idx];
+            }
+            for (;;) {
+                size_t off = __atomic_fetch_add(&p->next, 1u, __ATOMIC_RELAXED);
+                if (off >= len) break;
+                size_t idx = start + off;
+                const sol_accounts_db_local_entry_t* e =
+                    lthash_entries ? &lthash_entries[idx] : NULL;
+                if (!e || !delta) continue;
+
+                const sol_account_t* curr = e->account;
+                sol_account_t* prev = lthash_parent ? sol_accounts_db_load_view(lthash_parent, &e->pubkey) : NULL;
+
+                if (accounts_equal_for_lt_hash(prev, curr)) {
+                    sol_account_destroy(prev);
+                    continue;
+                }
+
+                sol_lt_hash_t prev_hash;
+                sol_lt_hash_t curr_hash;
+                if (prev) sol_account_lt_hash(&e->pubkey, prev, &prev_hash);
+                else      sol_lt_hash_identity(&prev_hash);
+                if (curr) sol_account_lt_hash(&e->pubkey, curr, &curr_hash);
+                else      sol_lt_hash_identity(&curr_hash);
+
+                sol_lt_hash_mix_out(delta, &prev_hash);
+                sol_lt_hash_mix_in(delta, &curr_hash);
+                sol_account_destroy(prev);
+            }
+        } else if (kind == TX_POOL_JOB_TX_DAG_PTRS) {
+            tx_pool_run_dag_worker(bank,
+                                   tx_ptrs,
+                                   results,
+                                   skip_tx_status,
+                                   dag_adj_head,
+                                   dag_edge_to,
+                                   dag_edge_next,
+                                   dag_indegree,
+                                   dag_ready_next,
+                                   dag_ready_head,
+                                   dag_remaining);
+        } else {
+            for (;;) {
+                size_t off = __atomic_fetch_add(&p->next, 1u, __ATOMIC_RELAXED);
+                if (off >= len) break;
+                size_t idx = start + off;
+                if (use_ptrs) {
+                    const sol_transaction_t* tx = tx_ptrs[idx];
+                    if (!tx) {
+                        /* A NULL tx pointer means the caller already filled results[idx]. */
+                        continue;
+                    }
+                    results[idx] = skip_tx_status
+                        ? sol_bank_process_transaction_parallel(bank, tx)
+                        : sol_bank_process_transaction(bank, tx);
+                } else {
+                    results[idx] = sol_bank_process_transaction(bank, &txs[idx]);
+                }
+            }
+        }
+
+        pthread_mutex_lock(&p->mu);
+        if (--p->active == 0) {
+            p->has_job = false;
+            pthread_cond_signal(&p->done);
+        }
+        pthread_mutex_unlock(&p->mu);
+    }
+}
+
+static void
+tx_pool_shutdown(void) {
+    sol_tx_pool_t* p = &g_tx_pool;
+    if (!p->inited) return;
+
+    pthread_mutex_lock(&p->mu);
+    p->stop = true;
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+
+    for (size_t i = 0; i < p->nthreads; i++) {
+        (void)pthread_join(p->threads[i], NULL);
+    }
+    sol_free(p->threads);
+    p->threads = NULL;
+    sol_free(p->worker_ctx);
+    p->worker_ctx = NULL;
+    p->nthreads = 0;
+
+    pthread_mutex_destroy(&p->mu);
+    pthread_cond_destroy(&p->cv);
+    pthread_cond_destroy(&p->done);
+    p->inited = false;
+}
+
+static void
+tx_pool_init_once(void) {
+    sol_tx_pool_t* p = &g_tx_pool;
+    memset(p, 0, sizeof(*p));
+
+    (void)pthread_mutex_init(&p->mu, NULL);
+    (void)pthread_cond_init(&p->cv, NULL);
+    (void)pthread_cond_init(&p->done, NULL);
+    p->inited = true;
+    p->job_id = 0;
+
+    size_t workers = tx_worker_target();
+    if (workers <= 1u) {
+        p->nthreads = 0;
+        return;
+    }
+
+    /* Use caller thread as a worker too. */
+    p->nthreads = workers - 1u;
+    sol_log_info("TX pool: workers=%lu (threads=%lu + caller), dag=%d, min_batch=%lu",
+                 (unsigned long)workers,
+                 (unsigned long)p->nthreads,
+                 tx_dag_sched_enabled() ? 1 : 0,
+                 (unsigned long)tx_pool_min_batch());
+    p->threads = sol_calloc(p->nthreads, sizeof(pthread_t));
+    if (!p->threads) {
+        p->nthreads = 0;
+        return;
+    }
+    p->worker_ctx = sol_calloc(p->nthreads, sizeof(tx_pool_worker_ctx_t));
+    if (!p->worker_ctx) {
+        sol_free(p->threads);
+        p->threads = NULL;
+        p->nthreads = 0;
+        return;
+    }
+
+    for (size_t i = 0; i < p->nthreads; i++) {
+        p->worker_ctx[i].p = p;
+        p->worker_ctx[i].thread_idx = i;
+        if (pthread_create(&p->threads[i], NULL, tx_pool_worker_main, &p->worker_ctx[i]) != 0) {
+            p->nthreads = i;
+            break;
+        }
+    }
+
+    atexit(tx_pool_shutdown);
+}
+
+static inline bool
+tx_pool_available(void) {
+    return g_tx_pool.nthreads > 0;
+}
+
+static void
+tx_pool_run_range(sol_bank_t* bank,
+                  const sol_transaction_t* txs,
+                  sol_tx_result_t* results,
+                  size_t start,
+                  size_t end) {
+    if (start >= end) return;
+
+    size_t len = end - start;
+    tx_pool_stats_t* stats = g_tls_tx_pool_stats;
+    uint64_t t0 = stats ? bank_monotonic_ns() : 0;
+    bool ran_parallel = false;
+
+    size_t min_batch = tx_pool_min_batch();
+
+    /* Parallelize only when the batch is large enough to amortize coordination. */
+    if (!tx_pool_available() || len < min_batch) {
+        for (size_t i = start; i < end; i++) {
+            results[i] = sol_bank_process_transaction(bank, &txs[i]);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)len;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
+
+    sol_tx_pool_t* p = &g_tx_pool;
+    ran_parallel = true;
+
+    /* Wake only the number of worker threads we can use for this job. Waking the
+     * full pool for tiny batches is extremely expensive and can dominate replay. */
+    size_t workers = p->nthreads;
+    if (workers > (len - 1u)) workers = len - 1u;
+
+    pthread_mutex_lock(&p->mu);
+    p->job_kind = TX_POOL_JOB_TXS;
+    p->bank = bank;
+    p->txs = txs;
+    p->tx_ptrs = NULL;
+    p->use_ptrs = false;
+    p->skip_tx_status = false;
+    p->results = results;
+    p->lthash_entries = NULL;
+    p->lthash_parent = NULL;
+    p->lthash_partials = NULL;
+    p->start = start;
+    p->end = end;
+    __atomic_store_n(&p->next, 0u, __ATOMIC_RELAXED);
+    p->active = workers + 1u;
+    p->wake = workers;
+    p->job_id++;
+    p->has_job = true;
+    for (size_t i = 0; i < workers; i++) {
+        pthread_cond_signal(&p->cv);
+    }
+    pthread_mutex_unlock(&p->mu);
+
+    /* Caller thread participates. */
+    for (;;) {
+        size_t off = __atomic_fetch_add(&p->next, 1u, __ATOMIC_RELAXED);
+        if (off >= len) break;
+        size_t idx = start + off;
+        results[idx] = sol_bank_process_transaction(bank, &txs[idx]);
+    }
+
+    pthread_mutex_lock(&p->mu);
+    if (--p->active == 0) {
+        p->has_job = false;
+        pthread_cond_signal(&p->done);
+    }
+    while (p->has_job) {
+        pthread_cond_wait(&p->done, &p->mu);
+    }
+    pthread_mutex_unlock(&p->mu);
+
+    if (stats && ran_parallel) {
+        uint64_t dt = bank_monotonic_ns() - t0;
+        stats->par_calls++;
+        stats->par_txs += (uint64_t)len;
+        stats->par_ns += dt;
+    }
+}
+
+static void
+tx_pool_run_range_ptrs(sol_bank_t* bank,
+                       const sol_transaction_t* const* tx_ptrs,
+                       sol_tx_result_t* results,
+                       size_t start,
+                       size_t end,
+                       bool skip_tx_status) {
+    if (start >= end) return;
+    if (!bank || !tx_ptrs || !results) return;
+
+    size_t len = end - start;
+    tx_pool_stats_t* stats = g_tls_tx_pool_stats;
+    uint64_t t0 = stats ? bank_monotonic_ns() : 0;
+    bool ran_parallel = false;
+    size_t exec_txs = len;
+    if (stats) {
+        exec_txs = 0;
+        for (size_t i = start; i < end; i++) {
+            if (tx_ptrs[i]) exec_txs++;
+        }
+    }
+
+    size_t min_batch = tx_pool_min_batch();
+
+    /* Parallelize only when the batch is large enough to amortize coordination. */
+    if (!tx_pool_available() || len < min_batch) {
+        for (size_t i = start; i < end; i++) {
+            const sol_transaction_t* tx = tx_ptrs[i];
+            if (!tx) {
+                /* A NULL tx pointer means the caller already filled results[i]. */
+                continue;
+            }
+            results[i] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx)
+                : sol_bank_process_transaction(bank, tx);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)exec_txs;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
+
+    sol_tx_pool_t* p = &g_tx_pool;
+    ran_parallel = true;
+
+    size_t workers = p->nthreads;
+    if (workers > (len - 1u)) workers = len - 1u;
+
+    pthread_mutex_lock(&p->mu);
+    p->job_kind = TX_POOL_JOB_TX_PTRS;
+    p->bank = bank;
+    p->txs = NULL;
+    p->tx_ptrs = tx_ptrs;
+    p->use_ptrs = true;
+    p->skip_tx_status = skip_tx_status;
+    p->results = results;
+    p->lthash_entries = NULL;
+    p->lthash_parent = NULL;
+    p->lthash_partials = NULL;
+    p->start = start;
+    p->end = end;
+    __atomic_store_n(&p->next, 0u, __ATOMIC_RELAXED);
+    p->active = workers + 1u;
+    p->wake = workers;
+    p->job_id++;
+    p->has_job = true;
+    for (size_t i = 0; i < workers; i++) {
+        pthread_cond_signal(&p->cv);
+    }
+    pthread_mutex_unlock(&p->mu);
+
+    /* Caller thread participates. */
+    for (;;) {
+        size_t off = __atomic_fetch_add(&p->next, 1u, __ATOMIC_RELAXED);
+        if (off >= len) break;
+        size_t idx = start + off;
+        const sol_transaction_t* tx = tx_ptrs[idx];
+        if (!tx) {
+            /* A NULL tx pointer means the caller already filled results[idx]. */
+            continue;
+        }
+        results[idx] = skip_tx_status
+            ? sol_bank_process_transaction_parallel(bank, tx)
+            : sol_bank_process_transaction(bank, tx);
+    }
+
+    pthread_mutex_lock(&p->mu);
+    if (--p->active == 0) {
+        p->has_job = false;
+        pthread_cond_signal(&p->done);
+    }
+    while (p->has_job) {
+        pthread_cond_wait(&p->done, &p->mu);
+    }
+    pthread_mutex_unlock(&p->mu);
+
+    if (stats && ran_parallel) {
+        uint64_t dt = bank_monotonic_ns() - t0;
+        stats->par_calls++;
+        stats->par_txs += (uint64_t)exec_txs;
+        stats->par_ns += dt;
+    }
+}
+
+static void
+tx_pool_run_dag_ptrs(sol_bank_t* bank,
+                     const sol_transaction_t* const* tx_ptrs,
+                     sol_tx_result_t* results,
+                     const uint32_t* seg_nodes,
+                     size_t seg_len,
+                     const uint32_t* adj_head,
+                     const uint32_t* edge_to,
+                     const uint32_t* edge_next,
+                     uint32_t* indegree,
+                     uint32_t* ready_next,
+                     bool skip_tx_status) {
+    if (seg_len == 0) return;
+    if (!bank || !tx_ptrs || !results || !seg_nodes || !adj_head || !edge_to || !edge_next ||
+        !indegree || !ready_next) {
+        return;
+    }
+
+    tx_pool_stats_t* stats = g_tls_tx_pool_stats;
+    uint64_t t0 = stats ? bank_monotonic_ns() : 0;
+
+    size_t min_batch = tx_pool_min_batch();
+
+    /* Sequential fallback for small segments or when the pool isn't available. */
+    if (!tx_pool_available() || seg_len < min_batch) {
+        for (size_t i = 0; i < seg_len; i++) {
+            uint32_t node = seg_nodes[i];
+            const sol_transaction_t* tx = tx_ptrs[node];
+            if (!tx) continue;
+            results[node] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx)
+                : sol_bank_process_transaction(bank, tx);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)seg_len;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
+
+    if (seg_len > (size_t)UINT32_MAX) {
+        /* Defensive: our DAG node indices are uint32_t. */
+        for (size_t i = 0; i < seg_len; i++) {
+            uint32_t node = seg_nodes[i];
+            const sol_transaction_t* tx = tx_ptrs[node];
+            if (!tx) continue;
+            results[node] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx)
+                : sol_bank_process_transaction(bank, tx);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)seg_len;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
+
+    sol_tx_pool_t* p = &g_tx_pool;
+
+    /* Initialize ready stack from indegree==0 nodes. */
+    uint32_t init_head = TX_POOL_DAG_NONE;
+    for (size_t i = 0; i < seg_len; i++) {
+        uint32_t node = seg_nodes[i];
+        if (indegree[node] == 0u) {
+            ready_next[node] = init_head;
+            init_head = node;
+        }
+    }
+    __atomic_store_n(&p->dag_ready_head, init_head, __ATOMIC_RELEASE);
+    __atomic_store_n(&p->dag_remaining, (uint32_t)seg_len, __ATOMIC_RELEASE);
+
+    /* If nothing is ready, something is wrong (cycle or bad graph). Avoid
+     * deadlocking by falling back to sequential execution. */
+    if (init_head == TX_POOL_DAG_NONE) {
+        __atomic_store_n(&p->dag_remaining, 0u, __ATOMIC_RELEASE);
+        for (size_t i = 0; i < seg_len; i++) {
+            uint32_t node = seg_nodes[i];
+            const sol_transaction_t* tx = tx_ptrs[node];
+            if (!tx) continue;
+            results[node] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx)
+                : sol_bank_process_transaction(bank, tx);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)seg_len;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
+
+    size_t workers = p->nthreads;
+    if (workers > (seg_len - 1u)) workers = seg_len - 1u;
+
+    pthread_mutex_lock(&p->mu);
+    p->job_kind = TX_POOL_JOB_TX_DAG_PTRS;
+    p->bank = bank;
+    p->txs = NULL;
+    p->tx_ptrs = tx_ptrs;
+    p->use_ptrs = true;
+    p->skip_tx_status = skip_tx_status;
+    p->results = results;
+    p->dag_adj_head = adj_head;
+    p->dag_edge_to = edge_to;
+    p->dag_edge_next = edge_next;
+    p->dag_indegree = indegree;
+    p->dag_ready_next = ready_next;
+    p->lthash_entries = NULL;
+    p->lthash_parent = NULL;
+    p->lthash_partials = NULL;
+    p->start = 0;
+    p->end = 0;
+    __atomic_store_n(&p->next, 0u, __ATOMIC_RELAXED);
+    p->active = workers + 1u;
+    p->wake = workers;
+    p->job_id++;
+    p->has_job = true;
+    for (size_t i = 0; i < workers; i++) {
+        pthread_cond_signal(&p->cv);
+    }
+    pthread_mutex_unlock(&p->mu);
+
+    /* Caller thread participates. */
+    tx_pool_run_dag_worker(bank,
+                           tx_ptrs,
+                           results,
+                           skip_tx_status,
+                           adj_head,
+                           edge_to,
+                           edge_next,
+                           indegree,
+                           ready_next,
+                           &p->dag_ready_head,
+                           &p->dag_remaining);
+
+    pthread_mutex_lock(&p->mu);
+    if (--p->active == 0) {
+        p->has_job = false;
+        pthread_cond_signal(&p->done);
+    }
+    while (p->has_job) {
+        pthread_cond_wait(&p->done, &p->mu);
+    }
+    pthread_mutex_unlock(&p->mu);
+
+    if (stats) {
+        uint64_t dt = bank_monotonic_ns() - t0;
+        stats->par_calls++;
+        stats->par_txs += (uint64_t)seg_len;
+        stats->par_ns += dt;
+    }
+}
+
+static bool
+lthash_parallel_enabled(void) {
+    const char* env = getenv("SOL_LT_HASH_PARALLEL");
+    if (env && env[0] != '\0') {
+        while (*env && isspace((unsigned char)*env)) env++;
+        if (*env == '0' || *env == 'n' || *env == 'N' || *env == 'f' || *env == 'F') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void
+lthash_delta_seq(sol_accounts_db_t* parent,
+                 const sol_accounts_db_local_entry_t* entries,
+                 size_t count,
+                 sol_lt_hash_t* out_delta) {
+    if (!out_delta) return;
+    if (!entries || count == 0) return;
+
+    for (size_t i = 0; i < count; i++) {
+        const sol_accounts_db_local_entry_t* e = &entries[i];
+        const sol_account_t* curr = e->account;
+        sol_account_t* prev = parent ? sol_accounts_db_load_view(parent, &e->pubkey) : NULL;
+
+        if (accounts_equal_for_lt_hash(prev, curr)) {
+            sol_account_destroy(prev);
+            continue;
+        }
+
+        sol_lt_hash_t prev_hash;
+        sol_lt_hash_t curr_hash;
+        if (prev) sol_account_lt_hash(&e->pubkey, prev, &prev_hash);
+        else      sol_lt_hash_identity(&prev_hash);
+        if (curr) sol_account_lt_hash(&e->pubkey, curr, &curr_hash);
+        else      sol_lt_hash_identity(&curr_hash);
+
+        sol_lt_hash_mix_out(out_delta, &prev_hash);
+        sol_lt_hash_mix_in(out_delta, &curr_hash);
+        sol_account_destroy(prev);
+    }
+}
+
+static void
+tx_pool_run_lthash_delta(sol_accounts_db_t* parent,
+                         const sol_accounts_db_local_entry_t* entries,
+                         size_t count,
+                         sol_lt_hash_t* out_delta) {
+    if (!out_delta) return;
+    sol_lt_hash_identity(out_delta);
+    if (!entries || count == 0) return;
+
+    if (!lthash_parallel_enabled()) {
+        lthash_delta_seq(parent, entries, count, out_delta);
+        return;
+    }
+
+    /* Parallelize only when large enough to amortize coordination. */
+    if (count < 64u) {
+        lthash_delta_seq(parent, entries, count, out_delta);
+        return;
+    }
+
+    (void)pthread_once(&g_tx_pool_once, tx_pool_init_once);
+    if (!tx_pool_available()) {
+        lthash_delta_seq(parent, entries, count, out_delta);
+        return;
+    }
+
+    sol_tx_pool_t* p = &g_tx_pool;
+    size_t len = count;
+
+    size_t workers = p->nthreads;
+    if (workers > (len - 1u)) workers = len - 1u;
+    if (workers == 0u) {
+        lthash_delta_seq(parent, entries, count, out_delta);
+        return;
+    }
+
+    sol_lt_hash_t* partials = sol_calloc(p->nthreads + 1u, sizeof(*partials));
+    if (!partials) {
+        lthash_delta_seq(parent, entries, count, out_delta);
+        return;
+    }
+
+    pthread_mutex_lock(&p->mu);
+    p->job_kind = TX_POOL_JOB_LT_HASH_DELTA;
+    p->bank = NULL;
+    p->txs = NULL;
+    p->tx_ptrs = NULL;
+    p->use_ptrs = false;
+    p->skip_tx_status = false;
+    p->results = NULL;
+    p->lthash_entries = entries;
+    p->lthash_parent = parent;
+    p->lthash_partials = partials;
+    p->start = 0;
+    p->end = count;
+    __atomic_store_n(&p->next, 0u, __ATOMIC_RELAXED);
+    p->active = workers + 1u;
+    p->wake = workers;
+    p->job_id++;
+    p->has_job = true;
+    for (size_t i = 0; i < workers; i++) {
+        pthread_cond_signal(&p->cv);
+    }
+    pthread_mutex_unlock(&p->mu);
+
+    /* Caller thread participates (use the last partial slot). */
+    sol_lt_hash_t* caller_delta = &partials[p->nthreads];
+    for (;;) {
+        size_t off = __atomic_fetch_add(&p->next, 1u, __ATOMIC_RELAXED);
+        if (off >= len) break;
+        const sol_accounts_db_local_entry_t* e = &entries[off];
+        const sol_account_t* curr = e->account;
+        sol_account_t* prev = parent ? sol_accounts_db_load_view(parent, &e->pubkey) : NULL;
+
+        if (accounts_equal_for_lt_hash(prev, curr)) {
+            sol_account_destroy(prev);
+            continue;
+        }
+
+        sol_lt_hash_t prev_hash;
+        sol_lt_hash_t curr_hash;
+        if (prev) sol_account_lt_hash(&e->pubkey, prev, &prev_hash);
+        else      sol_lt_hash_identity(&prev_hash);
+        if (curr) sol_account_lt_hash(&e->pubkey, curr, &curr_hash);
+        else      sol_lt_hash_identity(&curr_hash);
+
+        sol_lt_hash_mix_out(caller_delta, &prev_hash);
+        sol_lt_hash_mix_in(caller_delta, &curr_hash);
+        sol_account_destroy(prev);
+    }
+
+    pthread_mutex_lock(&p->mu);
+    if (--p->active == 0) {
+        p->has_job = false;
+        pthread_cond_signal(&p->done);
+    }
+    while (p->has_job) {
+        pthread_cond_wait(&p->done, &p->mu);
+    }
+    pthread_mutex_unlock(&p->mu);
+
+    for (size_t i = 0; i < (p->nthreads + 1u); i++) {
+        sol_lt_hash_mix_in(out_delta, &partials[i]);
+    }
+
+    sol_free(partials);
 }
 
 sol_err_t
 sol_bank_process_transactions(sol_bank_t* bank, const sol_transaction_t* txs,
                               size_t count, sol_tx_result_t* results) {
     if (!bank || !txs || !results) return SOL_ERR_INVAL;
+    if (count == 0) return SOL_OK;
 
-    for (size_t i = 0; i < count; i++) {
-        results[i] = sol_bank_process_transaction(bank, &txs[i]);
+    if (!tx_parallel_enabled() || count < 16) {
+        for (size_t i = 0; i < count; i++) {
+            results[i] = sol_bank_process_transaction(bank, &txs[i]);
+        }
+        return SOL_OK;
     }
 
+    (void)pthread_once(&g_tx_pool_once, tx_pool_init_once);
+
+    /* Deterministic batching: execute maximal contiguous ranges of
+     * non-conflicting transactions in parallel. */
+    sol_pubkey_map_t* batch_reads = sol_pubkey_map_new(sizeof(uint8_t), 1024u);
+    sol_pubkey_map_t* batch_writes = sol_pubkey_map_new(sizeof(uint8_t), 1024u);
+    if (!batch_reads || !batch_writes) {
+        if (batch_reads) sol_pubkey_map_destroy(batch_reads);
+        if (batch_writes) sol_pubkey_map_destroy(batch_writes);
+        for (size_t i = 0; i < count; i++) {
+            results[i] = sol_bank_process_transaction(bank, &txs[i]);
+        }
+        return SOL_OK;
+    }
+
+    sol_pubkey_t keys[SOL_MAX_MESSAGE_ACCOUNTS];
+    bool writable[SOL_MAX_MESSAGE_ACCOUNTS];
+    bool signer[SOL_MAX_MESSAGE_ACCOUNTS];
+    (void)signer;
+
+    uint8_t one = 1u;
+    size_t batch_start = 0;
+
+    bank_v0_resolve_cache_t v0_cache = {0};
+    v0_cache.patches = sol_calloc(count, sizeof(*v0_cache.patches));
+    if (v0_cache.patches) {
+        v0_cache.patches_cap = count;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        const sol_transaction_t* tx = &txs[i];
+
+        /* Address lookup table resolution depends on on-chain ALT account data.
+         * If a prior transaction in the current batch wrote any ALT table that
+         * this transaction needs to read for resolution, flush first so we
+         * resolve against the correct post-write state. */
+        if (tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+            tx->message.address_lookups_len > 0 &&
+            tx->message.address_lookups) {
+            bool alt_conflict = false;
+            for (uint8_t li = 0; li < tx->message.address_lookups_len; li++) {
+                const sol_pubkey_t* table = &tx->message.address_lookups[li].account_key;
+                if (sol_pubkey_map_get(batch_writes, table)) {
+                    alt_conflict = true;
+                    break;
+                }
+            }
+            if (alt_conflict && batch_start < i) {
+                tx_pool_run_range(bank, txs, results, batch_start, i);
+                sol_map_clear(batch_reads->inner);
+                sol_map_clear(batch_writes->inner);
+                batch_start = i;
+            }
+        }
+
+        size_t key_len = 0;
+        const sol_pubkey_t* keys_view = NULL;
+        const bool* writable_view = NULL;
+
+        sol_err_t rerr = SOL_OK;
+        if (tx->message.version == SOL_MESSAGE_VERSION_V0 && v0_cache.patches) {
+            sol_err_t cerr = bank_v0_cache_resolve(bank, tx, &v0_cache);
+            if (cerr == SOL_OK) {
+                const sol_message_t* msg = &tx->message;
+                key_len = (size_t)msg->resolved_accounts_len;
+                keys_view = msg->resolved_accounts;
+                writable_view = msg->is_writable;
+            } else {
+                rerr = cerr;
+            }
+        }
+
+        if (!keys_view) {
+            rerr = sol_bank_resolve_transaction_accounts(bank,
+                                                        tx,
+                                                        keys,
+                                                        writable,
+                                                        signer,
+                                                        SOL_MAX_MESSAGE_ACCOUNTS,
+                                                        &key_len);
+            if (rerr == SOL_OK) {
+                keys_view = keys;
+                writable_view = writable;
+            }
+        }
+
+        if (rerr != SOL_OK || !keys_view || !writable_view) {
+            /* Can't build a lock set; execute sequentially after flushing. */
+            if (batch_start < i) {
+                tx_pool_run_range(bank, txs, results, batch_start, i);
+                sol_map_clear(batch_reads->inner);
+                sol_map_clear(batch_writes->inner);
+            }
+
+            results[i] = sol_bank_process_transaction(bank, &txs[i]);
+            batch_start = i + 1;
+            continue;
+        }
+
+        /* Include implicit read locks for upgradeable program ProgramData
+         * accounts. These are read during BPF execution but are not part of the
+         * resolved account list, so without them parallel scheduling can run
+         * upgrades concurrently with invocations. */
+        sol_pubkey_t progdata_keys[64];
+        size_t progdata_len = 0;
+        sol_pubkey_t seen_progids[64];
+        size_t seen_progids_len = 0;
+
+        /* If a prior tx wrote an invoked program account, flush before we
+         * inspect it for ProgramData so we read the post-write state. */
+        bool prog_barrier = false;
+        for (uint8_t ix_i = 0; ix_i < tx->message.instructions_len; ix_i++) {
+            const sol_compiled_instruction_t* ix = &tx->message.instructions[ix_i];
+            if ((size_t)ix->program_id_index >= key_len) {
+                continue;
+            }
+            const sol_pubkey_t* pid = &keys_view[ix->program_id_index];
+            if (sol_pubkey_eq(pid, &SOL_SYSTEM_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_VOTE_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_COMPUTE_BUDGET_ID) ||
+                sol_pubkey_eq(pid, &SOL_ED25519_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_SECP256K1_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_SECP256R1_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_BPF_LOADER_UPGRADEABLE_ID) ||
+                sol_pubkey_eq(pid, &SOL_BPF_LOADER_V2_ID)) {
+                continue;
+            }
+            if (sol_pubkey_map_get(batch_writes, pid)) {
+                prog_barrier = true;
+                break;
+            }
+        }
+        if (prog_barrier && batch_start < i) {
+            tx_pool_run_range(bank, txs, results, batch_start, i);
+            sol_map_clear(batch_reads->inner);
+            sol_map_clear(batch_writes->inner);
+            batch_start = i;
+        }
+
+        for (uint8_t ix_i = 0; ix_i < tx->message.instructions_len; ix_i++) {
+            const sol_compiled_instruction_t* ix = &tx->message.instructions[ix_i];
+            if ((size_t)ix->program_id_index >= key_len) {
+                continue;
+            }
+            const sol_pubkey_t* pid = &keys_view[ix->program_id_index];
+            if (sol_pubkey_eq(pid, &SOL_SYSTEM_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_VOTE_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_COMPUTE_BUDGET_ID) ||
+                sol_pubkey_eq(pid, &SOL_ED25519_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_SECP256K1_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_SECP256R1_PROGRAM_ID) ||
+                sol_pubkey_eq(pid, &SOL_BPF_LOADER_UPGRADEABLE_ID) ||
+                sol_pubkey_eq(pid, &SOL_BPF_LOADER_V2_ID)) {
+                continue;
+            }
+
+            bool seen = false;
+            for (size_t si = 0; si < seen_progids_len; si++) {
+                if (sol_pubkey_eq(&seen_progids[si], pid)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) {
+                continue;
+            }
+            if (seen_progids_len < (sizeof(seen_progids) / sizeof(seen_progids[0]))) {
+                seen_progids[seen_progids_len++] = *pid;
+            }
+
+            sol_pubkey_t pd = {0};
+            if (bank_get_upgradeable_programdata_pubkey(bank, pid, &pd)) {
+                if (progdata_len < (sizeof(progdata_keys) / sizeof(progdata_keys[0]))) {
+                    progdata_keys[progdata_len++] = pd;
+                }
+            }
+        }
+
+        bool conflict = false;
+        for (size_t k = 0; k < key_len; k++) {
+            if (writable_view[k]) {
+                if (sol_pubkey_map_get(batch_writes, &keys_view[k]) ||
+                    sol_pubkey_map_get(batch_reads, &keys_view[k])) {
+                    conflict = true;
+                    break;
+                }
+            } else {
+                if (sol_pubkey_map_get(batch_writes, &keys_view[k])) {
+                    conflict = true;
+                    break;
+                }
+            }
+        }
+
+        if (!conflict) {
+            for (size_t pk = 0; pk < progdata_len; pk++) {
+                if (sol_pubkey_map_get(batch_writes, &progdata_keys[pk])) {
+                    conflict = true;
+                    break;
+                }
+            }
+        }
+
+        if (conflict && batch_start < i) {
+            /* Execute prior batch. */
+            tx_pool_run_range(bank, txs, results, batch_start, i);
+            sol_map_clear(batch_reads->inner);
+            sol_map_clear(batch_writes->inner);
+            batch_start = i;
+        }
+
+        /* Add tx accounts to batch set. */
+        for (size_t k = 0; k < key_len; k++) {
+            if (writable_view[k]) {
+                (void)sol_pubkey_map_insert(batch_writes, &keys_view[k], &one);
+            } else {
+                (void)sol_pubkey_map_insert(batch_reads, &keys_view[k], &one);
+            }
+        }
+
+        /* Lock ALT table accounts as read-only for scheduling purposes. They are
+         * not part of the resolved account list passed to programs, but they are
+         * read during v0 account resolution. */
+        if (tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+            tx->message.address_lookups_len > 0 &&
+            tx->message.address_lookups) {
+            for (uint8_t li = 0; li < tx->message.address_lookups_len; li++) {
+                (void)sol_pubkey_map_insert(batch_reads,
+                                            &tx->message.address_lookups[li].account_key,
+                    &one);
+            }
+        }
+
+        for (size_t pk = 0; pk < progdata_len; pk++) {
+            (void)sol_pubkey_map_insert(batch_reads, &progdata_keys[pk], &one);
+        }
+    }
+
+    /* Execute last batch. */
+    if (batch_start < count) {
+        tx_pool_run_range(bank, txs, results, batch_start, count);
+    }
+
+    bank_v0_cache_destroy(&v0_cache);
+
+    sol_pubkey_map_destroy(batch_reads);
+    sol_pubkey_map_destroy(batch_writes);
+    return SOL_OK;
+}
+
+static uint64_t
+tx_seen_sig_hash(const void* key) {
+    const sol_signature_t* sig = (const sol_signature_t*)key;
+    return sol_hash_bytes(sig->bytes, sizeof(sig->bytes));
+}
+
+static bool
+tx_seen_sig_eq(const void* a, const void* b) {
+    return memcmp(a, b, sizeof(sol_signature_t)) == 0;
+}
+
+/* Wave scheduler barrier: transactions that can mutate state required for lock-set
+ * construction (e.g. ALT tables, program upgrades). These are rare on mainnet,
+ * but must be processed in-order to keep v0 resolution and implicit ProgramData
+ * locks correct. */
+static bool
+tx_is_wave_barrier(const sol_transaction_t* tx) {
+    if (!tx) return false;
+    const sol_message_t* msg = &tx->message;
+    if (!msg->account_keys || msg->account_keys_len == 0) return false;
+
+    const sol_pubkey_t* keys = msg->account_keys;
+    size_t keys_len = (size_t)msg->account_keys_len;
+
+    for (uint8_t ix_i = 0; ix_i < msg->instructions_len; ix_i++) {
+        const sol_compiled_instruction_t* ix = &msg->instructions[ix_i];
+        if (!ix) continue;
+        if ((size_t)ix->program_id_index >= keys_len) continue;
+        const sol_pubkey_t* pid = &keys[ix->program_id_index];
+        if (sol_pubkey_eq(pid, &SOL_ADDRESS_LOOKUP_TABLE_ID) ||
+            sol_pubkey_eq(pid, &SOL_BPF_LOADER_UPGRADEABLE_ID) ||
+            sol_pubkey_eq(pid, &SOL_BPF_LOADER_V2_ID) ||
+            sol_pubkey_eq(pid, &SOL_BPF_LOADER_DEPRECATED_ID)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    uint32_t last_write; /* wave index + 1, 0 = none */
+    uint32_t last_read;  /* wave index + 1, 0 = none */
+} tx_wave_last_t;
+
+typedef struct {
+    size_t*           tx_indices;
+    size_t            tx_len;
+    size_t            tx_cap;
+} tx_wave_t;
+
+static void
+tx_wave_destroy(tx_wave_t* w) {
+    if (!w) return;
+    sol_free(w->tx_indices);
+    memset(w, 0, sizeof(*w));
+}
+
+static inline void
+tx_wave_reset(tx_wave_t* w) {
+    if (!w) return;
+    w->tx_len = 0;
+}
+
+static bool
+tx_wave_push(tx_wave_t* w, size_t tx_index) {
+    if (!w) return false;
+    if (w->tx_len == w->tx_cap) {
+        size_t new_cap = w->tx_cap ? (w->tx_cap * 2u) : 64u;
+        size_t* next = sol_realloc_array(size_t, w->tx_indices, new_cap);
+        if (!next) return false;
+        w->tx_indices = next;
+        w->tx_cap = new_cap;
+    }
+    w->tx_indices[w->tx_len++] = tx_index;
+    return true;
+}
+
+typedef struct {
+    /* Legacy contiguous batching scratch (also used by DAG/wave paths). */
+    sol_pubkey_map_t* batch_reads;
+    sol_pubkey_map_t* batch_writes;
+    sol_map_t*        seen_sigs;
+
+    /* v0 account resolution scratch (avoid per-slot arena churn). */
+    bank_v0_resolve_cache_t v0_cache;
+
+    /* sol_bank_process_entries scratch (flattened tx pointers/results). */
+    const sol_transaction_t**  batch_tx_ptrs;
+    sol_tx_result_t*           batch_results;
+    size_t                     batch_buf_cap;
+
+    /* Shared for DAG + wave schedulers (account last-access tracking). */
+    sol_pubkey_map_t* last_access;
+
+    /* Wave scheduler scratch. */
+    tx_wave_t*                 waves;
+    size_t                     waves_cap;
+    const sol_transaction_t**  wave_ptrs;
+    sol_tx_result_t*           wave_results;
+    size_t                     wave_buf_cap;
+
+    /* DAG scheduler scratch. */
+    uint32_t*  dag_adj_head;
+    uint32_t*  dag_indegree;
+    uint32_t*  dag_ready_next;
+    uint32_t*  dag_seg_nodes;
+    size_t     dag_node_cap;
+    uint32_t*  dag_edge_to;
+    uint32_t*  dag_edge_next;
+    size_t     dag_edge_cap;
+} tx_sched_scratch_t;
+
+static __thread tx_sched_scratch_t g_tls_tx_sched_scratch = {0};
+
+static bool
+tx_sched_ensure_pubkey_map(sol_pubkey_map_t** map,
+                           size_t val_size,
+                           size_t reserve_cap) {
+    if (!map) return false;
+    if (!*map) {
+        *map = sol_pubkey_map_new(val_size, reserve_cap);
+        return *map != NULL;
+    }
+    if ((*map)->inner) {
+        (void)sol_map_reserve((*map)->inner, reserve_cap);
+    }
+    return true;
+}
+
+static bool
+tx_sched_ensure_seen_sigs(sol_map_t** map, size_t reserve_cap) {
+    if (!map) return false;
+    if (!*map) {
+        *map = sol_map_new(sizeof(sol_signature_t),
+                           sizeof(uint8_t),
+                           tx_seen_sig_hash,
+                           tx_seen_sig_eq,
+                           reserve_cap);
+        return *map != NULL;
+    }
+    (void)sol_map_reserve(*map, reserve_cap);
+    return true;
+}
+
+static bool
+tx_sched_ensure_v0_patches(bank_v0_resolve_cache_t* cache, size_t count) {
+    if (!cache) return false;
+    if (cache->patches_cap >= count) return true;
+    bank_v0_msg_patch_t* next = sol_realloc_array(bank_v0_msg_patch_t, cache->patches, count);
+    if (!next) return false;
+    if (count > cache->patches_cap) {
+        memset(next + cache->patches_cap,
+               0,
+               (count - cache->patches_cap) * sizeof(*next));
+    }
+    cache->patches = next;
+    cache->patches_cap = count;
+    return true;
+}
+
+static bool
+tx_sched_ensure_waves(tx_sched_scratch_t* sc, size_t count) {
+    if (!sc) return false;
+
+    if (sc->waves_cap < count) {
+        tx_wave_t* next = sol_realloc_array(tx_wave_t, sc->waves, count);
+        if (!next) return false;
+        /* New slots must start zeroed so tx_indices pointers are NULL. */
+        if (count > sc->waves_cap) {
+            memset(next + sc->waves_cap, 0, (count - sc->waves_cap) * sizeof(*next));
+        }
+        sc->waves = next;
+        sc->waves_cap = count;
+    }
+
+    if (sc->wave_buf_cap < count) {
+        const sol_transaction_t** next_ptrs =
+            sol_realloc_array(const sol_transaction_t*, sc->wave_ptrs, count);
+        if (!next_ptrs) return false;
+        sc->wave_ptrs = next_ptrs;
+
+        sol_tx_result_t* next_results =
+            sol_realloc_array(sol_tx_result_t, sc->wave_results, count);
+        if (!next_results) return false;
+        sc->wave_results = next_results;
+
+        sc->wave_buf_cap = count;
+    }
+
+    return true;
+}
+
+static bool
+tx_sched_ensure_batch_bufs(tx_sched_scratch_t* sc, size_t count) {
+    if (!sc) return false;
+
+    if (sc->batch_buf_cap < count) {
+        const sol_transaction_t** next_ptrs =
+            sol_realloc_array(const sol_transaction_t*, sc->batch_tx_ptrs, count);
+        if (!next_ptrs) return false;
+        sc->batch_tx_ptrs = next_ptrs;
+
+        sol_tx_result_t* next_results =
+            sol_realloc_array(sol_tx_result_t, sc->batch_results, count);
+        if (!next_results) return false;
+        sc->batch_results = next_results;
+
+        sc->batch_buf_cap = count;
+    }
+
+    return true;
+}
+
+static bool
+tx_sched_ensure_dag(tx_sched_scratch_t* sc, size_t count, size_t edge_cap) {
+    if (!sc) return false;
+    if (sc->dag_node_cap < count) {
+        uint32_t* next_adj = sol_realloc_array(uint32_t, sc->dag_adj_head, count);
+        if (!next_adj) return false;
+        sc->dag_adj_head = next_adj;
+
+        uint32_t* next_indeg = sol_realloc_array(uint32_t, sc->dag_indegree, count);
+        if (!next_indeg) return false;
+        sc->dag_indegree = next_indeg;
+
+        uint32_t* next_ready = sol_realloc_array(uint32_t, sc->dag_ready_next, count);
+        if (!next_ready) return false;
+        sc->dag_ready_next = next_ready;
+
+        uint32_t* next_seg = sol_realloc_array(uint32_t, sc->dag_seg_nodes, count);
+        if (!next_seg) return false;
+        sc->dag_seg_nodes = next_seg;
+
+        sc->dag_node_cap = count;
+    }
+    if (sc->dag_edge_cap < edge_cap) {
+        uint32_t* next_to = sol_realloc_array(uint32_t, sc->dag_edge_to, edge_cap);
+        if (!next_to) return false;
+        sc->dag_edge_to = next_to;
+
+        uint32_t* next_next = sol_realloc_array(uint32_t, sc->dag_edge_next, edge_cap);
+        if (!next_next) return false;
+        sc->dag_edge_next = next_next;
+
+        sc->dag_edge_cap = edge_cap;
+    }
+    return true;
+}
+
+static sol_err_t
+sol_bank_process_transactions_ptrs(sol_bank_t* bank,
+                                   const sol_transaction_t** tx_ptrs,
+                                   size_t count,
+                                   sol_tx_result_t* results) {
+    if (!bank || !tx_ptrs || !results) return SOL_ERR_INVAL;
+    if (count == 0) return SOL_OK;
+
+    tx_pool_stats_t pool_stats = {0};
+    bool tx_pool_stats = tx_pool_stats_enabled();
+    if (__builtin_expect(tx_pool_stats, 0)) {
+        g_tls_tx_pool_stats = &pool_stats;
+    }
+
+    if (!tx_parallel_enabled() || count < 16) {
+        for (size_t i = 0; i < count; i++) {
+            results[i] = sol_bank_process_transaction(bank, tx_ptrs[i]);
+        }
+        if (__builtin_expect(tx_pool_stats, 0)) {
+            /* No batching/pool usage in this path; clear TLS pointer. */
+            g_tls_tx_pool_stats = NULL;
+        }
+        return SOL_OK;
+    }
+
+    (void)pthread_once(&g_tx_pool_once, tx_pool_init_once);
+
+    /* Deterministic batching: execute maximal contiguous ranges of
+     * non-conflicting transactions in parallel. */
+    tx_sched_scratch_t* sc = &g_tls_tx_sched_scratch;
+
+    if (!tx_sched_ensure_pubkey_map(&sc->batch_reads, sizeof(uint8_t), 1024u) ||
+        !tx_sched_ensure_pubkey_map(&sc->batch_writes, sizeof(uint8_t), 1024u)) {
+        for (size_t i = 0; i < count; i++) {
+            results[i] = sol_bank_process_transaction(bank, tx_ptrs[i]);
+        }
+        if (__builtin_expect(tx_pool_stats, 0)) {
+            g_tls_tx_pool_stats = NULL;
+        }
+        return SOL_OK;
+    }
+
+    sol_pubkey_map_t* batch_reads = sc->batch_reads;
+    sol_pubkey_map_t* batch_writes = sc->batch_writes;
+    sol_map_clear(batch_reads->inner);
+    sol_map_clear(batch_writes->inner);
+
+    sol_pubkey_t keys[SOL_MAX_MESSAGE_ACCOUNTS];
+    bool writable[SOL_MAX_MESSAGE_ACCOUNTS];
+    bool signer[SOL_MAX_MESSAGE_ACCOUNTS];
+    (void)signer;
+
+    uint8_t one = 1u;
+    size_t batch_start = 0;
+
+    bank_v0_resolve_cache_t* v0_cache = &sc->v0_cache;
+    /* Ensure message patches from a prior call are reverted. */
+    bank_v0_cache_reset(v0_cache);
+    bank_v0_msg_patch_t* saved_v0_patches = v0_cache->patches;
+    size_t saved_v0_patches_cap = v0_cache->patches_cap;
+    bool v0_cache_disabled = false;
+    if (!tx_sched_ensure_v0_patches(v0_cache, count)) {
+        /* Fall back to resolving v0 messages without caching. */
+        v0_cache_disabled = true;
+        v0_cache->patches = NULL;
+        v0_cache->patches_cap = 0;
+    }
+
+    static int tx_batch_stats_cached = -1;
+    if (__builtin_expect(tx_batch_stats_cached < 0, 0)) {
+        const char* env = getenv("SOL_TX_BATCH_STATS");
+        tx_batch_stats_cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    bool tx_batch_stats = tx_batch_stats_cached != 0;
+    size_t tx_batch_cnt = 0;
+    size_t tx_batch_txs = 0;
+    size_t tx_batch_min = SIZE_MAX;
+    size_t tx_batch_max = 0;
+    size_t tx_batch_lt8_cnt = 0;
+    size_t tx_batch_lt8_txs = 0;
+    size_t tx_batch_seq_txs = 0;
+    size_t tx_batch_hist[8] = {0}; /* sizes 0..7; we use 1..7 */
+
+#define TX_BATCH_STATS_ADD(len_) do {               \
+        size_t _l = (len_);                         \
+        if (_l == 0) break;                         \
+        tx_batch_cnt++;                             \
+        tx_batch_txs += _l;                         \
+        if (_l < tx_batch_min) tx_batch_min = _l;   \
+        if (_l > tx_batch_max) tx_batch_max = _l;   \
+        if (_l < 8u) {                              \
+            tx_batch_lt8_cnt++;                     \
+            tx_batch_lt8_txs += _l;                 \
+            if (_l < (sizeof(tx_batch_hist) / sizeof(tx_batch_hist[0]))) { \
+                tx_batch_hist[_l]++;                \
+            }                                       \
+        }                                           \
+    } while (0)
+
+    /* In the parallel path, avoid bank->lock contention from tx-status
+     * reserve/record by doing duplicate filtering up-front and recording tx
+     * statuses after execution in a single thread. */
+    bool skip_tx_status = true;
+    sol_map_t* seen_sigs = NULL;
+    if (tx_sched_ensure_seen_sigs(&sc->seen_sigs, count * 2u)) {
+        seen_sigs = sc->seen_sigs;
+        sol_map_clear(seen_sigs);
+    } else {
+        skip_tx_status = false;
+    }
+
+    if (tx_wave_sched_enabled()) {
+        static int tx_wave_diag_cached = -1;
+        if (__builtin_expect(tx_wave_diag_cached < 0, 0)) {
+            const char* env = getenv("SOL_TX_WAVE_DIAG");
+            tx_wave_diag_cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+        }
+        bool tx_wave_diag = tx_wave_diag_cached != 0;
+        uint64_t wave_total_t0 = tx_wave_diag ? bank_monotonic_ns() : 0;
+        uint64_t wave_exec_ns = 0;
+        size_t wave_flushes = 0;
+        size_t wave_waves_created = 0;
+        size_t wave_waves_peak = 0;
+        size_t wave_txs_scheduled = 0;
+
+        /* Wave scheduler: build independent "waves" separated by barriers that can
+         * change lock-set construction (ALT updates, program upgrades). Execute
+         * waves sequentially; each wave runs in parallel. */
+        sol_pubkey_map_t* last_access = NULL;
+        if (!tx_sched_ensure_pubkey_map(&sc->last_access,
+                                        sizeof(tx_wave_last_t),
+                                        count * 16u)) {
+            goto legacy_sched;
+        }
+        last_access = sc->last_access;
+        sol_map_clear(last_access->inner);
+
+        bool use_dag = tx_dag_sched_enabled() && count <= (size_t)UINT32_MAX;
+
+        /* Pre-pass for duplicate filtering and NULL tx pointers. Must happen before
+         * any parallel execution in skip_tx_status mode. */
+	        for (size_t i = 0; i < count; i++) {
+	            const sol_transaction_t* tx = tx_ptrs[i];
+	            if (!tx) {
+	                sol_tx_result_t r = {0};
+	                r.status = SOL_ERR_INVAL;
+                results[i] = r;
+                continue;
+            }
+
+            if (skip_tx_status) {
+                const sol_signature_t* sig = sol_transaction_signature(tx);
+                if (sig && sol_map_contains(seen_sigs, sig)) {
+                    sol_tx_result_t r = {0};
+                    r.status = SOL_ERR_TX_ALREADY_PROCESSED;
+                    results[i] = r;
+                    tx_ptrs[i] = NULL;
+
+                    BANK_STAT_INC(bank, transactions_processed);
+                    BANK_STAT_INC(bank, transactions_failed);
+                    BANK_STAT_INC(bank, rejected_duplicate);
+                    log_prevalidation_rejection(bank, tx, "duplicate", SOL_ERR_TX_ALREADY_PROCESSED);
+                    continue;
+                }
+                if (sig) {
+                    (void)sol_map_insert(seen_sigs, sig, &one);
+	                }
+	            }
+	        }
+
+	        /* DAG scheduler: build a tx-index dependency graph and execute ready txs
+	         * as soon as their (account-lock) predecessors complete. This removes the
+	         * full barrier between "waves" and significantly improves throughput
+	         * when the workload contains a few long-running txs that would otherwise
+	         * stall unrelated dependent chains. */
+	        if (use_dag) {
+	            size_t edge_cap = count * 32u;
+	            if (edge_cap < 1024u) edge_cap = 1024u;
+	            if (!tx_sched_ensure_dag(sc, count, edge_cap)) {
+	                /* Allocation failed; fall back to the barriered wave scheduler. */
+	                use_dag = false;
+	            } else {
+	                uint32_t* adj_head = sc->dag_adj_head;
+	                uint32_t* indegree = sc->dag_indegree;
+	                uint32_t* ready_next = sc->dag_ready_next;
+	                uint32_t* seg_nodes = sc->dag_seg_nodes;
+	                uint32_t* edge_to = sc->dag_edge_to;
+	                uint32_t* edge_next = sc->dag_edge_next;
+	                edge_cap = sc->dag_edge_cap;
+
+	                memset(adj_head, 0xFF, count * sizeof(*adj_head));
+	                memset(indegree, 0, count * sizeof(*indegree));
+	                memset(ready_next, 0xFF, count * sizeof(*ready_next));
+	                sol_map_clear(last_access->inner);
+
+		                size_t seg_len = 0;
+		                size_t edge_len = 0;
+		                size_t seg_begin = SIZE_MAX;
+		                size_t seg_end = 0;
+		                size_t dag_segments = 0;
+		                size_t dag_edges_total = 0;
+		                size_t dag_txs_scheduled = 0;
+		                uint64_t dag_exec_ns = 0;
+		                bool dag_abort = false;
+
+#define TX_DAG_SEG_RESET() do {                                           \
+		                        seg_len = 0;                                    \
+		                        edge_len = 0;                                   \
+		                        seg_begin = SIZE_MAX;                            \
+		                        seg_end = 0;                                    \
+		                        memset(adj_head, 0xFF, count * sizeof(*adj_head)); \
+		                        memset(indegree, 0, count * sizeof(*indegree)); \
+		                        sol_map_clear(last_access->inner);              \
+		                    } while (0)
+
+#define TX_DAG_FLUSH_EXEC() do {                                          \
+		                        if (seg_len == 0) break;                        \
+		                        if (__builtin_expect(tx_batch_stats, 0)) {      \
+		                            TX_BATCH_STATS_ADD(seg_len);                \
+		                        }                                                \
+		                        uint64_t _exec0 = __builtin_expect(tx_wave_diag, 0) ? bank_monotonic_ns() : 0; \
+		                        if (edge_len == 0 && seg_begin != SIZE_MAX && seg_end > seg_begin) { \
+		                            /* Fast path: no dependencies => execute as a plain parallel range. */ \
+		                            tx_pool_run_range_ptrs(bank,                 \
+		                                                   tx_ptrs,              \
+		                                                   results,              \
+		                                                   seg_begin,            \
+		                                                   seg_end,              \
+		                                                   skip_tx_status);      \
+		                        } else {                                        \
+		                            tx_pool_run_dag_ptrs(bank,                  \
+		                                                 tx_ptrs,               \
+		                                                 results,               \
+		                                                 seg_nodes,             \
+		                                                 seg_len,               \
+		                                                 adj_head,              \
+		                                                 edge_to,               \
+		                                                 edge_next,             \
+		                                                 indegree,              \
+		                                                 ready_next,            \
+		                                                 skip_tx_status);       \
+		                        }                                               \
+		                        if (__builtin_expect(tx_wave_diag, 0)) {        \
+		                            dag_exec_ns += bank_monotonic_ns() - _exec0; \
+		                        }                                                \
+		                        dag_segments++;                                  \
+		                        dag_edges_total += edge_len;                     \
+	                        TX_DAG_SEG_RESET();                              \
+	                    } while (0)
+
+	                for (size_t i = 0; i < count; i++) {
+	                    const sol_transaction_t* tx = tx_ptrs[i];
+	                    if (!tx) continue;
+
+	                    if (tx_is_wave_barrier(tx)) {
+	                        TX_DAG_FLUSH_EXEC();
+	                        results[i] = skip_tx_status
+	                            ? sol_bank_process_transaction_parallel(bank, tx)
+	                            : sol_bank_process_transaction(bank, tx);
+	                        if (__builtin_expect(tx_batch_stats, 0)) {
+	                            TX_BATCH_STATS_ADD(1u);
+	                            tx_batch_seq_txs++;
+	                        }
+	                        continue;
+	                    }
+
+	                    size_t key_len = 0;
+	                    const sol_pubkey_t* keys_view = NULL;
+	                    const bool* writable_view = NULL;
+
+	                    sol_err_t rerr = SOL_OK;
+	                    if (tx->message.version == SOL_MESSAGE_VERSION_V0 && v0_cache->patches) {
+	                        sol_err_t cerr = bank_v0_cache_resolve(bank, tx, v0_cache);
+	                        if (cerr == SOL_OK) {
+	                            const sol_message_t* msg = &tx->message;
+	                            key_len = (size_t)msg->resolved_accounts_len;
+	                            keys_view = msg->resolved_accounts;
+	                            writable_view = msg->is_writable;
+	                        } else {
+	                            rerr = cerr;
+	                        }
+	                    }
+
+	                    if (!keys_view) {
+	                        rerr = sol_bank_resolve_transaction_accounts(bank,
+	                                                                    tx,
+	                                                                    keys,
+	                                                                    writable,
+	                                                                    signer,
+	                                                                    SOL_MAX_MESSAGE_ACCOUNTS,
+	                                                                    &key_len);
+	                        if (rerr == SOL_OK) {
+	                            keys_view = keys;
+	                            writable_view = writable;
+	                        }
+	                    }
+
+	                    if (rerr != SOL_OK || !keys_view || !writable_view) {
+	                        /* Can't build a lock set; flush and execute sequentially. */
+	                        TX_DAG_FLUSH_EXEC();
+	                        results[i] = skip_tx_status
+	                            ? sol_bank_process_transaction_parallel(bank, tx)
+	                            : sol_bank_process_transaction(bank, tx);
+	                        if (__builtin_expect(tx_batch_stats, 0)) {
+	                            TX_BATCH_STATS_ADD(1u);
+	                            tx_batch_seq_txs++;
+	                        }
+	                        continue;
+	                    }
+
+	                    sol_pubkey_t progdata_keys[64];
+	                    size_t progdata_len = 0;
+	                    sol_pubkey_t seen_progids[64];
+	                    size_t seen_progids_len = 0;
+
+	                    for (uint8_t ix_i = 0; ix_i < tx->message.instructions_len; ix_i++) {
+	                        const sol_compiled_instruction_t* ix = &tx->message.instructions[ix_i];
+	                        if ((size_t)ix->program_id_index >= key_len) {
+	                            continue;
+	                        }
+	                        const sol_pubkey_t* pid = &keys_view[ix->program_id_index];
+	                        if (sol_pubkey_eq(pid, &SOL_SYSTEM_PROGRAM_ID) ||
+	                            sol_pubkey_eq(pid, &SOL_VOTE_PROGRAM_ID) ||
+	                            sol_pubkey_eq(pid, &SOL_COMPUTE_BUDGET_ID) ||
+	                            sol_pubkey_eq(pid, &SOL_ED25519_PROGRAM_ID) ||
+	                            sol_pubkey_eq(pid, &SOL_SECP256K1_PROGRAM_ID) ||
+	                            sol_pubkey_eq(pid, &SOL_SECP256R1_PROGRAM_ID) ||
+	                            sol_pubkey_eq(pid, &SOL_BPF_LOADER_UPGRADEABLE_ID) ||
+	                            sol_pubkey_eq(pid, &SOL_BPF_LOADER_V2_ID)) {
+	                            continue;
+	                        }
+
+	                        bool seen = false;
+	                        for (size_t si = 0; si < seen_progids_len; si++) {
+	                            if (sol_pubkey_eq(&seen_progids[si], pid)) {
+	                                seen = true;
+	                                break;
+	                            }
+	                        }
+	                        if (seen) continue;
+	                        if (seen_progids_len < (sizeof(seen_progids) / sizeof(seen_progids[0]))) {
+	                            seen_progids[seen_progids_len++] = *pid;
+	                        }
+
+	                        sol_pubkey_t pd = {0};
+	                        if (bank_get_upgradeable_programdata_pubkey(bank, pid, &pd)) {
+	                            if (progdata_len < (sizeof(progdata_keys) / sizeof(progdata_keys[0]))) {
+	                                progdata_keys[progdata_len++] = pd;
+	                            }
+	                        }
+	                    }
+
+	                    uint32_t to = (uint32_t)i;
+
+	                    /* Add dependency edges derived from account locks. */
+	                    for (size_t k = 0; k < key_len; k++) {
+	                        const sol_pubkey_t* key = &keys_view[k];
+	                        const tx_wave_last_t* last =
+	                            (const tx_wave_last_t*)sol_pubkey_map_get(last_access, key);
+	                        if (!last) continue;
+
+	                        uint32_t dep = writable_view[k]
+	                            ? ((last->last_write > last->last_read) ? last->last_write : last->last_read)
+	                            : last->last_write;
+	                        if (dep == 0u) continue;
+	                        uint32_t from = dep - 1u;
+
+	                        if (edge_len == edge_cap) {
+	                            size_t new_cap = edge_cap * 2u;
+	                            uint32_t* new_to = sol_alloc(new_cap * sizeof(*new_to));
+	                            uint32_t* new_next = sol_alloc(new_cap * sizeof(*new_next));
+	                            if (!new_to || !new_next) {
+	                                sol_free(new_to);
+	                                sol_free(new_next);
+	                                dag_abort = true;
+	                                break;
+	                            }
+	                            memcpy(new_to, edge_to, edge_len * sizeof(*new_to));
+	                            memcpy(new_next, edge_next, edge_len * sizeof(*new_next));
+	                            sol_free(edge_to);
+	                            sol_free(edge_next);
+	                            edge_to = new_to;
+	                            edge_next = new_next;
+	                            edge_cap = new_cap;
+	                        }
+
+	                        edge_to[edge_len] = to;
+	                        edge_next[edge_len] = adj_head[from];
+	                        adj_head[from] = (uint32_t)edge_len;
+	                        edge_len++;
+	                        indegree[to]++;
+	                    }
+
+	                    if (dag_abort) {
+	                        /* Flush what we have sequentially and finish in-order. */
+	                        for (size_t si = 0; si < seg_len; si++) {
+	                            uint32_t node = seg_nodes[si];
+	                            const sol_transaction_t* tx2 = tx_ptrs[node];
+	                            if (!tx2) continue;
+	                            results[node] = skip_tx_status
+	                                ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                : sol_bank_process_transaction(bank, tx2);
+	                        }
+	                        seg_len = 0;
+	                        for (size_t j = i; j < count; j++) {
+	                            const sol_transaction_t* tx2 = tx_ptrs[j];
+	                            if (!tx2) continue;
+	                            results[j] = skip_tx_status
+	                                ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                : sol_bank_process_transaction(bank, tx2);
+	                        }
+	                        break;
+	                    }
+
+	                    /* ALT table accounts are read during v0 resolution. */
+	                    if (tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+	                        tx->message.address_lookups_len > 0 &&
+	                        tx->message.address_lookups) {
+	                        for (uint8_t li = 0; li < tx->message.address_lookups_len; li++) {
+	                            const sol_pubkey_t* table = &tx->message.address_lookups[li].account_key;
+	                            const tx_wave_last_t* last =
+	                                (const tx_wave_last_t*)sol_pubkey_map_get(last_access, table);
+	                            if (last && last->last_write != 0u) {
+	                                uint32_t from = last->last_write - 1u;
+	                                if (edge_len == edge_cap) {
+	                                    size_t new_cap = edge_cap * 2u;
+	                                    uint32_t* new_to = sol_alloc(new_cap * sizeof(*new_to));
+	                                    uint32_t* new_next = sol_alloc(new_cap * sizeof(*new_next));
+	                                    if (!new_to || !new_next) {
+	                                        sol_free(new_to);
+	                                        sol_free(new_next);
+	                                        dag_abort = true;
+	                                        break;
+	                                    }
+	                                    memcpy(new_to, edge_to, edge_len * sizeof(*new_to));
+	                                    memcpy(new_next, edge_next, edge_len * sizeof(*new_next));
+	                                    sol_free(edge_to);
+	                                    sol_free(edge_next);
+	                                    edge_to = new_to;
+	                                    edge_next = new_next;
+	                                    edge_cap = new_cap;
+	                                }
+	                                edge_to[edge_len] = to;
+	                                edge_next[edge_len] = adj_head[from];
+	                                adj_head[from] = (uint32_t)edge_len;
+	                                edge_len++;
+	                                indegree[to]++;
+	                            }
+	                        }
+	                        if (dag_abort) {
+	                            for (size_t si = 0; si < seg_len; si++) {
+	                                uint32_t node = seg_nodes[si];
+	                                const sol_transaction_t* tx2 = tx_ptrs[node];
+	                                if (!tx2) continue;
+	                                results[node] = skip_tx_status
+	                                    ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                    : sol_bank_process_transaction(bank, tx2);
+	                            }
+	                            seg_len = 0;
+	                            for (size_t j = i; j < count; j++) {
+	                                const sol_transaction_t* tx2 = tx_ptrs[j];
+	                                if (!tx2) continue;
+	                                results[j] = skip_tx_status
+	                                    ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                    : sol_bank_process_transaction(bank, tx2);
+	                            }
+	                            break;
+	                        }
+	                    }
+
+	                    for (size_t pk = 0; pk < progdata_len; pk++) {
+	                        const sol_pubkey_t* key = &progdata_keys[pk];
+	                        const tx_wave_last_t* last =
+	                            (const tx_wave_last_t*)sol_pubkey_map_get(last_access, key);
+	                        if (last && last->last_write != 0u) {
+	                            uint32_t from = last->last_write - 1u;
+	                            if (edge_len == edge_cap) {
+	                                size_t new_cap = edge_cap * 2u;
+	                                uint32_t* new_to = sol_alloc(new_cap * sizeof(*new_to));
+	                                uint32_t* new_next = sol_alloc(new_cap * sizeof(*new_next));
+	                                if (!new_to || !new_next) {
+	                                    sol_free(new_to);
+	                                    sol_free(new_next);
+	                                    dag_abort = true;
+	                                    break;
+	                                }
+	                                memcpy(new_to, edge_to, edge_len * sizeof(*new_to));
+	                                memcpy(new_next, edge_next, edge_len * sizeof(*new_next));
+	                                sol_free(edge_to);
+	                                sol_free(edge_next);
+	                                edge_to = new_to;
+	                                edge_next = new_next;
+	                                edge_cap = new_cap;
+	                            }
+	                            edge_to[edge_len] = to;
+	                            edge_next[edge_len] = adj_head[from];
+	                            adj_head[from] = (uint32_t)edge_len;
+	                            edge_len++;
+	                            indegree[to]++;
+	                        }
+	                    }
+
+	                    if (dag_abort) {
+	                        for (size_t si = 0; si < seg_len; si++) {
+	                            uint32_t node = seg_nodes[si];
+	                            const sol_transaction_t* tx2 = tx_ptrs[node];
+	                            if (!tx2) continue;
+	                            results[node] = skip_tx_status
+	                                ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                : sol_bank_process_transaction(bank, tx2);
+	                        }
+	                        seg_len = 0;
+	                        for (size_t j = i; j < count; j++) {
+	                            const sol_transaction_t* tx2 = tx_ptrs[j];
+	                            if (!tx2) continue;
+	                            results[j] = skip_tx_status
+	                                ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                : sol_bank_process_transaction(bank, tx2);
+	                        }
+	                        break;
+	                    }
+
+		                    /* Mark scheduled and update last-access map with tx-index stamps. */
+		                    if (seg_len == 0) {
+		                        seg_begin = (size_t)to;
+		                    }
+		                    seg_end = (size_t)to + 1u;
+		                    seg_nodes[seg_len++] = to;
+		                    dag_txs_scheduled++;
+
+	                    uint32_t stamp = to + 1u;
+	                    for (size_t k = 0; k < key_len; k++) {
+	                        const sol_pubkey_t* key = &keys_view[k];
+	                        tx_wave_last_t* last =
+	                            (tx_wave_last_t*)sol_pubkey_map_insert(last_access, key, NULL);
+	                        if (!last) continue;
+	                        if (writable_view[k]) {
+	                            if (last->last_write < stamp) last->last_write = stamp;
+	                        } else {
+	                            if (last->last_read < stamp) last->last_read = stamp;
+	                        }
+	                    }
+
+	                    if (tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+	                        tx->message.address_lookups_len > 0 &&
+	                        tx->message.address_lookups) {
+	                        for (uint8_t li = 0; li < tx->message.address_lookups_len; li++) {
+	                            const sol_pubkey_t* table = &tx->message.address_lookups[li].account_key;
+	                            tx_wave_last_t* last =
+	                                (tx_wave_last_t*)sol_pubkey_map_insert(last_access, table, NULL);
+	                            if (last && last->last_read < stamp) last->last_read = stamp;
+	                        }
+	                    }
+
+	                    for (size_t pk = 0; pk < progdata_len; pk++) {
+	                        const sol_pubkey_t* key = &progdata_keys[pk];
+	                        tx_wave_last_t* last =
+	                            (tx_wave_last_t*)sol_pubkey_map_insert(last_access, key, NULL);
+	                        if (last && last->last_read < stamp) last->last_read = stamp;
+	                    }
+	                }
+
+	                if (!dag_abort) {
+	                    TX_DAG_FLUSH_EXEC();
+	                }
+
+#undef TX_DAG_FLUSH_EXEC
+#undef TX_DAG_SEG_RESET
+	                /* Clear last-access tracking for reuse next call. */
+	                sol_map_clear(last_access->inner);
+
+	                /* If we grew edge buffers during this run, keep them. */
+	                sc->dag_edge_to = edge_to;
+	                sc->dag_edge_next = edge_next;
+	                sc->dag_edge_cap = edge_cap;
+
+	                if (__builtin_expect(tx_wave_diag, 0)) {
+	                    uint64_t dag_total_ns = bank_monotonic_ns() - wave_total_t0;
+	                    uint64_t dag_build_ns = dag_total_ns - dag_exec_ns;
+	                    sol_log_info("tx_dag_diag: txs=%zu scheduled=%zu segments=%zu edges=%zu build_ms=%.3f exec_ms=%.3f total_ms=%.3f",
+	                                 count,
+	                                 dag_txs_scheduled,
+	                                 dag_segments,
+	                                 dag_edges_total,
+	                                 (double)dag_build_ns / 1e6,
+	                                 (double)dag_exec_ns / 1e6,
+	                                 (double)dag_total_ns / 1e6);
+	                }
+	                goto tx_sched_done;
+	            }
+	        }
+
+            if (!tx_sched_ensure_waves(sc, count)) {
+                goto legacy_sched;
+            }
+
+            tx_wave_t* waves = sc->waves;
+            const sol_transaction_t** wave_ptrs = sc->wave_ptrs;
+            sol_tx_result_t* wave_results = sc->wave_results;
+
+#define TX_WAVE_FLUSH_EXEC() do {                                                          \
+            if (__builtin_expect(tx_wave_diag, 0)) {                                        \
+                wave_flushes++;                                                             \
+                if (waves_len > wave_waves_peak) wave_waves_peak = waves_len;               \
+            }                                                                               \
+            for (size_t _wi = 0; _wi < waves_len; _wi++) {                                 \
+                tx_wave_t* _w = &waves[_wi];                                                \
+                size_t _len = _w->tx_len;                                                   \
+                if (_len == 0) continue;                                                    \
+                if (__builtin_expect(tx_batch_stats, 0)) {                                  \
+                    TX_BATCH_STATS_ADD(_len);                                               \
+                }                                                                           \
+                for (size_t _j = 0; _j < _len; _j++) {                                      \
+                    size_t _ti = _w->tx_indices[_j];                                        \
+                    wave_ptrs[_j] = tx_ptrs[_ti];                                           \
+                }                                                                           \
+                uint64_t _exec0 = __builtin_expect(tx_wave_diag, 0) ? bank_monotonic_ns() : 0; \
+                tx_pool_run_range_ptrs(bank, wave_ptrs, wave_results, 0, _len, skip_tx_status); \
+                if (__builtin_expect(tx_wave_diag, 0)) {                                    \
+                    wave_exec_ns += bank_monotonic_ns() - _exec0;                            \
+                }                                                                           \
+                for (size_t _j = 0; _j < _len; _j++) {                                      \
+                    size_t _ti = _w->tx_indices[_j];                                        \
+                    results[_ti] = wave_results[_j];                                        \
+                }                                                                           \
+            }                                                                               \
+            for (size_t _wi = 0; _wi < waves_len; _wi++) {                                  \
+                tx_wave_reset(&waves[_wi]);                                                 \
+            }                                                                               \
+            waves_len = 0;                                                                  \
+            sol_map_clear(last_access->inner);                                              \
+        } while (0)
+
+	        size_t waves_len = 0;
+
+	        for (size_t i = 0; i < count; i++) {
+	            const sol_transaction_t* tx = tx_ptrs[i];
+            if (!tx) continue;
+
+            if (tx_is_wave_barrier(tx)) {
+                TX_WAVE_FLUSH_EXEC();
+                results[i] = skip_tx_status
+                    ? sol_bank_process_transaction_parallel(bank, tx)
+                    : sol_bank_process_transaction(bank, tx);
+                if (__builtin_expect(tx_batch_stats, 0)) {
+                    TX_BATCH_STATS_ADD(1u);
+                    tx_batch_seq_txs++;
+                }
+                continue;
+            }
+
+            size_t key_len = 0;
+            const sol_pubkey_t* keys_view = NULL;
+            const bool* writable_view = NULL;
+
+            sol_err_t rerr = SOL_OK;
+            if (tx->message.version == SOL_MESSAGE_VERSION_V0 && v0_cache->patches) {
+                sol_err_t cerr = bank_v0_cache_resolve(bank, tx, v0_cache);
+                if (cerr == SOL_OK) {
+                    const sol_message_t* msg = &tx->message;
+                    key_len = (size_t)msg->resolved_accounts_len;
+                    keys_view = msg->resolved_accounts;
+                    writable_view = msg->is_writable;
+                } else {
+                    rerr = cerr;
+                }
+            }
+
+            if (!keys_view) {
+                rerr = sol_bank_resolve_transaction_accounts(bank,
+                                                            tx,
+                                                            keys,
+                                                            writable,
+                                                            signer,
+                                                            SOL_MAX_MESSAGE_ACCOUNTS,
+                                                            &key_len);
+                if (rerr == SOL_OK) {
+                    keys_view = keys;
+                    writable_view = writable;
+                }
+            }
+
+            if (rerr != SOL_OK || !keys_view || !writable_view) {
+                /* Can't build a lock set; execute sequentially after flushing. */
+                TX_WAVE_FLUSH_EXEC();
+                results[i] = skip_tx_status
+                    ? sol_bank_process_transaction_parallel(bank, tx)
+                    : sol_bank_process_transaction(bank, tx);
+                if (__builtin_expect(tx_batch_stats, 0)) {
+                    TX_BATCH_STATS_ADD(1u);
+                    tx_batch_seq_txs++;
+                }
+                continue;
+            }
+
+            sol_pubkey_t progdata_keys[64];
+            size_t progdata_len = 0;
+            sol_pubkey_t seen_progids[64];
+            size_t seen_progids_len = 0;
+
+            for (uint8_t ix_i = 0; ix_i < tx->message.instructions_len; ix_i++) {
+                const sol_compiled_instruction_t* ix = &tx->message.instructions[ix_i];
+                if ((size_t)ix->program_id_index >= key_len) {
+                    continue;
+                }
+                const sol_pubkey_t* pid = &keys_view[ix->program_id_index];
+                if (sol_pubkey_eq(pid, &SOL_SYSTEM_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_VOTE_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_COMPUTE_BUDGET_ID) ||
+                    sol_pubkey_eq(pid, &SOL_ED25519_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_SECP256K1_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_SECP256R1_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_BPF_LOADER_UPGRADEABLE_ID) ||
+                    sol_pubkey_eq(pid, &SOL_BPF_LOADER_V2_ID)) {
+                    continue;
+                }
+
+                bool seen = false;
+                for (size_t si = 0; si < seen_progids_len; si++) {
+                    if (sol_pubkey_eq(&seen_progids[si], pid)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (seen) {
+                    continue;
+                }
+                if (seen_progids_len < (sizeof(seen_progids) / sizeof(seen_progids[0]))) {
+                    seen_progids[seen_progids_len++] = *pid;
+                }
+
+                sol_pubkey_t pd = {0};
+                if (bank_get_upgradeable_programdata_pubkey(bank, pid, &pd)) {
+                    if (progdata_len < (sizeof(progdata_keys) / sizeof(progdata_keys[0]))) {
+                        progdata_keys[progdata_len++] = pd;
+                    }
+                }
+            }
+
+            uint32_t min_wave = 0;
+
+            /* Account locks from the resolved account list. */
+            for (size_t k = 0; k < key_len; k++) {
+                const sol_pubkey_t* key = &keys_view[k];
+                const tx_wave_last_t* last = (const tx_wave_last_t*)sol_pubkey_map_get(last_access, key);
+                if (!last) continue;
+                uint32_t dep = writable_view[k]
+                    ? ((last->last_write > last->last_read) ? last->last_write : last->last_read)
+                    : last->last_write;
+                if (dep > min_wave) min_wave = dep;
+            }
+
+            /* Lock ALT table accounts as read-only (used during v0 resolution). */
+            if (tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+                tx->message.address_lookups_len > 0 &&
+                tx->message.address_lookups) {
+                for (uint8_t li = 0; li < tx->message.address_lookups_len; li++) {
+                    const sol_pubkey_t* table = &tx->message.address_lookups[li].account_key;
+                    const tx_wave_last_t* last = (const tx_wave_last_t*)sol_pubkey_map_get(last_access, table);
+                    if (!last) continue;
+                    if (last->last_write > min_wave) min_wave = last->last_write;
+                }
+            }
+
+            for (size_t pk = 0; pk < progdata_len; pk++) {
+                const sol_pubkey_t* key = &progdata_keys[pk];
+                const tx_wave_last_t* last = (const tx_wave_last_t*)sol_pubkey_map_get(last_access, key);
+                if (!last) continue;
+                if (last->last_write > min_wave) min_wave = last->last_write;
+            }
+
+            size_t wave_index = (size_t)min_wave;
+
+            if (wave_index == waves_len) {
+                if (waves_len >= count) {
+                    /* Should not happen, but stay safe. */
+                    TX_WAVE_FLUSH_EXEC();
+                    results[i] = skip_tx_status
+                        ? sol_bank_process_transaction_parallel(bank, tx)
+                        : sol_bank_process_transaction(bank, tx);
+                    if (__builtin_expect(tx_batch_stats, 0)) {
+                        TX_BATCH_STATS_ADD(1u);
+                        tx_batch_seq_txs++;
+                    }
+                    continue;
+                }
+
+                tx_wave_t* w = &waves[waves_len];
+                tx_wave_reset(w);
+                waves_len++;
+                if (__builtin_expect(tx_wave_diag, 0)) {
+                    wave_waves_created++;
+                    if (waves_len > wave_waves_peak) wave_waves_peak = waves_len;
+                }
+            }
+
+            tx_wave_t* w = &waves[wave_index];
+
+            if (!tx_wave_push(w, i)) {
+                TX_WAVE_FLUSH_EXEC();
+                results[i] = skip_tx_status
+                    ? sol_bank_process_transaction_parallel(bank, tx)
+                    : sol_bank_process_transaction(bank, tx);
+                if (__builtin_expect(tx_batch_stats, 0)) {
+                    TX_BATCH_STATS_ADD(1u);
+                    tx_batch_seq_txs++;
+                }
+                continue;
+            }
+            if (__builtin_expect(tx_wave_diag, 0)) {
+                wave_txs_scheduled++;
+            }
+
+            uint32_t wave_stamp = (uint32_t)wave_index + 1u;
+
+            /* Update last-access map. */
+            for (size_t k = 0; k < key_len; k++) {
+                const sol_pubkey_t* key = &keys_view[k];
+                if (writable_view[k]) {
+                    tx_wave_last_t* last = (tx_wave_last_t*)sol_pubkey_map_insert(last_access, key, NULL);
+                    if (last && last->last_write < wave_stamp) {
+                        last->last_write = wave_stamp;
+                    }
+                } else {
+                    tx_wave_last_t* last = (tx_wave_last_t*)sol_pubkey_map_insert(last_access, key, NULL);
+                    if (last && last->last_read < wave_stamp) {
+                        last->last_read = wave_stamp;
+                    }
+                }
+            }
+
+            if (tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+                tx->message.address_lookups_len > 0 &&
+                tx->message.address_lookups) {
+                for (uint8_t li = 0; li < tx->message.address_lookups_len; li++) {
+                    const sol_pubkey_t* table = &tx->message.address_lookups[li].account_key;
+                    tx_wave_last_t* last = (tx_wave_last_t*)sol_pubkey_map_insert(last_access, table, NULL);
+                    if (last && last->last_read < wave_stamp) {
+                        last->last_read = wave_stamp;
+                    }
+                }
+            }
+
+            for (size_t pk = 0; pk < progdata_len; pk++) {
+                const sol_pubkey_t* key = &progdata_keys[pk];
+                tx_wave_last_t* last = (tx_wave_last_t*)sol_pubkey_map_insert(last_access, key, NULL);
+                if (last && last->last_read < wave_stamp) {
+                    last->last_read = wave_stamp;
+                }
+            }
+        }
+
+        /* Execute remaining waves. */
+        TX_WAVE_FLUSH_EXEC();
+
+#undef TX_WAVE_FLUSH_EXEC
+        sol_map_clear(last_access->inner);
+
+        if (__builtin_expect(tx_wave_diag, 0)) {
+            uint64_t wave_total_ns = bank_monotonic_ns() - wave_total_t0;
+            uint64_t wave_build_ns = wave_total_ns - wave_exec_ns;
+            sol_log_info("tx_wave_diag: txs=%zu scheduled=%zu flushes=%zu waves_created=%zu waves_peak=%zu build_ms=%.3f exec_ms=%.3f total_ms=%.3f",
+                         count,
+                         wave_txs_scheduled,
+                         wave_flushes,
+                         wave_waves_created,
+                         wave_waves_peak,
+                         (double)wave_build_ns / 1e6,
+                         (double)wave_exec_ns / 1e6,
+                         (double)wave_total_ns / 1e6);
+        }
+        goto tx_sched_done;
+    }
+
+legacy_sched:
+    for (size_t i = 0; i < count; i++) {
+        const sol_transaction_t* tx = tx_ptrs[i];
+        if (!tx) {
+            sol_tx_result_t r = {0};
+            r.status = SOL_ERR_INVAL;
+            results[i] = r;
+            continue;
+        }
+
+        if (skip_tx_status) {
+            const sol_signature_t* sig = sol_transaction_signature(tx);
+            if (sig && sol_map_contains(seen_sigs, sig)) {
+                sol_tx_result_t r = {0};
+                r.status = SOL_ERR_TX_ALREADY_PROCESSED;
+                results[i] = r;
+                tx_ptrs[i] = NULL;
+
+                BANK_STAT_INC(bank, transactions_processed);
+                BANK_STAT_INC(bank, transactions_failed);
+                BANK_STAT_INC(bank, rejected_duplicate);
+                log_prevalidation_rejection(bank, tx, "duplicate", SOL_ERR_TX_ALREADY_PROCESSED);
+                continue;
+            }
+            if (sig) {
+                (void)sol_map_insert(seen_sigs, sig, &one);
+            }
+        }
+
+        /* Address lookup table resolution depends on on-chain ALT account data.
+         * Flush if this tx needs to read a table written earlier in the batch. */
+        if (tx &&
+            tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+            tx->message.address_lookups_len > 0 &&
+            tx->message.address_lookups) {
+            bool alt_conflict = false;
+            for (uint8_t li = 0; li < tx->message.address_lookups_len; li++) {
+                const sol_pubkey_t* table = &tx->message.address_lookups[li].account_key;
+                if (sol_pubkey_map_get(batch_writes, table)) {
+                    alt_conflict = true;
+                    break;
+                }
+            }
+            if (alt_conflict && batch_start < i) {
+                if (__builtin_expect(tx_batch_stats, 0)) {
+                    TX_BATCH_STATS_ADD(i - batch_start);
+                }
+                tx_pool_run_range_ptrs(bank, tx_ptrs, results, batch_start, i, skip_tx_status);
+                sol_map_clear(batch_reads->inner);
+                sol_map_clear(batch_writes->inner);
+                batch_start = i;
+            }
+        }
+
+        size_t key_len = 0;
+        const sol_pubkey_t* keys_view = NULL;
+        const bool* writable_view = NULL;
+
+        sol_err_t rerr = SOL_OK;
+        if (tx->message.version == SOL_MESSAGE_VERSION_V0 && v0_cache->patches) {
+            sol_err_t cerr = bank_v0_cache_resolve(bank, tx, v0_cache);
+            if (cerr == SOL_OK) {
+                const sol_message_t* msg = &tx->message;
+                key_len = (size_t)msg->resolved_accounts_len;
+                keys_view = msg->resolved_accounts;
+                writable_view = msg->is_writable;
+            } else {
+                rerr = cerr;
+            }
+        }
+
+        if (!keys_view) {
+            rerr = sol_bank_resolve_transaction_accounts(bank,
+                                                        tx,
+                                                        keys,
+                                                        writable,
+                                                        signer,
+                                                        SOL_MAX_MESSAGE_ACCOUNTS,
+                                                        &key_len);
+            if (rerr == SOL_OK) {
+                keys_view = keys;
+                writable_view = writable;
+            }
+        }
+
+        if (rerr != SOL_OK || !keys_view || !writable_view) {
+            /* Can't build a lock set; execute sequentially after flushing. */
+            if (batch_start < i) {
+                if (__builtin_expect(tx_batch_stats, 0)) {
+                    TX_BATCH_STATS_ADD(i - batch_start);
+                }
+                tx_pool_run_range_ptrs(bank, tx_ptrs, results, batch_start, i, skip_tx_status);
+                sol_map_clear(batch_reads->inner);
+                sol_map_clear(batch_writes->inner);
+            }
+
+            results[i] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx_ptrs[i])
+                : sol_bank_process_transaction(bank, tx_ptrs[i]);
+            if (__builtin_expect(tx_batch_stats, 0)) {
+                TX_BATCH_STATS_ADD(1u);
+                tx_batch_seq_txs++;
+            }
+            batch_start = i + 1;
+            continue;
+        }
+
+        sol_pubkey_t progdata_keys[64];
+        size_t progdata_len = 0;
+        sol_pubkey_t seen_progids[64];
+        size_t seen_progids_len = 0;
+
+        /* If a prior tx wrote an invoked program account, flush before we
+         * inspect it for ProgramData so we read the post-write state. */
+        bool prog_barrier = false;
+        if (tx) {
+            for (uint8_t ix_i = 0; ix_i < tx->message.instructions_len; ix_i++) {
+                const sol_compiled_instruction_t* ix = &tx->message.instructions[ix_i];
+                if ((size_t)ix->program_id_index >= key_len) {
+                    continue;
+                }
+                const sol_pubkey_t* pid = &keys_view[ix->program_id_index];
+                if (sol_pubkey_eq(pid, &SOL_SYSTEM_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_VOTE_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_COMPUTE_BUDGET_ID) ||
+                    sol_pubkey_eq(pid, &SOL_ED25519_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_SECP256K1_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_SECP256R1_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_BPF_LOADER_UPGRADEABLE_ID) ||
+                    sol_pubkey_eq(pid, &SOL_BPF_LOADER_V2_ID)) {
+                    continue;
+                }
+                if (sol_pubkey_map_get(batch_writes, pid)) {
+                    prog_barrier = true;
+                    break;
+                }
+            }
+        }
+        if (prog_barrier && batch_start < i) {
+            if (__builtin_expect(tx_batch_stats, 0)) {
+                TX_BATCH_STATS_ADD(i - batch_start);
+            }
+            tx_pool_run_range_ptrs(bank, tx_ptrs, results, batch_start, i, skip_tx_status);
+            sol_map_clear(batch_reads->inner);
+            sol_map_clear(batch_writes->inner);
+            batch_start = i;
+        }
+
+        if (tx) {
+            for (uint8_t ix_i = 0; ix_i < tx->message.instructions_len; ix_i++) {
+                const sol_compiled_instruction_t* ix = &tx->message.instructions[ix_i];
+                if ((size_t)ix->program_id_index >= key_len) {
+                    continue;
+                }
+                const sol_pubkey_t* pid = &keys_view[ix->program_id_index];
+                if (sol_pubkey_eq(pid, &SOL_SYSTEM_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_VOTE_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_COMPUTE_BUDGET_ID) ||
+                    sol_pubkey_eq(pid, &SOL_ED25519_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_SECP256K1_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_SECP256R1_PROGRAM_ID) ||
+                    sol_pubkey_eq(pid, &SOL_BPF_LOADER_UPGRADEABLE_ID) ||
+                    sol_pubkey_eq(pid, &SOL_BPF_LOADER_V2_ID)) {
+                    continue;
+                }
+
+                bool seen = false;
+                for (size_t si = 0; si < seen_progids_len; si++) {
+                    if (sol_pubkey_eq(&seen_progids[si], pid)) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (seen) {
+                    continue;
+                }
+                if (seen_progids_len < (sizeof(seen_progids) / sizeof(seen_progids[0]))) {
+                    seen_progids[seen_progids_len++] = *pid;
+                }
+
+                sol_pubkey_t pd = {0};
+                if (bank_get_upgradeable_programdata_pubkey(bank, pid, &pd)) {
+                    if (progdata_len < (sizeof(progdata_keys) / sizeof(progdata_keys[0]))) {
+                        progdata_keys[progdata_len++] = pd;
+                    }
+                }
+            }
+        }
+
+        bool conflict = false;
+        for (size_t k = 0; k < key_len; k++) {
+            if (writable_view[k]) {
+                if (sol_pubkey_map_get(batch_writes, &keys_view[k]) ||
+                    sol_pubkey_map_get(batch_reads, &keys_view[k])) {
+                    conflict = true;
+                    break;
+                }
+            } else {
+                if (sol_pubkey_map_get(batch_writes, &keys_view[k])) {
+                    conflict = true;
+                    break;
+                }
+            }
+        }
+
+        if (!conflict) {
+            for (size_t pk = 0; pk < progdata_len; pk++) {
+                if (sol_pubkey_map_get(batch_writes, &progdata_keys[pk])) {
+                    conflict = true;
+                    break;
+                }
+            }
+        }
+
+        if (conflict && batch_start < i) {
+            /* Execute prior batch. */
+            if (__builtin_expect(tx_batch_stats, 0)) {
+                TX_BATCH_STATS_ADD(i - batch_start);
+            }
+            tx_pool_run_range_ptrs(bank, tx_ptrs, results, batch_start, i, skip_tx_status);
+            sol_map_clear(batch_reads->inner);
+            sol_map_clear(batch_writes->inner);
+            batch_start = i;
+        }
+
+        /* Add tx accounts to batch set. */
+        for (size_t k = 0; k < key_len; k++) {
+            if (writable_view[k]) {
+                (void)sol_pubkey_map_insert(batch_writes, &keys_view[k], &one);
+            } else {
+                (void)sol_pubkey_map_insert(batch_reads, &keys_view[k], &one);
+            }
+        }
+
+        if (tx &&
+            tx->message.version == SOL_MESSAGE_VERSION_V0 &&
+            tx->message.address_lookups_len > 0 &&
+            tx->message.address_lookups) {
+            for (uint8_t li = 0; li < tx->message.address_lookups_len; li++) {
+                (void)sol_pubkey_map_insert(batch_reads,
+                                            &tx->message.address_lookups[li].account_key,
+                                            &one);
+            }
+        }
+
+        for (size_t pk = 0; pk < progdata_len; pk++) {
+            (void)sol_pubkey_map_insert(batch_reads, &progdata_keys[pk], &one);
+        }
+    }
+
+    /* Execute last batch. */
+    if (batch_start < count) {
+        if (__builtin_expect(tx_batch_stats, 0)) {
+            TX_BATCH_STATS_ADD(count - batch_start);
+        }
+        tx_pool_run_range_ptrs(bank, tx_ptrs, results, batch_start, count, skip_tx_status);
+    }
+
+tx_sched_done:
+    if (skip_tx_status) {
+        for (size_t i = 0; i < count; i++) {
+            const sol_transaction_t* tx = tx_ptrs[i];
+            if (!tx) continue;
+            const sol_signature_t* sig = sol_transaction_signature(tx);
+            if (!sig) continue;
+            sol_bank_record_tx_status(bank,
+                                      sig,
+                                      results[i].status,
+                                      results[i].fee,
+                                      results[i].compute_units_used);
+        }
+    }
+
+    if (seen_sigs) {
+        sol_map_clear(seen_sigs);
+    }
+
+    if (__builtin_expect(tx_batch_stats, 0)) {
+        size_t min_len = (tx_batch_min == SIZE_MAX) ? 0u : tx_batch_min;
+        double avg = tx_batch_cnt ? ((double)tx_batch_txs / (double)tx_batch_cnt) : 0.0;
+        fprintf(stderr,
+                "tx_batch_stats(ptrs): txs=%zu batches=%zu avg=%.2f min=%zu max=%zu lt8_batches=%zu lt8_txs=%zu seq_txs=%zu\n",
+                count,
+                tx_batch_cnt,
+                avg,
+                min_len,
+                tx_batch_max,
+                tx_batch_lt8_cnt,
+                tx_batch_lt8_txs,
+                tx_batch_seq_txs);
+        fprintf(stderr,
+                "tx_batch_hist_lt8(ptrs): 1=%zu 2=%zu 3=%zu 4=%zu 5=%zu 6=%zu 7=%zu\n",
+                tx_batch_hist[1],
+                tx_batch_hist[2],
+                tx_batch_hist[3],
+                tx_batch_hist[4],
+                tx_batch_hist[5],
+                tx_batch_hist[6],
+                tx_batch_hist[7]);
+    }
+
+    if (__builtin_expect(tx_pool_stats, 0)) {
+        double seq_ms = (double)pool_stats.seq_ns / 1e6;
+        double par_ms = (double)pool_stats.par_ns / 1e6;
+        fprintf(stderr,
+                "tx_pool_stats(ptrs): slot=%lu seq_calls=%lu seq_txs=%lu seq_ms=%.3f par_calls=%lu par_txs=%lu par_ms=%.3f\n",
+                (unsigned long)bank->slot,
+                (unsigned long)pool_stats.seq_calls,
+                (unsigned long)pool_stats.seq_txs,
+                seq_ms,
+                (unsigned long)pool_stats.par_calls,
+                (unsigned long)pool_stats.par_txs,
+                par_ms);
+        g_tls_tx_pool_stats = NULL;
+    }
+
+    bank_v0_cache_reset(v0_cache);
+    if (v0_cache_disabled) {
+        v0_cache->patches = saved_v0_patches;
+        v0_cache->patches_cap = saved_v0_patches_cap;
+    }
+
+    sol_map_clear(batch_reads->inner);
+    sol_map_clear(batch_writes->inner);
+#undef TX_BATCH_STATS_ADD
     return SOL_OK;
 }
 
@@ -4402,6 +9195,38 @@ bank_advance_poh_and_register_ticks(sol_bank_t* bank, const sol_entry_t* entry) 
     hashes_in_tick = bank->hashes_in_tick;
     pthread_mutex_unlock(&bank->lock);
 
+    /* Fast path: Most ledgers do not cross tick boundaries inside transaction
+     * (record) entries. In that common case, we can advance PoH/ticks without
+     * recomputing the full sha256 hash_n chain, since `entry->hash` already
+     * contains the post-entry PoH hash and replay verifies the entry chain
+     * separately (sol_entry_batch_verify).
+     *
+     * We must fall back to the slow path only if this entry would advance past
+     * a tick boundary (needs intermediate tick hash value). */
+    {
+        uint64_t next_hashes = 0;
+        bool oflow = __builtin_add_overflow(hashes_in_tick, entry->num_hashes, &next_hashes);
+        if (!oflow && next_hashes <= hashes_per_tick) {
+            current = entry->hash;
+            if (next_hashes == hashes_per_tick) {
+                /* Tick boundary exactly at end of entry. */
+                sol_err_t err = sol_bank_register_tick(bank, &current);
+                if (err != SOL_OK && err != SOL_ERR_OVERFLOW) {
+                    return err;
+                }
+                hashes_in_tick = 0;
+            } else {
+                hashes_in_tick = next_hashes;
+            }
+
+            pthread_mutex_lock(&bank->lock);
+            bank->poh_hash = current;
+            bank->hashes_in_tick = hashes_in_tick;
+            pthread_mutex_unlock(&bank->lock);
+            return SOL_OK;
+        }
+    }
+
     uint64_t plain_hashes = entry->num_hashes;
     const bool has_record = entry->num_transactions > 0;
     if (has_record && plain_hashes > 0) {
@@ -4413,9 +9238,7 @@ bank_advance_poh_and_register_ticks(sol_bank_t* bank, const sol_entry_t* entry) 
         const uint64_t remaining = hashes_per_tick - hashes_in_tick;
         const uint64_t chunk = (plain_hashes < remaining) ? plain_hashes : remaining;
 
-        for (uint64_t i = 0; i < chunk; i++) {
-            sol_sha256_32bytes(current.bytes, current.bytes);
-        }
+        sol_sha256_32bytes_repeated(current.bytes, chunk);
 
         hashes_in_tick += chunk;
         plain_hashes -= chunk;
@@ -4457,17 +9280,41 @@ bank_advance_poh_and_register_ticks(sol_bank_t* bank, const sol_entry_t* entry) 
 sol_err_t
 sol_bank_process_entry(sol_bank_t* bank, const sol_entry_t* entry) {
     if (!bank || !entry) return SOL_ERR_INVAL;
-    if (bank->frozen) return SOL_ERR_SHUTDOWN;
+    if (__atomic_load_n(&bank->frozen, __ATOMIC_ACQUIRE)) return SOL_ERR_SHUTDOWN;
+
+    if (bank_skip_transaction_processing()) {
+        return bank_advance_poh_and_register_ticks(bank, entry);
+    }
 
     /* Process transactions in entry */
-    for (uint32_t i = 0; i < entry->num_transactions; i++) {
-        sol_tx_result_t result = sol_bank_process_transaction(
-            bank, &entry->transactions[i]);
+    if (entry->num_transactions > 0) {
+        /* Use a small stack buffer for the common case to avoid heap churn. */
+        sol_tx_result_t stack_results[64];
+        sol_tx_result_t* results = stack_results;
+        bool heap_results = false;
 
-        if (result.status != SOL_OK) {
-            sol_log_debug("Transaction %u failed: %d", i, result.status);
-            /* Continue processing other transactions */
+        if (entry->num_transactions > (uint32_t)(sizeof(stack_results) / sizeof(stack_results[0]))) {
+            results = sol_alloc((size_t)entry->num_transactions * sizeof(sol_tx_result_t));
+            if (!results) return SOL_ERR_NOMEM;
+            heap_results = true;
         }
+
+        sol_err_t terr = sol_bank_process_transactions(bank,
+                                                      entry->transactions,
+                                                      (size_t)entry->num_transactions,
+                                                      results);
+        if (terr != SOL_OK) {
+            if (heap_results) sol_free(results);
+            return terr;
+        }
+
+        for (uint32_t i = 0; i < entry->num_transactions; i++) {
+            if (results[i].status != SOL_OK) {
+                sol_log_debug("Transaction %u failed: %d", i, results[i].status);
+            }
+        }
+
+        if (heap_results) sol_free(results);
     }
 
     return bank_advance_poh_and_register_ticks(bank, entry);
@@ -4477,20 +9324,105 @@ sol_err_t
 sol_bank_process_entries(sol_bank_t* bank, const sol_entry_batch_t* batch) {
     if (!bank || !batch) return SOL_ERR_INVAL;
 
+    /* When skipping transaction execution, keep the original ordering: advance
+     * PoH/ticks entry-by-entry and return. */
+    if (bank_skip_transaction_processing()) {
+        for (size_t i = 0; i < batch->num_entries; i++) {
+            sol_err_t err = bank_advance_poh_and_register_ticks(bank, &batch->entries[i]);
+            if (err != SOL_OK) return err;
+        }
+        return SOL_OK;
+    }
+
+    /* Flatten all transactions for the batch to enable parallelism when
+     * entries contain small numbers of transactions. The deterministic lock-set
+     * scheduler preserves correctness by flushing on conflicts. */
+    size_t total_txs = 0;
     for (size_t i = 0; i < batch->num_entries; i++) {
-        sol_err_t err = sol_bank_process_entry(bank, &batch->entries[i]);
-        if (err != SOL_OK) {
-            return err;
+        total_txs += (size_t)batch->entries[i].num_transactions;
+    }
+
+    if (total_txs == 0) {
+        for (size_t i = 0; i < batch->num_entries; i++) {
+            sol_err_t err = bank_advance_poh_and_register_ticks(bank, &batch->entries[i]);
+            if (err != SOL_OK) return err;
+        }
+        return SOL_OK;
+    }
+
+    tx_sched_scratch_t* sc = &g_tls_tx_sched_scratch;
+    const sol_transaction_t** tx_ptrs = NULL;
+    sol_tx_result_t* results = NULL;
+    bool heap_bufs = false;
+
+    if (tx_sched_ensure_batch_bufs(sc, total_txs)) {
+        tx_ptrs = sc->batch_tx_ptrs;
+        results = sc->batch_results;
+    } else {
+        tx_ptrs = sol_alloc(total_txs * sizeof(*tx_ptrs));
+        results = sol_alloc(total_txs * sizeof(*results));
+        heap_bufs = true;
+        if (!tx_ptrs || !results) {
+            if (tx_ptrs) sol_free((void*)tx_ptrs);
+            if (results) sol_free(results);
+            /* Fall back to conservative entry-by-entry behavior. */
+            for (size_t i = 0; i < batch->num_entries; i++) {
+                sol_err_t err = sol_bank_process_entry(bank, &batch->entries[i]);
+                if (err != SOL_OK) return err;
+            }
+            return SOL_OK;
         }
     }
 
+    size_t cursor = 0;
+    for (size_t ei = 0; ei < batch->num_entries; ei++) {
+        const sol_entry_t* entry = &batch->entries[ei];
+        for (uint32_t ti = 0; ti < entry->num_transactions; ti++) {
+            tx_ptrs[cursor++] = &entry->transactions[ti];
+        }
+    }
+
+    sol_err_t terr = sol_bank_process_transactions_ptrs(bank, tx_ptrs, total_txs, results);
+    if (terr != SOL_OK) {
+        if (heap_bufs) {
+            sol_free((void*)tx_ptrs);
+            sol_free(results);
+        }
+        return terr;
+    }
+
+    /* Preserve per-entry logging and PoH advancement. */
+    cursor = 0;
+    for (size_t ei = 0; ei < batch->num_entries; ei++) {
+        const sol_entry_t* entry = &batch->entries[ei];
+        for (uint32_t ti = 0; ti < entry->num_transactions; ti++) {
+            if (results[cursor].status != SOL_OK) {
+                sol_log_debug("Transaction %u failed: %d", ti, results[cursor].status);
+            }
+            cursor++;
+        }
+
+        sol_err_t aerr = bank_advance_poh_and_register_ticks(bank, entry);
+        if (aerr != SOL_OK) {
+            if (heap_bufs) {
+                sol_free((void*)tx_ptrs);
+                sol_free(results);
+            }
+            return aerr;
+        }
+    }
+
+    if (heap_bufs) {
+        sol_free((void*)tx_ptrs);
+        sol_free(results);
+    }
     return SOL_OK;
 }
 
 sol_err_t
 sol_bank_register_tick(sol_bank_t* bank, const sol_hash_t* tick_hash) {
     if (!bank || !tick_hash) return SOL_ERR_INVAL;
-    if (bank->frozen) return SOL_ERR_SHUTDOWN;
+    if (__atomic_load_n(&bank->frozen, __ATOMIC_ACQUIRE)) return SOL_ERR_SHUTDOWN;
 
     pthread_mutex_lock(&bank->lock);
 
@@ -4527,6 +9459,7 @@ sol_bank_register_tick(sol_bank_t* bank, const sol_hash_t* tick_hash) {
 
         bank->recent_blockhashes[0].hash = *tick_hash;
         bank->recent_blockhashes[0].fee_calculator = bank->config.lamports_per_signature;
+        bank_recent_blockhash_map_rebuild(bank);
 
         /* In Agave, register_recent_blockhash() is called at the block boundary
          * (last tick). It adds the new hash to the blockhash_queue AND updates the
@@ -4564,7 +9497,7 @@ run_incinerator(sol_bank_t* bank) {
             /* Store a zero-lamport account (becomes a tombstone/delete).
                This subtracts the old lamports from db->stats.total_lamports. */
             sol_account_t zero_acct = {0};
-            sol_accounts_db_store(bank->accounts_db, &SOL_INCINERATOR_ID, &zero_acct);
+            (void)sol_bank_store_account(bank, &SOL_INCINERATOR_ID, &zero_acct);
         }
         sol_account_destroy(incinerator_acct);
     }
@@ -4713,9 +9646,17 @@ sol_bank_freeze(sol_bank_t* bank) {
 
     pthread_mutex_lock(&bank->lock);
 
-    /* Snapshot banks are already frozen; skip sysvar/fee updates.
-     * Only child banks (overlay) need freeze-time updates. */
-    if (sol_accounts_db_is_overlay(bank->accounts_db)) {
+    if (__atomic_load_n(&bank->frozen, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_unlock(&bank->lock);
+        return;
+    }
+
+    /* Freeze-time updates should only run once the slot has reached its max
+     * tick height. Snapshot/root banks may be frozen without local replay, so
+     * tick_height can be less than max_tick_height. */
+    const bool full_ticks = (bank->tick_height == bank->max_tick_height);
+
+    if (full_ticks) {
         /* Match Agave's freeze() ordering (bank.rs lines 2542-2569):
          *   1. distribute_transaction_fee_details()
          *   2. update_slot_history()
@@ -4733,19 +9674,16 @@ sol_bank_freeze(sol_bank_t* bank) {
         run_incinerator(bank);
     }
 
-    bank->frozen = true;
+    /* Publish frozen=true with release semantics so readers can check the flag
+     * without contending on bank->lock (used by RPC hot paths). */
+    __atomic_store_n(&bank->frozen, true, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&bank->lock);
 }
 
 bool
 sol_bank_is_frozen(const sol_bank_t* bank) {
     if (!bank) return false;
-
-    pthread_mutex_lock((pthread_mutex_t*)&bank->lock);
-    bool frozen = bank->frozen;
-    pthread_mutex_unlock((pthread_mutex_t*)&bank->lock);
-
-    return frozen;
+    return __atomic_load_n(&bank->frozen, __ATOMIC_ACQUIRE);
 }
 
 void
@@ -4785,17 +9723,6 @@ sol_bank_compute_hash(sol_bank_t* bank, sol_hash_t* out_hash) {
                           SOL_LT_HASH_SIZE_BYTES);
         sol_sha256_final_bytes(&ctx, bank->bank_hash.bytes);
 
-        /* Best-effort: keep accounts_delta_hash available for debug logs, but
-         * it is not part of the bank-hash inputs in modern Agave.
-         * Only compute for overlay (child) banks; for non-overlay banks the
-         * "delta" is the entire DB which is prohibitively expensive (~1B accts). */
-        if (sol_accounts_db_is_overlay(bank->accounts_db)) {
-            sol_hash_t accounts_delta_hash = {0};
-            sol_accounts_db_hash_delta(bank->accounts_db, &accounts_delta_hash);
-            bank->accounts_delta_hash = accounts_delta_hash;
-            bank->accounts_delta_hash_computed = true;
-        }
-
         bank->hash_computed = true;
     }
 
@@ -4809,6 +9736,13 @@ sol_bank_get_accounts_delta_hash(sol_bank_t* bank, sol_hash_t* out_hash) {
     if (!bank || !out_hash) return false;
 
     pthread_mutex_lock(&bank->lock);
+    if (!bank->accounts_delta_hash_computed &&
+        sol_accounts_db_is_overlay(bank->accounts_db)) {
+        sol_hash_t accounts_delta_hash = {0};
+        sol_accounts_db_hash_delta(bank->accounts_db, &accounts_delta_hash);
+        bank->accounts_delta_hash = accounts_delta_hash;
+        bank->accounts_delta_hash_computed = true;
+    }
     bool ok = bank->accounts_delta_hash_computed;
     if (ok) {
         *out_hash = bank->accounts_delta_hash;
@@ -4912,11 +9846,6 @@ sol_bank_record_tx_status(sol_bank_t* bank,
                           uint64_t compute_units) {
     if (!bank || !signature) return;
 
-    /* Limit cache size */
-    if (bank->tx_status_count >= SOL_TX_STATUS_CACHE_SIZE) {
-        return;  /* Cache full, skip recording */
-    }
-
     uint32_t bucket = signature_hash(signature);
 
     pthread_mutex_lock(&bank->lock);
@@ -4933,6 +9862,12 @@ sol_bank_record_tx_status(sol_bank_t* bank,
             return;
         }
         node = node->next;
+    }
+
+    /* Cache full: allow updates of existing entries above, but skip inserts. */
+    if (bank->tx_status_count >= SOL_TX_STATUS_CACHE_SIZE) {
+        pthread_mutex_unlock(&bank->lock);
+        return;
     }
 
     /* Create new entry */

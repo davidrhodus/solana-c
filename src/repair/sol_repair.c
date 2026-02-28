@@ -7,6 +7,7 @@
 #include "../util/sol_bits.h"
 #include "../util/sol_log.h"
 #include "../gossip/sol_crds_value.h"
+#include "../runtime/sol_leader_schedule.h"
 #include "../blockstore/sol_blockstore.h"
 #include "../crypto/sol_ed25519.h"
 #include "../crypto/sol_sha256.h"
@@ -19,6 +20,14 @@
 enum {
     SOL_REPAIR_WARM_PEERS_MAX = 512,
     SOL_REPAIR_WARM_TTL_MS = 60 * 1000,
+    SOL_REPAIR_SLOT_PEER_CACHE_SIZE = 2048, /* power of two */
+    SOL_REPAIR_SLOT_PEER_TTL_MS = 30 * 1000,
+    /* Best-effort hedge fanout for tail-latency sensitive catchup. */
+    SOL_REPAIR_MAX_FANOUT = 32,
+    /* Throttle timeout scans in sol_repair_run_once. Scanning the full pending
+     * table every main-loop iteration is expensive and can cause packet drops
+     * under high repair rates. */
+    SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS = 10,
 };
 
 typedef struct {
@@ -26,6 +35,59 @@ typedef struct {
     uint64_t     last_seen_ms;
     bool         active;
 } sol_repair_warm_peer_t;
+
+typedef struct {
+    sol_slot_t      slot;
+    sol_sockaddr_t  addr;
+    sol_pubkey_t    pubkey;
+    uint64_t        last_seen_ms;
+    bool            active;
+} sol_repair_slot_peer_t;
+
+static bool
+sockaddr_is_public_ip(const sol_sockaddr_t* sa) {
+    if (!sa) return false;
+
+    sol_endpoint_t ep = {0};
+    if (sol_endpoint_from_sockaddr(&ep, sa) != SOL_OK) {
+        return false;
+    }
+
+    struct in_addr a4;
+    if (inet_pton(AF_INET, ep.ip, &a4) == 1) {
+        uint32_t ip = ntohl(a4.s_addr);
+
+        /* Reject unroutable/localhost/private ranges for repair peer selection. */
+        if ((ip & 0xFF000000u) == 0x0A000000u) return false;         /* 10.0.0.0/8 */
+        if ((ip & 0xFFF00000u) == 0xAC100000u) return false;         /* 172.16.0.0/12 */
+        if ((ip & 0xFFFF0000u) == 0xC0A80000u) return false;         /* 192.168.0.0/16 */
+        if ((ip & 0xFF000000u) == 0x7F000000u) return false;         /* 127.0.0.0/8 */
+        if ((ip & 0xFFFF0000u) == 0xA9FE0000u) return false;         /* 169.254.0.0/16 */
+        if ((ip & 0xFFC00000u) == 0x64400000u) return false;         /* 100.64.0.0/10 */
+        if ((ip & 0xFF000000u) == 0x00000000u) return false;         /* 0.0.0.0/8 */
+
+        if ((ip & 0xF0000000u) == 0xE0000000u) return false;         /* multicast/reserved */
+
+        return true;
+    }
+
+    struct in6_addr a6;
+    if (inet_pton(AF_INET6, ep.ip, &a6) == 1) {
+        /* Reject loopback, link-local, and unique-local ranges. */
+        static const struct in6_addr loopback = IN6ADDR_LOOPBACK_INIT;
+        if (memcmp(&a6, &loopback, sizeof(a6)) == 0) return false;
+
+        if ((a6.s6_addr[0] == 0xfe) && ((a6.s6_addr[1] & 0xc0) == 0x80)) return false; /* fe80::/10 */
+        if ((a6.s6_addr[0] & 0xfe) == 0xfc) return false;                               /* fc00::/7 */
+
+        if (a6.s6_addr[0] == 0xff) return false; /* multicast */
+
+        return true;
+    }
+
+    /* Unknown family; treat as non-public to be safe. */
+    return false;
+}
 
 /*
  * Repair service structure
@@ -40,6 +102,9 @@ struct sol_repair {
     /* Gossip for peer discovery */
     sol_gossip_t*       gossip;
 
+    /* Leader schedule for leader-targeted repair peer selection */
+    sol_leader_schedule_t* leader_schedule;
+
     /* Blockstore for serving repairs */
     sol_blockstore_t*   blockstore;
 
@@ -52,6 +117,29 @@ struct sol_repair {
     sol_repair_pending_t* pending;
     size_t              pending_count;
     pthread_mutex_t     pending_lock;
+
+    /* Nonce -> pending index map (open addressing). Protected by pending_lock. */
+    uint32_t*           nonce_keys;
+    int32_t*            nonce_vals;      /* -1 empty, -2 tombstone, >=0 pending index */
+    size_t              nonce_map_size;  /* power of two */
+
+    /* (type,slot,shred_index)->pending index map (open addressing). Protected by pending_lock.
+     * This eliminates O(n) scans of the pending table on request hot paths. */
+    uint64_t*           req_slots;
+    uint64_t*           req_indices;
+    uint8_t*            req_types;
+    int32_t*            req_vals;      /* -1 empty, -2 tombstone, >=0 pending index */
+    size_t              req_map_size;  /* power of two */
+
+    /* Track outstanding ancestor-hash requests to avoid scanning pending table
+     * on every shred response. Guarded by pending_lock for updates, but read
+     * with relaxed atomics in hot paths. */
+    uint32_t            ancestor_pending_count;
+
+    uint64_t            last_timeout_check_ms;
+
+    /* Per-slot "sticky" peer cache to improve hit-rate during catchup. */
+    sol_repair_slot_peer_t slot_peers[SOL_REPAIR_SLOT_PEER_CACHE_SIZE];
 
     /* Seed peers for bootstrap (used when gossip CRDS contact-info is empty) */
     sol_repair_seed_peer_t* seed_peers;
@@ -80,11 +168,250 @@ struct sol_repair {
  */
 extern uint64_t sol_gossip_now_ms(void);
 
+/* pending_lock must be held by caller */
+static void
+pending_deactivate_locked(sol_repair_t* repair, sol_repair_pending_t* pending);
+
 static uint64_t
 sol_unix_now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static inline bool
+pending_ptr_is_tracked(const sol_repair_t* repair, const sol_repair_pending_t* pending) {
+    if (!repair || !pending || !repair->pending) return false;
+    const sol_repair_pending_t* base = repair->pending;
+    const sol_repair_pending_t* end = base + repair->config.max_pending_requests;
+    return pending >= base && pending < end;
+}
+
+static size_t
+pow2_ge(size_t v) {
+    size_t p = 1;
+    while (p < v && p != 0) p <<= 1;
+    return p ? p : (size_t)1;
+}
+
+static inline size_t
+nonce_hash(uint32_t nonce, size_t mask) {
+    /* Knuth multiplicative hash (works best with power-of-two tables). */
+    return ((size_t)(nonce * 2654435761u)) & mask;
+}
+
+static inline uint64_t
+mix_u64(uint64_t x) {
+    /* MurmurHash3 finalizer. */
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static inline uint64_t
+req_index_key(sol_repair_type_t type, uint64_t shred_index) {
+    /* Only shred requests key by (slot,index). Other request types are treated
+     * as "one per slot". */
+    return (type == SOL_REPAIR_SHRED) ? shred_index : 0ULL;
+}
+
+static inline size_t
+req_hash(sol_repair_type_t type, sol_slot_t slot, uint64_t shred_index, size_t mask) {
+    uint64_t h = (uint64_t)slot;
+    h ^= mix_u64(shred_index + 0x9e3779b97f4a7c15ULL);
+    h ^= (uint64_t)((uint32_t)type) * 0x94d049bb133111ebULL;
+    return (size_t)mix_u64(h) & mask;
+}
+
+/* pending_lock must be held by caller */
+static int32_t
+nonce_map_get_locked(const sol_repair_t* repair, uint32_t nonce) {
+    if (!repair || !repair->nonce_vals || !repair->nonce_keys || repair->nonce_map_size == 0) {
+        return -1;
+    }
+    if (nonce == 0) {
+        return -1;
+    }
+    size_t mask = repair->nonce_map_size - 1u;
+    size_t idx = nonce_hash(nonce, mask);
+    for (size_t probe = 0; probe < repair->nonce_map_size; probe++) {
+        int32_t v = repair->nonce_vals[idx];
+        if (v == -1) {
+            return -1; /* empty => not found */
+        }
+        if (v >= 0 && repair->nonce_keys[idx] == nonce) {
+            return v;
+        }
+        idx = (idx + 1u) & mask;
+    }
+    return -1;
+}
+
+/* pending_lock must be held by caller */
+static int32_t
+req_map_get_locked(const sol_repair_t* repair, sol_repair_type_t type, sol_slot_t slot, uint64_t shred_index) {
+    if (!repair || !repair->req_vals || !repair->req_slots || !repair->req_indices || !repair->req_types ||
+        repair->req_map_size == 0) {
+        return -1;
+    }
+    if (slot == 0) {
+        return -1;
+    }
+    size_t mask = repair->req_map_size - 1u;
+    uint64_t idx_key = req_index_key(type, shred_index);
+    size_t idx = req_hash(type, slot, idx_key, mask);
+    for (size_t probe = 0; probe < repair->req_map_size; probe++) {
+        int32_t v = repair->req_vals[idx];
+        if (v == -1) {
+            return -1;
+        }
+        if (v >= 0 &&
+            repair->req_slots[idx] == (uint64_t)slot &&
+            repair->req_indices[idx] == idx_key &&
+            repair->req_types[idx] == (uint8_t)type) {
+            return v;
+        }
+        idx = (idx + 1u) & mask;
+    }
+    return -1;
+}
+
+/* pending_lock must be held by caller */
+static void
+req_map_put_locked(sol_repair_t* repair, sol_repair_type_t type, sol_slot_t slot, uint64_t shred_index, int32_t pending_idx) {
+    if (!repair || !repair->req_vals || !repair->req_slots || !repair->req_indices || !repair->req_types ||
+        repair->req_map_size == 0) {
+        return;
+    }
+    if (slot == 0) {
+        return;
+    }
+    size_t mask = repair->req_map_size - 1u;
+    uint64_t idx_key = req_index_key(type, shred_index);
+    size_t idx = req_hash(type, slot, idx_key, mask);
+    size_t first_tomb = (size_t)-1;
+    for (size_t probe = 0; probe < repair->req_map_size; probe++) {
+        int32_t v = repair->req_vals[idx];
+        if (v == -1) {
+            size_t use = (first_tomb != (size_t)-1) ? first_tomb : idx;
+            repair->req_slots[use] = (uint64_t)slot;
+            repair->req_indices[use] = idx_key;
+            repair->req_types[use] = (uint8_t)type;
+            repair->req_vals[use] = pending_idx;
+            return;
+        }
+        if (v == -2) {
+            if (first_tomb == (size_t)-1) first_tomb = idx;
+        } else if (repair->req_slots[idx] == (uint64_t)slot &&
+                   repair->req_indices[idx] == idx_key &&
+                   repair->req_types[idx] == (uint8_t)type) {
+            repair->req_vals[idx] = pending_idx;
+            return;
+        }
+        idx = (idx + 1u) & mask;
+    }
+
+    /* Table saturated (no empty slots). If we saw a tombstone, reuse it;
+     * otherwise, the map is best-effort and callers will fall back. */
+    if (first_tomb != (size_t)-1) {
+        repair->req_slots[first_tomb] = (uint64_t)slot;
+        repair->req_indices[first_tomb] = idx_key;
+        repair->req_types[first_tomb] = (uint8_t)type;
+        repair->req_vals[first_tomb] = pending_idx;
+    }
+}
+
+/* pending_lock must be held by caller */
+static void
+req_map_del_locked(sol_repair_t* repair, sol_repair_type_t type, sol_slot_t slot, uint64_t shred_index) {
+    if (!repair || !repair->req_vals || !repair->req_slots || !repair->req_indices || !repair->req_types ||
+        repair->req_map_size == 0) {
+        return;
+    }
+    if (slot == 0) {
+        return;
+    }
+    size_t mask = repair->req_map_size - 1u;
+    uint64_t idx_key = req_index_key(type, shred_index);
+    size_t idx = req_hash(type, slot, idx_key, mask);
+    for (size_t probe = 0; probe < repair->req_map_size; probe++) {
+        int32_t v = repair->req_vals[idx];
+        if (v == -1) {
+            return;
+        }
+        if (v >= 0 &&
+            repair->req_slots[idx] == (uint64_t)slot &&
+            repair->req_indices[idx] == idx_key &&
+            repair->req_types[idx] == (uint8_t)type) {
+            repair->req_vals[idx] = -2;
+            return;
+        }
+        idx = (idx + 1u) & mask;
+    }
+}
+
+/* pending_lock must be held by caller */
+static void
+nonce_map_put_locked(sol_repair_t* repair, uint32_t nonce, int32_t pending_idx) {
+    if (!repair || !repair->nonce_vals || !repair->nonce_keys || repair->nonce_map_size == 0) {
+        return;
+    }
+    if (nonce == 0) {
+        return;
+    }
+    size_t mask = repair->nonce_map_size - 1u;
+    size_t idx = nonce_hash(nonce, mask);
+    size_t first_tomb = (size_t)-1;
+    for (size_t probe = 0; probe < repair->nonce_map_size; probe++) {
+        int32_t v = repair->nonce_vals[idx];
+        if (v == -1) {
+            size_t use = (first_tomb != (size_t)-1) ? first_tomb : idx;
+            repair->nonce_keys[use] = nonce;
+            repair->nonce_vals[use] = pending_idx;
+            return;
+        }
+        if (v == -2) {
+            if (first_tomb == (size_t)-1) first_tomb = idx;
+        } else if (repair->nonce_keys[idx] == nonce) {
+            repair->nonce_vals[idx] = pending_idx;
+            return;
+        }
+        idx = (idx + 1u) & mask;
+    }
+
+    /* Table saturated (no empty slots). If we saw a tombstone, reuse it;
+     * otherwise, the map is best-effort and callers will fall back. */
+    if (first_tomb != (size_t)-1) {
+        repair->nonce_keys[first_tomb] = nonce;
+        repair->nonce_vals[first_tomb] = pending_idx;
+    }
+}
+
+/* pending_lock must be held by caller */
+static void
+nonce_map_del_locked(sol_repair_t* repair, uint32_t nonce) {
+    if (!repair || !repair->nonce_vals || !repair->nonce_keys || repair->nonce_map_size == 0) {
+        return;
+    }
+    if (nonce == 0) {
+        return;
+    }
+    size_t mask = repair->nonce_map_size - 1u;
+    size_t idx = nonce_hash(nonce, mask);
+    for (size_t probe = 0; probe < repair->nonce_map_size; probe++) {
+        int32_t v = repair->nonce_vals[idx];
+        if (v == -1) {
+            return; /* not found */
+        }
+        if (v >= 0 && repair->nonce_keys[idx] == nonce) {
+            repair->nonce_vals[idx] = -2;
+            return;
+        }
+        idx = (idx + 1u) & mask;
+    }
 }
 
 static void
@@ -139,6 +466,63 @@ is_peer_warm(sol_repair_t* repair, const sol_pubkey_t* peer_pubkey, uint64_t now
     }
     pthread_mutex_unlock(&repair->warm_peers_lock);
     return warm;
+}
+
+static inline size_t
+slot_peer_cache_idx(sol_slot_t slot) {
+    return ((size_t)slot) & (SOL_REPAIR_SLOT_PEER_CACHE_SIZE - 1u);
+}
+
+/* pending_lock must be held by caller */
+static bool
+slot_peer_cache_get_locked(sol_repair_t* repair,
+                           sol_slot_t slot,
+                           uint64_t now_ms,
+                           sol_sockaddr_t* peer,
+                           sol_pubkey_t* peer_pubkey) {
+    if (!repair || slot == 0 || !peer) {
+        return false;
+    }
+
+    sol_repair_slot_peer_t* e = &repair->slot_peers[slot_peer_cache_idx(slot)];
+    if (!e->active) {
+        return false;
+    }
+    if (e->slot != slot) {
+        return false;
+    }
+    if (now_ms < e->last_seen_ms ||
+        (now_ms - e->last_seen_ms) > SOL_REPAIR_SLOT_PEER_TTL_MS) {
+        return false;
+    }
+    if (!is_peer_warm(repair, &e->pubkey, now_ms)) {
+        return false;
+    }
+
+    sol_sockaddr_copy(peer, &e->addr);
+    if (peer_pubkey) {
+        sol_pubkey_copy(peer_pubkey, &e->pubkey);
+    }
+    return true;
+}
+
+/* pending_lock must be held by caller */
+static void
+slot_peer_cache_update_locked(sol_repair_t* repair,
+                              sol_slot_t slot,
+                              const sol_sockaddr_t* peer,
+                              const sol_pubkey_t* peer_pubkey,
+                              uint64_t now_ms) {
+    if (!repair || slot == 0 || !peer || !peer_pubkey) {
+        return;
+    }
+
+    sol_repair_slot_peer_t* e = &repair->slot_peers[slot_peer_cache_idx(slot)];
+    e->slot = slot;
+    sol_sockaddr_copy(&e->addr, peer);
+    sol_pubkey_copy(&e->pubkey, peer_pubkey);
+    e->last_seen_ms = now_ms;
+    e->active = true;
 }
 
 /*
@@ -196,10 +580,7 @@ evict_lower_priority_pending(sol_repair_t* repair, sol_repair_type_t new_type) {
     }
 
     /* Evict and reuse the slot */
-    victim->active = false;
-    if (repair->pending_count > 0) {
-        repair->pending_count--;
-    }
+    pending_deactivate_locked(repair, victim);
     return victim;
 }
 
@@ -216,25 +597,55 @@ find_pending_slot(sol_repair_t* repair, sol_repair_type_t type) {
  * Find pending request by slot/index
  */
 static sol_repair_pending_t*
-find_pending(sol_repair_t* repair, sol_slot_t slot, uint64_t shred_index) {
-    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
-        if (repair->pending[i].active &&
-            repair->pending[i].slot == slot &&
-            repair->pending[i].shred_index == shred_index) {
-            return &repair->pending[i];
+find_pending(sol_repair_t* repair, sol_repair_type_t type, sol_slot_t slot, uint64_t shred_index) {
+    int32_t idx = req_map_get_locked(repair, type, slot, shred_index);
+    if (idx >= 0 && (size_t)idx < repair->config.max_pending_requests) {
+        sol_repair_pending_t* p = &repair->pending[idx];
+        uint64_t idx_key = req_index_key(type, shred_index);
+        if (p->active &&
+            p->type == type &&
+            p->slot == slot &&
+            req_index_key(p->type, p->shred_index) == idx_key) {
+            return p;
         }
     }
+
+    /* Fallback: linear scan if map is unavailable. */
+    if (!repair->req_map_size || !repair->req_vals) {
+        uint64_t idx_key = req_index_key(type, shred_index);
+        for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
+            sol_repair_pending_t* p = &repair->pending[i];
+            if (!p->active) continue;
+            if (p->type != type) continue;
+            if (p->slot != slot) continue;
+            if (req_index_key(p->type, p->shred_index) != idx_key) continue;
+            return p;
+        }
+    }
+
     return NULL;
 }
 
 static sol_repair_pending_t*
 find_pending_slot_only(sol_repair_t* repair, sol_repair_type_t type, sol_slot_t slot) {
-    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
-        sol_repair_pending_t* p = &repair->pending[i];
+    int32_t idx = req_map_get_locked(repair, type, slot, 0);
+    if (idx >= 0 && (size_t)idx < repair->config.max_pending_requests) {
+        sol_repair_pending_t* p = &repair->pending[idx];
         if (p->active && p->type == type && p->slot == slot) {
             return p;
         }
     }
+
+    /* Fallback: linear scan if map is unavailable. */
+    if (!repair->req_map_size || !repair->req_vals) {
+        for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
+            sol_repair_pending_t* p = &repair->pending[i];
+            if (p->active && p->type == type && p->slot == slot) {
+                return p;
+            }
+        }
+    }
+
     return NULL;
 }
 
@@ -242,18 +653,84 @@ find_pending_slot_only(sol_repair_t* repair, sol_repair_type_t type, sol_slot_t 
  * Select a repair peer
  */
 static bool
-select_repair_peer(sol_repair_t* repair, sol_sockaddr_t* peer, sol_pubkey_t* peer_pubkey) {
-    /* Get peers from gossip */
-    const sol_contact_info_t* contacts[100];
-    size_t num_contacts = 0;
-    if (repair->gossip) {
-        num_contacts = sol_gossip_get_cluster_nodes(repair->gossip, contacts, 100);
+pubkey_in_avoid_list(const sol_pubkey_t* pubkey,
+                     const sol_pubkey_t* avoid_pubkeys,
+                     size_t avoid_pubkeys_len) {
+    if (!pubkey || !avoid_pubkeys || avoid_pubkeys_len == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < avoid_pubkeys_len; i++) {
+        if (sol_pubkey_eq(pubkey, &avoid_pubkeys[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool
+select_repair_peer_ex(sol_repair_t* repair,
+                      sol_slot_t slot,
+                      const sol_pubkey_t* avoid_pubkeys,
+                      size_t avoid_pubkeys_len,
+                      sol_sockaddr_t* peer,
+                      sol_pubkey_t* peer_pubkey) {
+    uint64_t now_ms = sol_gossip_now_ms();
+
+    /* Prefer the slot leader when possible (best-effort). This reduces repair
+     * timeouts by targeting a peer that is guaranteed to have produced the
+     * shreds for the slot. */
+    sol_leader_schedule_t* schedule =
+        __atomic_load_n(&repair->leader_schedule, __ATOMIC_RELAXED);
+    if (schedule && repair->gossip) {
+        const sol_pubkey_t* leader = sol_leader_schedule_get_leader(schedule, slot);
+        if (leader &&
+            !sol_pubkey_is_zero(leader) &&
+            !sol_pubkey_eq(leader, &repair->self_pubkey) &&
+            (!avoid_pubkeys_len || !pubkey_in_avoid_list(leader, avoid_pubkeys, avoid_pubkeys_len))) {
+            sol_crds_t* crds = sol_gossip_crds(repair->gossip);
+            if (crds) {
+                const sol_contact_info_t* ci = sol_crds_get_contact_info(crds, leader);
+                if (ci) {
+                    const sol_sockaddr_t* addr =
+                        sol_contact_info_socket(ci, SOL_SOCKET_TAG_SERVE_REPAIR);
+                    if (addr && sockaddr_is_public_ip(addr)) {
+                        sol_sockaddr_copy(peer, addr);
+                        if (peer_pubkey) {
+                            sol_pubkey_copy(peer_pubkey, leader);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
     }
 
-    /* Filter to peers with a serve_repair socket, then pick one pseudo-randomly
-     * to spread load and avoid repeatedly selecting a slow/unreachable peer. */
-    const sol_contact_info_t* candidates[100];
-    size_t candidate_count = 0;
+    /* Prefer the most recently successful peer for this slot (catchup hit-rate). */
+    if (slot_peer_cache_get_locked(repair, slot, now_ms, peer, peer_pubkey)) {
+        if (!peer_pubkey || !pubkey_in_avoid_list(peer_pubkey, avoid_pubkeys, avoid_pubkeys_len)) {
+            return true;
+        }
+    }
+
+    enum { SOL_REPAIR_CONTACTS_MAX = 512 };
+
+    /* Get peers from gossip */
+    const sol_contact_info_t* contacts[SOL_REPAIR_CONTACTS_MAX];
+    size_t num_contacts = 0;
+    if (repair->gossip) {
+        num_contacts = sol_gossip_get_cluster_nodes(repair->gossip, contacts, SOL_REPAIR_CONTACTS_MAX);
+    }
+
+    /* Filter to peers with a serve_repair socket.
+     *
+     * Prefer public addresses (mainnet requirement), but fall back to any
+     * addresses if none are available. This keeps local/unit-test clusters
+     * functional (e.g. 127.0.0.1) while still avoiding obvious timeouts on
+     * mainnet. */
+    const sol_contact_info_t* all_candidates[SOL_REPAIR_CONTACTS_MAX];
+    size_t all_count = 0;
+    const sol_contact_info_t* public_candidates[SOL_REPAIR_CONTACTS_MAX];
+    size_t public_count = 0;
     for (size_t i = 0; i < num_contacts; i++) {
         const sol_sockaddr_t* addr =
             sol_contact_info_socket(contacts[i], SOL_SOCKET_TAG_SERVE_REPAIR);
@@ -263,7 +740,19 @@ select_repair_peer(sol_repair_t* repair, sol_sockaddr_t* peer, sol_pubkey_t* pee
         if (memcmp(contacts[i]->pubkey.bytes, repair->self_pubkey.bytes, SOL_PUBKEY_SIZE) == 0) {
             continue;
         }
-        candidates[candidate_count++] = contacts[i];
+        if (all_count < SOL_REPAIR_CONTACTS_MAX) {
+            all_candidates[all_count++] = contacts[i];
+        }
+        if (public_count < SOL_REPAIR_CONTACTS_MAX && sockaddr_is_public_ip(addr)) {
+            public_candidates[public_count++] = contacts[i];
+        }
+    }
+
+    const sol_contact_info_t** candidates = public_candidates;
+    size_t candidate_count = public_count;
+    if (candidate_count == 0) {
+        candidates = all_candidates;
+        candidate_count = all_count;
     }
 
     if (candidate_count == 0) {
@@ -275,7 +764,6 @@ select_repair_peer(sol_repair_t* repair, sol_sockaddr_t* peer, sol_pubkey_t* pee
             return false;
         }
 
-        uint64_t now_ms = sol_gossip_now_ms();
         size_t warm_idxs[100];
         size_t warm_count = 0;
         for (size_t i = 0; i < seed_count && warm_count < (sizeof(warm_idxs) / sizeof(warm_idxs[0])); i++) {
@@ -284,7 +772,7 @@ select_repair_peer(sol_repair_t* repair, sol_sockaddr_t* peer, sol_pubkey_t* pee
             }
         }
 
-        uint64_t seed = sol_gossip_now_ms();
+        uint64_t seed = now_ms;
         seed ^= (uint64_t)repair->pending_count << 17;
         seed ^= seed >> 33;
         seed *= 0xff51afd7ed558ccdULL;
@@ -297,63 +785,136 @@ select_repair_peer(sol_repair_t* repair, sol_sockaddr_t* peer, sol_pubkey_t* pee
             choose_warm = (seed % 10) != 0; /* ~90% warm, ~10% any */
         }
 
-        size_t idx = choose_warm ? warm_idxs[(size_t)(seed % warm_count)]
+        const size_t* idxs = choose_warm ? warm_idxs : NULL;
+        size_t idxs_len = choose_warm ? warm_count : seed_count;
+        size_t idx = choose_warm ? idxs[(size_t)(seed % warm_count)]
                                  : (size_t)(seed % seed_count);
-        sol_sockaddr_copy(peer, &repair->seed_peers[idx].serve_repair_addr);
-        if (peer_pubkey) {
-            sol_pubkey_copy(peer_pubkey, &repair->seed_peers[idx].pubkey);
+
+        /* Scan for a peer not in avoid list. */
+        for (size_t attempt = 0; attempt < idxs_len; attempt++) {
+            size_t cand = choose_warm ? idxs[(idx + attempt) % idxs_len]
+                                      : (idx + attempt) % seed_count;
+            if (avoid_pubkeys_len &&
+                pubkey_in_avoid_list(&repair->seed_peers[cand].pubkey, avoid_pubkeys, avoid_pubkeys_len)) {
+                continue;
+            }
+            sol_sockaddr_copy(peer, &repair->seed_peers[cand].serve_repair_addr);
+            if (peer_pubkey) {
+                sol_pubkey_copy(peer_pubkey, &repair->seed_peers[cand].pubkey);
+            }
+            pthread_mutex_unlock(&repair->seed_peers_lock);
+            return true;
         }
+
         pthread_mutex_unlock(&repair->seed_peers_lock);
-        return true;
+        return false;
     }
 
     /* Prefer peers that have pinged us recently (ping-cache gating). */
-    const sol_contact_info_t* warm_candidates[100];
+    const sol_contact_info_t* warm_candidates[SOL_REPAIR_CONTACTS_MAX];
     size_t warm_count = 0;
-    uint64_t now_ms = sol_gossip_now_ms();
     for (size_t i = 0; i < candidate_count; i++) {
         if (is_peer_warm(repair, &candidates[i]->pubkey, now_ms)) {
             warm_candidates[warm_count++] = candidates[i];
         }
     }
 
-    uint64_t seed = sol_gossip_now_ms();
+    uint64_t seed = now_ms;
     seed ^= (uint64_t)repair->pending_count << 17;
     seed ^= seed >> 33;
     seed *= 0xff51afd7ed558ccdULL;
     seed ^= seed >> 33;
 
-    if (warm_count && candidate_count > warm_count) {
+    if (warm_count) {
         /* Prefer warm peers most of the time, but keep sampling cold peers to
-         * avoid getting stuck on a single slow/unhelpful peer. */
-        if ((seed % 10) != 0) { /* ~90% warm */
-            memcpy(candidates, warm_candidates, warm_count * sizeof(candidates[0]));
+         * avoid getting stuck on a single slow/unhelpful peer.
+         *
+         * When we're retrying (avoid list non-empty), deliberately broaden the
+         * sample to cold peers more aggressively to find a responsive peer that
+         * still has historical shreds. */
+        uint64_t warm_mod = avoid_pubkeys_len ? 2u : 10u; /* ~50% warm on retry, ~90% warm initially */
+        bool choose_warm = (candidate_count == warm_count);
+        if (!choose_warm) {
+            choose_warm = (seed % warm_mod) != 0;
+        }
+        if (choose_warm) {
+            candidates = warm_candidates;
             candidate_count = warm_count;
         }
-    } else if (warm_count) {
-        memcpy(candidates, warm_candidates, warm_count * sizeof(candidates[0]));
-        candidate_count = warm_count;
     }
 
     size_t idx = (size_t)(seed % candidate_count);
-    const sol_contact_info_t* chosen = candidates[idx];
-    const sol_sockaddr_t* addr = sol_contact_info_socket(chosen, SOL_SOCKET_TAG_SERVE_REPAIR);
-    if (!addr) {
-        return false;
+    for (size_t attempt = 0; attempt < candidate_count; attempt++) {
+        const sol_contact_info_t* chosen = candidates[(idx + attempt) % candidate_count];
+        if (avoid_pubkeys_len &&
+            pubkey_in_avoid_list(&chosen->pubkey, avoid_pubkeys, avoid_pubkeys_len)) {
+            continue;
+        }
+        const sol_sockaddr_t* addr = sol_contact_info_socket(chosen, SOL_SOCKET_TAG_SERVE_REPAIR);
+        if (!addr) {
+            continue;
+        }
+        sol_sockaddr_copy(peer, addr);
+        if (peer_pubkey) {
+            sol_pubkey_copy(peer_pubkey, &chosen->pubkey);
+        }
+        return true;
     }
-    sol_sockaddr_copy(peer, addr);
-    if (peer_pubkey) {
-        sol_pubkey_copy(peer_pubkey, &chosen->pubkey);
+
+    return false;
+}
+
+static bool
+select_repair_peer(sol_repair_t* repair,
+                   sol_slot_t slot,
+                   const sol_pubkey_t* avoid_pubkey,
+                   sol_sockaddr_t* peer,
+                   sol_pubkey_t* peer_pubkey) {
+    if (avoid_pubkey) {
+        return select_repair_peer_ex(repair, slot, avoid_pubkey, 1u, peer, peer_pubkey);
     }
-    return true;
+    return select_repair_peer_ex(repair, slot, NULL, 0u, peer, peer_pubkey);
 }
 
 /*
  * Send a repair request
  */
-static sol_err_t
-send_repair_request(sol_repair_t* repair, sol_repair_pending_t* pending) {
+/* pending_lock must be held by caller */
+static uint32_t
+ensure_nonce_tracked_locked(sol_repair_t* repair, sol_repair_pending_t* pending) {
     if (!repair || !pending) {
+        return 0;
+    }
+
+    /* RepairRequestHeader.nonce (u32) */
+    if (pending->nonce == 0) {
+        repair->nonce_counter++;
+        if (repair->nonce_counter == 0) {
+            repair->nonce_counter = 1;
+        }
+        pending->nonce = repair->nonce_counter;
+    }
+
+    if (pending_ptr_is_tracked(repair, pending)) {
+        int32_t pending_idx = (int32_t)(pending - repair->pending);
+        nonce_map_put_locked(repair, pending->nonce, pending_idx);
+    }
+
+    return pending->nonce;
+}
+
+static sol_err_t
+send_repair_request_unlocked(sol_repair_t* repair,
+                             sol_repair_type_t type,
+                             sol_slot_t slot,
+                             uint64_t shred_index,
+                             uint32_t nonce,
+                             const sol_pubkey_t* peer_pubkey,
+                             const sol_sockaddr_t* peer) {
+    if (!repair || !peer_pubkey || !peer) {
+        return SOL_ERR_INVAL;
+    }
+    if (nonce == 0) {
         return SOL_ERR_INVAL;
     }
 
@@ -369,7 +930,7 @@ send_repair_request(sol_repair_t* repair, sol_repair_pending_t* pending) {
      * is computed over bytes[0..4] + bytes[4+64..] (skipping signature bytes).
      */
     uint32_t protocol_discriminant = 0;
-    switch (pending->type) {
+    switch (type) {
     case SOL_REPAIR_SHRED:           protocol_discriminant = 8;  break; /* WindowIndex */
     case SOL_REPAIR_HIGHEST_SHRED:   protocol_discriminant = 9;  break; /* HighestWindowIndex */
     case SOL_REPAIR_ORPHAN:          protocol_discriminant = 10; break; /* Orphan */
@@ -393,7 +954,7 @@ send_repair_request(sol_repair_t* repair, sol_repair_pending_t* pending) {
     len += SOL_PUBKEY_SIZE;
 
     /* RepairRequestHeader.recipient */
-    memcpy(buf + len, pending->peer_pubkey.bytes, SOL_PUBKEY_SIZE);
+    memcpy(buf + len, peer_pubkey->bytes, SOL_PUBKEY_SIZE);
     len += SOL_PUBKEY_SIZE;
 
     /* RepairRequestHeader.timestamp (ms since UNIX epoch) */
@@ -402,28 +963,21 @@ send_repair_request(sol_repair_t* repair, sol_repair_pending_t* pending) {
     len += 8;
 
     /* RepairRequestHeader.nonce (u32) */
-    if (pending->nonce == 0) {
-        repair->nonce_counter++;
-        if (repair->nonce_counter == 0) {
-            repair->nonce_counter = 1;
-        }
-        pending->nonce = repair->nonce_counter;
-    }
-    sol_store_u32_le(buf + len, pending->nonce);
+    sol_store_u32_le(buf + len, nonce);
     len += 4;
 
     /* Variant fields */
-    switch (pending->type) {
+    switch (type) {
     case SOL_REPAIR_SHRED:
     case SOL_REPAIR_HIGHEST_SHRED:
-        sol_store_u64_le(buf + len, (uint64_t)pending->slot);
+        sol_store_u64_le(buf + len, (uint64_t)slot);
         len += 8;
-        sol_store_u64_le(buf + len, pending->shred_index);
+        sol_store_u64_le(buf + len, shred_index);
         len += 8;
         break;
     case SOL_REPAIR_ORPHAN:
     case SOL_REPAIR_ANCESTOR_HASHES:
-        sol_store_u64_le(buf + len, (uint64_t)pending->slot);
+        sol_store_u64_le(buf + len, (uint64_t)slot);
         len += 8;
         break;
     }
@@ -441,36 +995,48 @@ send_repair_request(sol_repair_t* repair, sol_repair_pending_t* pending) {
     memcpy(buf + 4, signature.bytes, SOL_SIGNATURE_SIZE);
 
     /* Send */
-    sol_err_t err = sol_udp_send(repair->repair_sock, buf, len, &pending->peer);
+    sol_err_t err = sol_udp_send(repair->repair_sock, buf, len, peer);
     if (err == SOL_OK) {
-        repair->stats.requests_sent++;
+        (void)__atomic_fetch_add(&repair->stats.requests_sent, 1u, __ATOMIC_RELAXED);
         static uint32_t req_log_budget = 32;
         if (req_log_budget > 0) {
             char addr_str[64] = {0};
-            if (sol_sockaddr_to_string(&pending->peer, addr_str, sizeof(addr_str)) == SOL_OK) {
+            if (sol_sockaddr_to_string(peer, addr_str, sizeof(addr_str)) == SOL_OK) {
                 sol_log_debug("Repair request sent: type=%s slot=%llu index=%llu nonce=%u to=%s",
-                              sol_repair_type_name(pending->type),
-                              (unsigned long long)pending->slot,
-                              (unsigned long long)pending->shred_index,
-                              (unsigned)pending->nonce,
+                              sol_repair_type_name(type),
+                              (unsigned long long)slot,
+                              (unsigned long long)shred_index,
+                              (unsigned)nonce,
                               addr_str);
             } else {
                 sol_log_debug("Repair request sent: type=%s slot=%llu index=%llu nonce=%u",
-                              sol_repair_type_name(pending->type),
-                              (unsigned long long)pending->slot,
-                              (unsigned long long)pending->shred_index,
-                              (unsigned)pending->nonce);
+                              sol_repair_type_name(type),
+                              (unsigned long long)slot,
+                              (unsigned long long)shred_index,
+                              (unsigned)nonce);
             }
             req_log_budget--;
         }
         sol_log_trace("Sent repair request: type=%s slot=%llu index=%llu nonce=%u",
-                      sol_repair_type_name(pending->type),
-                      (unsigned long long)pending->slot,
-                      (unsigned long long)pending->shred_index,
-                      (unsigned)pending->nonce);
+                      sol_repair_type_name(type),
+                      (unsigned long long)slot,
+                      (unsigned long long)shred_index,
+                      (unsigned)nonce);
     }
 
     return err;
+}
+
+static sol_err_t
+send_repair_request_unlocked_pending(sol_repair_t* repair, const sol_repair_pending_t* pending) {
+    if (!repair || !pending) return SOL_ERR_INVAL;
+    return send_repair_request_unlocked(repair,
+                                        pending->type,
+                                        pending->slot,
+                                        pending->shred_index,
+                                        pending->nonce,
+                                        &pending->peer_pubkey,
+                                        &pending->peer);
 }
 
 /*
@@ -480,33 +1046,80 @@ static void
 process_timeouts(sol_repair_t* repair) {
     uint64_t now = sol_gossip_now_ms();
 
+    typedef struct {
+        sol_repair_type_t type;
+        sol_slot_t        slot;
+        uint64_t          shred_index;
+        uint32_t          nonce;
+        sol_sockaddr_t    peer;
+        sol_pubkey_t      peer_pubkey;
+    } sol_repair_send_action_t;
+
+    /* Under heavy catchup, many requests can timeout at once. If this buffer is
+     * too small, we risk "retrying" a request (updating sent_time/retries) but
+     * not actually sending it, which stalls repair. Keep this large enough to
+     * make forward progress per timeout scan. */
+    enum { SOL_REPAIR_TIMEOUT_SEND_MAX = 4096 };
+    sol_repair_send_action_t actions[SOL_REPAIR_TIMEOUT_SEND_MAX];
+    size_t action_len = 0;
+
     pthread_mutex_lock(&repair->pending_lock);
 
     for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
         sol_repair_pending_t* p = &repair->pending[i];
         if (!p->active) continue;
 
-        if (now - p->sent_time > repair->config.request_timeout_ms) {
-            repair->stats.timeouts++;
+        if (now - p->sent_time >= repair->config.request_timeout_ms) {
+            /* If we cannot enqueue a send action, do not mutate the pending
+             * entry. Otherwise we would delay the request by an additional
+             * timeout interval without ever sending. */
+            if (action_len >= SOL_REPAIR_TIMEOUT_SEND_MAX) {
+                break;
+            }
+
+            (void)__atomic_fetch_add(&repair->stats.timeouts, 1u, __ATOMIC_RELAXED);
 
             if (p->retries < repair->config.max_retries) {
                 /* Retry */
+                /* Try a different peer; if we can't find one, resend to the
+                 * existing peer rather than stalling. */
+                sol_pubkey_t prev = p->peer_pubkey;
+                sol_sockaddr_t new_peer = p->peer;
+                sol_pubkey_t new_peer_pubkey = p->peer_pubkey;
+                if (select_repair_peer(repair, p->slot, &prev, &new_peer, &new_peer_pubkey)) {
+                    p->peer = new_peer;
+                    p->peer_pubkey = new_peer_pubkey;
+                }
+
                 p->retries++;
                 p->sent_time = now;
-
-                /* Try a different peer */
-                if (select_repair_peer(repair, &p->peer, &p->peer_pubkey)) {
-                    send_repair_request(repair, p);
-                }
+                (void)ensure_nonce_tracked_locked(repair, p);
+                actions[action_len++] = (sol_repair_send_action_t){
+                    .type = p->type,
+                    .slot = p->slot,
+                    .shred_index = p->shred_index,
+                    .nonce = p->nonce,
+                    .peer = p->peer,
+                    .peer_pubkey = p->peer_pubkey,
+                };
             } else {
                 /* Give up */
-                p->active = false;
-                repair->pending_count--;
+                pending_deactivate_locked(repair, p);
             }
         }
     }
 
     pthread_mutex_unlock(&repair->pending_lock);
+
+    for (size_t i = 0; i < action_len; i++) {
+        (void)send_repair_request_unlocked(repair,
+                                           actions[i].type,
+                                           actions[i].slot,
+                                           actions[i].shred_index,
+                                           actions[i].nonce,
+                                           &actions[i].peer_pubkey,
+                                           &actions[i].peer);
+    }
 }
 
 #define SOL_REPAIR_PING_TOKEN_SIZE 32u
@@ -655,14 +1268,22 @@ resend_pending_for_peer(sol_repair_t* repair, const sol_pubkey_t* peer_pubkey) {
         }
     }
 
+    sol_repair_pending_t snap;
+    bool have_snap = false;
     if (best) {
         best->sent_time = now_ms;
         if (best->retries < repair->config.max_retries) {
             best->retries++;
         }
-        (void)send_repair_request(repair, best);
+        (void)ensure_nonce_tracked_locked(repair, best);
+        snap = *best;
+        have_snap = true;
     }
     pthread_mutex_unlock(&repair->pending_lock);
+
+    if (have_snap) {
+        (void)send_repair_request_unlocked_pending(repair, &snap);
+    }
 
     if (best) {
         static uint32_t resend_log_budget = 32;
@@ -675,6 +1296,23 @@ resend_pending_for_peer(sol_repair_t* repair, const sol_pubkey_t* peer_pubkey) {
 
 static sol_repair_pending_t*
 find_pending_by_nonce_locked(sol_repair_t* repair, uint32_t nonce) {
+    int32_t idx = nonce_map_get_locked(repair, nonce);
+    if (idx >= 0 && (size_t)idx < repair->config.max_pending_requests) {
+        sol_repair_pending_t* p = &repair->pending[idx];
+        if (p->active && p->nonce == nonce) {
+            return p;
+        }
+    }
+
+    /* Fast path miss: avoid O(n) scans on the response hot path when the
+     * nonce map is available. The map is sized for `max_pending_requests*32`
+     * and should have stable hit-rate; linear scans here are catastrophic
+     * under mainnet repair response rates. */
+    if (repair->nonce_map_size != 0 && repair->nonce_vals && repair->nonce_keys) {
+        return NULL;
+    }
+
+    /* Fallback: linear scan (map is best-effort and may be disabled). */
     for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
         sol_repair_pending_t* p = &repair->pending[i];
         if (p->active && p->nonce == nonce) {
@@ -682,6 +1320,26 @@ find_pending_by_nonce_locked(sol_repair_t* repair, uint32_t nonce) {
         }
     }
     return NULL;
+}
+
+/* pending_lock must be held by caller */
+static void
+pending_deactivate_locked(sol_repair_t* repair, sol_repair_pending_t* pending) {
+    if (!repair || !pending || !pending->active) {
+        return;
+    }
+    if (pending->type == SOL_REPAIR_ANCESTOR_HASHES) {
+        uint32_t cur = __atomic_load_n(&repair->ancestor_pending_count, __ATOMIC_RELAXED);
+        if (cur > 0u) {
+            (void)__atomic_fetch_sub(&repair->ancestor_pending_count, 1u, __ATOMIC_RELAXED);
+        }
+    }
+    req_map_del_locked(repair, pending->type, pending->slot, pending->shred_index);
+    nonce_map_del_locked(repair, pending->nonce);
+    pending->active = false;
+    if (repair->pending_count > 0) {
+        repair->pending_count--;
+    }
 }
 
 /*
@@ -752,19 +1410,19 @@ process_ancestor_response(sol_repair_t* repair, const uint8_t* data, size_t len)
     }
 
     if (len < 4 + 8) {
-        repair->stats.invalid_responses++;
+        (void)__atomic_fetch_add(&repair->stats.invalid_responses, 1u, __ATOMIC_RELAXED);
         return;
     }
 
     uint32_t disc = sol_load_u32_le(data);
     if (disc != 0) {
-        repair->stats.invalid_responses++;
+        (void)__atomic_fetch_add(&repair->stats.invalid_responses, 1u, __ATOMIC_RELAXED);
         return;
     }
 
     uint64_t vec_len = sol_load_u64_le(data + 4);
     if (vec_len > SOL_REPAIR_MAX_ANCESTOR_HASHES) {
-        repair->stats.invalid_responses++;
+        (void)__atomic_fetch_add(&repair->stats.invalid_responses, 1u, __ATOMIC_RELAXED);
         return;
     }
 
@@ -775,31 +1433,30 @@ process_ancestor_response(sol_repair_t* repair, const uint8_t* data, size_t len)
         resp_nonce = sol_load_u32_le(data + expected);
         len = expected;
     } else if (len != expected) {
-        repair->stats.invalid_responses++;
+        (void)__atomic_fetch_add(&repair->stats.invalid_responses, 1u, __ATOMIC_RELAXED);
         return;
     }
 
     sol_repair_pending_t* pending = NULL;
+    sol_slot_t requested_slot = 0;
     pthread_mutex_lock(&repair->pending_lock);
     pending = find_pending_by_nonce_locked(repair, resp_nonce);
     if (pending && pending->type == SOL_REPAIR_ANCESTOR_HASHES) {
-        pending->active = false;
-        if (repair->pending_count > 0) {
-            repair->pending_count--;
-        }
+        requested_slot = pending->slot;
+        pending_deactivate_locked(repair, pending);
     } else {
         pending = NULL;
     }
     pthread_mutex_unlock(&repair->pending_lock);
 
     if (!pending) {
-        repair->stats.duplicates++;
+        (void)__atomic_fetch_add(&repair->stats.duplicates, 1u, __ATOMIC_RELAXED);
         return;
     }
 
     sol_repair_ancestor_response_t response;
     memset(&response, 0, sizeof(response));
-    response.requested_slot = pending->slot;
+    response.requested_slot = requested_slot;
 
     response.ancestors_len = (uint16_t)vec_len;
     const uint8_t* p = data + 12;
@@ -817,7 +1474,7 @@ process_ancestor_response(sol_repair_t* repair, const uint8_t* data, size_t len)
     response.validated = true;
 
     if (response.validation != SOL_ANCESTOR_VALID) {
-        repair->stats.invalid_responses++;
+        (void)__atomic_fetch_add(&repair->stats.invalid_responses, 1u, __ATOMIC_RELAXED);
         sol_log_warn("Invalid ancestor chain for slot %llu: validation=%d",
                      (unsigned long long)response.requested_slot,
                      (int)response.validation);
@@ -893,7 +1550,7 @@ unwrap_repair_shred_bincode(const uint8_t* data, size_t len,
 static void
 process_response(sol_repair_t* repair, const uint8_t* data, size_t len,
                  const sol_sockaddr_t* from) {
-    repair->stats.responses_received++;
+    (void)__atomic_fetch_add(&repair->stats.responses_received, 1u, __ATOMIC_RELAXED);
 
     if (len != SOL_REPAIR_PING_MSG_BYTES) {
         static uint32_t non_ping_log_budget = 8;
@@ -917,7 +1574,7 @@ process_response(sol_repair_t* repair, const uint8_t* data, size_t len,
 
         if (is_ping) {
             if (!sol_ed25519_verify(&ping_from, token, SOL_REPAIR_PING_TOKEN_SIZE, &sig)) {
-                repair->stats.invalid_responses++;
+                (void)__atomic_fetch_add(&repair->stats.invalid_responses, 1u, __ATOMIC_RELAXED);
             } else {
                 mark_peer_warm(repair, &ping_from);
                 if (send_repair_pong(repair, token, from) == SOL_OK) {
@@ -935,15 +1592,8 @@ process_response(sol_repair_t* repair, const uint8_t* data, size_t len,
     /* Ancestor hash responses are bincode and may be mistaken for shreds unless
      * we gate the parse carefully. Only attempt when we have an outstanding
      * ancestor request and the packet length matches the expected layout. */
-    bool have_ancestor_pending = false;
-    pthread_mutex_lock(&repair->pending_lock);
-    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
-        if (repair->pending[i].active && repair->pending[i].type == SOL_REPAIR_ANCESTOR_HASHES) {
-            have_ancestor_pending = true;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&repair->pending_lock);
+    bool have_ancestor_pending =
+        (__atomic_load_n(&repair->ancestor_pending_count, __ATOMIC_RELAXED) > 0u);
 
     if (have_ancestor_pending && len >= 12) {
         uint32_t disc = sol_load_u32_le(data);
@@ -983,14 +1633,20 @@ process_response(sol_repair_t* repair, const uint8_t* data, size_t len,
     if (err != SOL_OK) {
         sol_log_debug("Repair response parse failed (len=%zu, err=%d, wrapped=%s)",
                       len, (int)err, used_wrapper ? "yes" : "no");
-        repair->stats.invalid_responses++;
+        (void)__atomic_fetch_add(&repair->stats.invalid_responses, 1u, __ATOMIC_RELAXED);
         return;
     }
+
+    bool shred_is_data = (shred.type == SOL_SHRED_TYPE_DATA);
 
     /* Find and complete pending request */
     pthread_mutex_lock(&repair->pending_lock);
 
-    if (!used_wrapper && len >= 4) {
+    /* Some peers send raw shreds with a trailing nonce(u32) used to match the
+     * original request. Only treat the tail as a nonce when it extends the
+     * canonical shred wire size; otherwise we'd waste time looking up random
+     * payload bytes in the pending map (and potentially do O(n) fallbacks). */
+    if (!used_wrapper && len == (size_t)shred.raw_len + 4u) {
         resp_nonce = sol_load_u32_le(data + len - 4);
         have_nonce = true;
     }
@@ -1005,6 +1661,26 @@ process_response(sol_repair_t* repair, const uint8_t* data, size_t len,
                 match = false;
             } else if (by_nonce->type == SOL_REPAIR_SHRED && by_nonce->shred_index != shred.index) {
                 match = false;
+            }
+
+            /* RepairProtocol::WindowIndex does not encode shred type on the wire.
+             * Some peers may respond with a coding shred for the requested index.
+             * Track the response for FEC recovery, but do not treat it as
+             * satisfying a pending *data* shred request. */
+            if (match && by_nonce->type == SOL_REPAIR_SHRED) {
+                if (by_nonce->is_data != shred_is_data) {
+                    match = false;
+                    static uint32_t type_mismatch_budget = 32;
+                    if (type_mismatch_budget > 0) {
+                        sol_log_debug("Repair response shred-type mismatch: nonce=%u slot=%llu index=%u expected=%s got=%s",
+                                      (unsigned)resp_nonce,
+                                      (unsigned long long)shred.slot,
+                                      (unsigned)shred.index,
+                                      by_nonce->is_data ? "data" : "code",
+                                      shred_is_data ? "data" : "code");
+                        type_mismatch_budget--;
+                    }
+                }
             }
 
             if (match) {
@@ -1025,8 +1701,14 @@ process_response(sol_repair_t* repair, const uint8_t* data, size_t len,
             }
         }
     }
+    /* Fallback: match by slot/index (SHRED) or slot-only (HIGHEST/ORPHAN).
+     *
+     * This used to be O(n) across the pending table. With the request map, it
+     * is O(1) and also acts as a correctness backstop if some peers do not
+     * include a nonce trailer or if the nonce map becomes temporarily
+     * ineffective under sustained churn. */
     if (!pending) {
-        pending = find_pending(repair, shred.slot, shred.index);
+        pending = find_pending(repair, SOL_REPAIR_SHRED, shred.slot, shred.index);
     }
     if (!pending) {
         /* Highest/orphan requests are satisfied by any shred for the slot. */
@@ -1035,19 +1717,31 @@ process_response(sol_repair_t* repair, const uint8_t* data, size_t len,
     if (!pending) {
         pending = find_pending_slot_only(repair, SOL_REPAIR_ORPHAN, shred.slot);
     }
+
+    bool pending_satisfied = false;
     if (pending) {
         /* Treat any valid response as a "warm" signal for ping-cache gating. */
         mark_peer_warm(repair, &pending->peer_pubkey);
-        pending->active = false;
-        if (repair->pending_count > 0) {
-            repair->pending_count--;
-        }
-        repair->stats.shreds_repaired++;
-    } else {
-        repair->stats.duplicates++;
-    }
 
-    bool pending_hit = (pending != NULL);
+        bool type_ok = true;
+        if (pending->type == SOL_REPAIR_SHRED) {
+            type_ok = (pending->is_data == shred_is_data);
+        }
+
+        if (type_ok) {
+            uint64_t now_ms = sol_gossip_now_ms();
+            slot_peer_cache_update_locked(repair, shred.slot, &pending->peer, &pending->peer_pubkey, now_ms);
+            pending_deactivate_locked(repair, pending);
+            (void)__atomic_fetch_add(&repair->stats.shreds_repaired, 1u, __ATOMIC_RELAXED);
+            pending_satisfied = true;
+        } else {
+            /* We got a shred for the right slot/index but of the wrong type. Do
+             * not deactivate the pending entry so we can keep retrying. */
+            (void)__atomic_fetch_add(&repair->stats.duplicates, 1u, __ATOMIC_RELAXED);
+        }
+    } else {
+        (void)__atomic_fetch_add(&repair->stats.duplicates, 1u, __ATOMIC_RELAXED);
+    }
 
     pthread_mutex_unlock(&repair->pending_lock);
 
@@ -1057,7 +1751,7 @@ process_response(sol_repair_t* repair, const uint8_t* data, size_t len,
                   shred_len,
                   used_wrapper ? "yes" : "no",
                   (unsigned)resp_nonce,
-                  pending_hit ? "hit" : "miss",
+                  pending_satisfied ? "hit" : "miss",
                   pending_matched_by_nonce ? " (nonce)" : "");
 
     /* Notify callback */
@@ -1118,7 +1812,7 @@ process_request(sol_repair_t* repair, const uint8_t* data, size_t len,
         if (err == SOL_OK && shred_len > 0) {
             /* Send shred back to requester */
             sol_udp_send(repair->serve_sock, shred_buf, shred_len, from);
-            repair->stats.responses_received++;  /* Reusing this for responses sent */
+            (void)__atomic_fetch_add(&repair->stats.responses_received, 1u, __ATOMIC_RELAXED);  /* Reusing this for responses sent */
         }
         break;
     }
@@ -1301,7 +1995,59 @@ sol_repair_new(const sol_repair_config_t* config,
         return NULL;
     }
 
+    /* Allocate nonce -> pending lookup table (best-effort fast-path).
+     *
+     * Note: open-addressing tables with tombstones degrade under sustained
+     * churn (timeout/retry heavy catchup). We intentionally oversize the table
+     * so we keep plenty of true empty slots (-1) for fast negative lookups. */
+    repair->nonce_map_size = pow2_ge((size_t)repair->config.max_pending_requests * 32u);
+    if (repair->nonce_map_size < 64u) {
+        repair->nonce_map_size = 64u;
+    }
+    repair->nonce_keys = sol_calloc(repair->nonce_map_size, sizeof(uint32_t));
+    repair->nonce_vals = sol_alloc(repair->nonce_map_size * sizeof(int32_t));
+    if (!repair->nonce_keys || !repair->nonce_vals) {
+        sol_free(repair->nonce_keys);
+        sol_free(repair->nonce_vals);
+        sol_free(repair->pending);
+        sol_free(repair);
+        return NULL;
+    }
+    for (size_t i = 0; i < repair->nonce_map_size; i++) {
+        repair->nonce_vals[i] = -1;
+    }
+
+    /* Allocate (type,slot,index)->pending lookup table for request dedupe. */
+    repair->req_map_size = pow2_ge((size_t)repair->config.max_pending_requests * 32u);
+    if (repair->req_map_size < 64u) {
+        repair->req_map_size = 64u;
+    }
+    repair->req_slots = sol_calloc(repair->req_map_size, sizeof(uint64_t));
+    repair->req_indices = sol_calloc(repair->req_map_size, sizeof(uint64_t));
+    repair->req_types = sol_calloc(repair->req_map_size, sizeof(uint8_t));
+    repair->req_vals = sol_alloc(repair->req_map_size * sizeof(int32_t));
+    if (!repair->req_slots || !repair->req_indices || !repair->req_types || !repair->req_vals) {
+        sol_free(repair->req_slots);
+        sol_free(repair->req_indices);
+        sol_free(repair->req_types);
+        sol_free(repair->req_vals);
+        sol_free(repair->nonce_keys);
+        sol_free(repair->nonce_vals);
+        sol_free(repair->pending);
+        sol_free(repair);
+        return NULL;
+    }
+    for (size_t i = 0; i < repair->req_map_size; i++) {
+        repair->req_vals[i] = -1;
+    }
+
     if (pthread_mutex_init(&repair->pending_lock, NULL) != 0) {
+        sol_free(repair->req_slots);
+        sol_free(repair->req_indices);
+        sol_free(repair->req_types);
+        sol_free(repair->req_vals);
+        sol_free(repair->nonce_keys);
+        sol_free(repair->nonce_vals);
         sol_free(repair->pending);
         sol_free(repair);
         return NULL;
@@ -1309,6 +2055,12 @@ sol_repair_new(const sol_repair_config_t* config,
 
     if (pthread_mutex_init(&repair->seed_peers_lock, NULL) != 0) {
         pthread_mutex_destroy(&repair->pending_lock);
+        sol_free(repair->req_slots);
+        sol_free(repair->req_indices);
+        sol_free(repair->req_types);
+        sol_free(repair->req_vals);
+        sol_free(repair->nonce_keys);
+        sol_free(repair->nonce_vals);
         sol_free(repair->pending);
         sol_free(repair);
         return NULL;
@@ -1317,6 +2069,12 @@ sol_repair_new(const sol_repair_config_t* config,
     if (pthread_mutex_init(&repair->warm_peers_lock, NULL) != 0) {
         pthread_mutex_destroy(&repair->seed_peers_lock);
         pthread_mutex_destroy(&repair->pending_lock);
+        sol_free(repair->req_slots);
+        sol_free(repair->req_indices);
+        sol_free(repair->req_types);
+        sol_free(repair->req_vals);
+        sol_free(repair->nonce_keys);
+        sol_free(repair->nonce_vals);
         sol_free(repair->pending);
         sol_free(repair);
         return NULL;
@@ -1344,6 +2102,12 @@ sol_repair_destroy(sol_repair_t* repair) {
     sol_free(repair->seed_peers);
 
     pthread_mutex_destroy(&repair->pending_lock);
+    sol_free(repair->req_slots);
+    sol_free(repair->req_indices);
+    sol_free(repair->req_types);
+    sol_free(repair->req_vals);
+    sol_free(repair->nonce_keys);
+    sol_free(repair->nonce_vals);
     sol_free(repair->pending);
     sol_free(repair);
 }
@@ -1357,6 +2121,10 @@ sol_repair_start(sol_repair_t* repair, uint16_t port) {
     sol_udp_config_t udp_cfg = SOL_UDP_CONFIG_DEFAULT;
     udp_cfg.bind_port = 0;  /* Any port */
     udp_cfg.nonblocking = true;
+    /* Repair traffic can be bursty during catchup; prefer larger kernel
+     * buffers to reduce response drops under load. */
+    udp_cfg.recv_buf = 128u * 1024u * 1024u;
+    udp_cfg.send_buf = 128u * 1024u * 1024u;
 
     repair->repair_sock = sol_udp_new(&udp_cfg);
     if (!repair->repair_sock) {
@@ -1408,37 +2176,60 @@ sol_repair_run_once(sol_repair_t* repair, uint32_t timeout_ms) {
     }
 
     /* Drain repair socket (responses). */
-    enum { SOL_REPAIR_RECV_BUDGET = 128 };
-    for (size_t i = 0; i < SOL_REPAIR_RECV_BUDGET; i++) {
-        sol_sockaddr_t from;
-        size_t len = sizeof(repair->recv_buf);
-
-        sol_err_t err = sol_udp_recv(repair->repair_sock, repair->recv_buf,
-                                     &len, &from);
-        if (err == SOL_OK) {
-            process_response(repair, repair->recv_buf, len, &from);
-            continue;
+    enum { SOL_REPAIR_RECV_BUDGET = 32768 };
+    {
+        size_t received = 0;
+        sol_udp_pkt_t pkts[SOL_NET_BATCH_SIZE];
+        while (received < SOL_REPAIR_RECV_BUDGET) {
+            int n = sol_udp_recv_batch(repair->repair_sock, pkts, SOL_NET_BATCH_SIZE);
+            if (n < 0) {
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+            received += (size_t)n;
+            for (int i = 0; i < n; i++) {
+                process_response(repair, pkts[i].data, pkts[i].len, &pkts[i].addr);
+            }
         }
-        break;
     }
 
     /* Drain serve socket (requests). */
     if (repair->serve_sock) {
-        for (size_t i = 0; i < SOL_REPAIR_RECV_BUDGET; i++) {
-            sol_sockaddr_t from;
-            size_t len = sizeof(repair->recv_buf);
-
-            sol_err_t err = sol_udp_recv(repair->serve_sock, repair->recv_buf, &len, &from);
-            if (err == SOL_OK) {
-                process_request(repair, repair->recv_buf, len, &from);
-                continue;
+        size_t received = 0;
+        sol_udp_pkt_t pkts[SOL_NET_BATCH_SIZE];
+        while (received < SOL_REPAIR_RECV_BUDGET) {
+            int n = sol_udp_recv_batch(repair->serve_sock, pkts, SOL_NET_BATCH_SIZE);
+            if (n < 0) {
+                break;
             }
-            break;
+            if (n == 0) {
+                break;
+            }
+            received += (size_t)n;
+            for (int i = 0; i < n; i++) {
+                process_request(repair, pkts[i].data, pkts[i].len, &pkts[i].addr);
+            }
         }
     }
 
-    /* Process timeouts */
-    process_timeouts(repair);
+    /* Process timeouts (throttled). */
+    uint64_t now_ms = sol_gossip_now_ms();
+    size_t pending_count = sol_repair_pending_count(repair);
+    /* When pending is large, retries must be driven frequently to avoid
+     * multi-second stalls on a small number of missing shreds. */
+    uint64_t interval_ms = (uint64_t)(repair->config.request_timeout_ms / 2u);
+    if (pending_count > 1024u) {
+        interval_ms = (uint64_t)SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS;
+    } else if (interval_ms < (uint64_t)SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS) {
+        interval_ms = (uint64_t)SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS;
+    }
+    if (pending_count > 0 &&
+        (repair->last_timeout_check_ms == 0 || (now_ms - repair->last_timeout_check_ms) >= interval_ms)) {
+        repair->last_timeout_check_ms = now_ms;
+        process_timeouts(repair);
+    }
 
     return SOL_OK;
 }
@@ -1457,10 +2248,13 @@ sol_repair_request_shred(sol_repair_t* repair, sol_slot_t slot,
                          uint64_t shred_index, bool is_data) {
     if (!repair) return SOL_ERR_INVAL;
 
+    sol_repair_pending_t snap;
+    sol_repair_pending_t* tracked = NULL;
+
     pthread_mutex_lock(&repair->pending_lock);
 
     /* Check if already pending */
-    if (find_pending(repair, slot, shred_index)) {
+    if (find_pending(repair, SOL_REPAIR_SHRED, slot, shred_index)) {
         pthread_mutex_unlock(&repair->pending_lock);
         return SOL_OK;
     }
@@ -1473,7 +2267,7 @@ sol_repair_request_shred(sol_repair_t* repair, sol_slot_t slot,
     }
 
     /* Select peer */
-    if (!select_repair_peer(repair, &pending->peer, &pending->peer_pubkey)) {
+    if (!select_repair_peer(repair, slot, NULL, &pending->peer, &pending->peer_pubkey)) {
         pthread_mutex_unlock(&repair->pending_lock);
         return SOL_ERR_PEER_UNAVAILABLE;
     }
@@ -1486,33 +2280,300 @@ sol_repair_request_shred(sol_repair_t* repair, sol_slot_t slot,
     pending->nonce = 0;
     pending->sent_time = sol_gossip_now_ms();
     pending->retries = 0;
+    pending->hedge_retry_mark = UINT32_MAX;
     pending->active = true;
     repair->pending_count++;
 
-    /* Send request */
-    sol_err_t err = send_repair_request(repair, pending);
-    if (err != SOL_OK) {
-        pending->active = false;
-        repair->pending_count--;
-    }
+    (void)ensure_nonce_tracked_locked(repair, pending);
+    req_map_put_locked(repair, pending->type, pending->slot, pending->shred_index, (int32_t)(pending - repair->pending));
+    snap = *pending;
+    tracked = pending;
 
     pthread_mutex_unlock(&repair->pending_lock);
 
+    /* Send outside pending_lock to avoid blocking response processing. */
+    sol_err_t err = send_repair_request_unlocked_pending(repair, &snap);
+    if (err != SOL_OK && tracked) {
+        pthread_mutex_lock(&repair->pending_lock);
+        if (tracked->active && tracked->nonce == snap.nonce) {
+            pending_deactivate_locked(repair, tracked);
+        }
+        pthread_mutex_unlock(&repair->pending_lock);
+    }
+
     return err;
+}
+
+sol_err_t
+sol_repair_request_shred_fanout(sol_repair_t* repair, sol_slot_t slot,
+                                uint64_t shred_index, bool is_data, uint32_t fanout) {
+    if (!repair) return SOL_ERR_INVAL;
+
+    if (fanout <= 1u) {
+        return sol_repair_request_shred(repair, slot, shred_index, is_data);
+    }
+
+    /* Cap to keep stack bounded and avoid accidental misuse. */
+    if (fanout > (uint32_t)SOL_REPAIR_MAX_FANOUT) {
+        fanout = (uint32_t)SOL_REPAIR_MAX_FANOUT;
+    }
+
+    enum { SOL_REPAIR_HEDGE_DELAY_MS = 5 };
+
+    uint64_t now_ms = sol_gossip_now_ms();
+    bool created = false;
+
+    sol_repair_pending_t primary_snap;
+    bool send_primary = false;
+    sol_repair_pending_t* tracked = NULL;
+    sol_repair_pending_t hedges[SOL_REPAIR_MAX_FANOUT];
+    size_t hedge_len = 0;
+
+    pthread_mutex_lock(&repair->pending_lock);
+
+    sol_repair_pending_t* pending = find_pending(repair, SOL_REPAIR_SHRED, slot, shred_index);
+    if (!pending) {
+        /* Create the primary tracked request first. */
+        pending = find_pending_slot(repair, SOL_REPAIR_SHRED);
+        if (!pending) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_ERR_FULL;
+        }
+
+        if (!select_repair_peer_ex(repair, slot, NULL, 0u, &pending->peer, &pending->peer_pubkey)) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_ERR_PEER_UNAVAILABLE;
+        }
+
+        pending->type = SOL_REPAIR_SHRED;
+        pending->slot = slot;
+        pending->shred_index = shred_index;
+        pending->is_data = is_data;
+        pending->nonce = 0;
+        pending->sent_time = now_ms;
+        pending->retries = 0;
+        pending->hedge_retry_mark = UINT32_MAX;
+        pending->active = true;
+        repair->pending_count++;
+
+        (void)ensure_nonce_tracked_locked(repair, pending);
+        req_map_put_locked(repair, pending->type, pending->slot, pending->shred_index, (int32_t)(pending - repair->pending));
+        primary_snap = *pending;
+        tracked = pending;
+        send_primary = true;
+
+        created = true;
+        /* Refresh our local clock for gating, but do not mutate pending->sent_time again. */
+        now_ms = sol_gossip_now_ms();
+    }
+
+    if (!pending->active || pending->type != SOL_REPAIR_SHRED) {
+        pthread_mutex_unlock(&repair->pending_lock);
+        return SOL_OK;
+    }
+
+    (void)ensure_nonce_tracked_locked(repair, pending);
+
+    if (!created) {
+        /* Rate limit hedges to once per retry attempt. */
+        if (pending->hedge_retry_mark == pending->retries) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_OK;
+        }
+        /* Don't hedge immediately after a (re)send. */
+        if (now_ms >= pending->sent_time && (now_ms - pending->sent_time) < SOL_REPAIR_HEDGE_DELAY_MS) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_OK;
+        }
+    }
+
+    sol_pubkey_t avoid[SOL_REPAIR_MAX_FANOUT];
+    size_t avoid_len = 0;
+    avoid[avoid_len++] = pending->peer_pubkey;
+
+    /* Best-effort: send additional copies with the same nonce. We don't create
+     * additional pending entries; responses will still match by nonce. */
+    for (uint32_t i = 1;
+         i < fanout && avoid_len < (sizeof(avoid) / sizeof(avoid[0])) && hedge_len < (sizeof(hedges) / sizeof(hedges[0]));
+         i++) {
+        sol_sockaddr_t peer;
+        sol_pubkey_t peer_pk;
+        if (!select_repair_peer_ex(repair, slot, avoid, avoid_len, &peer, &peer_pk)) {
+            break;
+        }
+        avoid[avoid_len++] = peer_pk;
+
+        sol_repair_pending_t tmp = *pending;
+        tmp.peer = peer;
+        tmp.peer_pubkey = peer_pk;
+        tmp.is_data = is_data;
+        tmp.nonce = pending->nonce;
+
+        hedges[hedge_len++] = tmp;
+    }
+
+    pending->hedge_retry_mark = pending->retries;
+    pthread_mutex_unlock(&repair->pending_lock);
+
+    if (send_primary) {
+        sol_err_t err = send_repair_request_unlocked_pending(repair, &primary_snap);
+        if (err != SOL_OK && tracked) {
+            pthread_mutex_lock(&repair->pending_lock);
+            if (tracked->active && tracked->nonce == primary_snap.nonce) {
+                pending_deactivate_locked(repair, tracked);
+            }
+            pthread_mutex_unlock(&repair->pending_lock);
+            return err;
+        }
+    }
+
+    for (size_t i = 0; i < hedge_len; i++) {
+        (void)send_repair_request_unlocked_pending(repair, &hedges[i]);
+    }
+
+    return SOL_OK;
+}
+
+sol_err_t
+sol_repair_request_highest_fanout(sol_repair_t* repair, sol_slot_t slot,
+                                  uint64_t shred_index, uint32_t fanout) {
+    if (!repair) return SOL_ERR_INVAL;
+
+    if (fanout <= 1u) {
+        return sol_repair_request_highest(repair, slot, shred_index);
+    }
+
+    /* Cap to keep stack bounded and avoid accidental misuse. */
+    if (fanout > (uint32_t)SOL_REPAIR_MAX_FANOUT) {
+        fanout = (uint32_t)SOL_REPAIR_MAX_FANOUT;
+    }
+
+    enum { SOL_REPAIR_HEDGE_DELAY_MS = 5 };
+
+    uint64_t now_ms = sol_gossip_now_ms();
+    bool created = false;
+
+    sol_repair_pending_t primary_snap;
+    bool send_primary = false;
+    sol_repair_pending_t* tracked = NULL;
+    sol_repair_pending_t hedges[SOL_REPAIR_MAX_FANOUT];
+    size_t hedge_len = 0;
+
+    pthread_mutex_lock(&repair->pending_lock);
+
+    sol_repair_pending_t* pending = find_pending_slot_only(repair, SOL_REPAIR_HIGHEST_SHRED, slot);
+
+    if (!pending) {
+        pending = find_pending_slot(repair, SOL_REPAIR_HIGHEST_SHRED);
+        if (!pending) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_ERR_FULL;
+        }
+
+        if (!select_repair_peer_ex(repair, slot, NULL, 0u, &pending->peer, &pending->peer_pubkey)) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_ERR_PEER_UNAVAILABLE;
+        }
+
+        pending->type = SOL_REPAIR_HIGHEST_SHRED;
+        pending->slot = slot;
+        pending->shred_index = shred_index;
+        pending->nonce = 0;
+        pending->sent_time = now_ms;
+        pending->retries = 0;
+        pending->hedge_retry_mark = UINT32_MAX;
+        pending->active = true;
+        repair->pending_count++;
+
+        (void)ensure_nonce_tracked_locked(repair, pending);
+        req_map_put_locked(repair, pending->type, pending->slot, pending->shred_index, (int32_t)(pending - repair->pending));
+        primary_snap = *pending;
+        tracked = pending;
+        send_primary = true;
+
+        created = true;
+        now_ms = sol_gossip_now_ms();
+    }
+
+    if (!pending->active || pending->type != SOL_REPAIR_HIGHEST_SHRED) {
+        pthread_mutex_unlock(&repair->pending_lock);
+        return SOL_OK;
+    }
+
+    (void)ensure_nonce_tracked_locked(repair, pending);
+
+    if (!created) {
+        /* Rate limit hedges to once per retry attempt. */
+        if (pending->hedge_retry_mark == pending->retries) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_OK;
+        }
+        /* Don't hedge immediately after a (re)send. */
+        if (now_ms >= pending->sent_time && (now_ms - pending->sent_time) < SOL_REPAIR_HEDGE_DELAY_MS) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_OK;
+        }
+    }
+
+    sol_pubkey_t avoid[SOL_REPAIR_MAX_FANOUT];
+    size_t avoid_len = 0;
+    avoid[avoid_len++] = pending->peer_pubkey;
+
+    /* Best-effort: send additional copies with the same nonce. We don't create
+     * additional pending entries; responses will still match by nonce. */
+    for (uint32_t i = 1;
+         i < fanout && avoid_len < (sizeof(avoid) / sizeof(avoid[0])) && hedge_len < (sizeof(hedges) / sizeof(hedges[0]));
+         i++) {
+        sol_sockaddr_t peer;
+        sol_pubkey_t peer_pk;
+        if (!select_repair_peer_ex(repair, slot, avoid, avoid_len, &peer, &peer_pk)) {
+            break;
+        }
+        avoid[avoid_len++] = peer_pk;
+
+        sol_repair_pending_t tmp = *pending;
+        tmp.peer = peer;
+        tmp.peer_pubkey = peer_pk;
+        tmp.shred_index = shred_index;
+        tmp.nonce = pending->nonce;
+
+        hedges[hedge_len++] = tmp;
+    }
+
+    pending->hedge_retry_mark = pending->retries;
+    pthread_mutex_unlock(&repair->pending_lock);
+
+    if (send_primary) {
+        sol_err_t err = send_repair_request_unlocked_pending(repair, &primary_snap);
+        if (err != SOL_OK && tracked) {
+            pthread_mutex_lock(&repair->pending_lock);
+            if (tracked->active && tracked->nonce == primary_snap.nonce) {
+                pending_deactivate_locked(repair, tracked);
+            }
+            pthread_mutex_unlock(&repair->pending_lock);
+            return err;
+        }
+    }
+
+    for (size_t i = 0; i < hedge_len; i++) {
+        (void)send_repair_request_unlocked_pending(repair, &hedges[i]);
+    }
+
+    return SOL_OK;
 }
 
 sol_err_t
 sol_repair_request_highest(sol_repair_t* repair, sol_slot_t slot, uint64_t shred_index) {
     if (!repair) return SOL_ERR_INVAL;
 
+    sol_repair_pending_t snap;
+    sol_repair_pending_t* tracked = NULL;
+
     pthread_mutex_lock(&repair->pending_lock);
 
-    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
-        sol_repair_pending_t* p = &repair->pending[i];
-        if (p->active && p->type == SOL_REPAIR_HIGHEST_SHRED && p->slot == slot) {
-            pthread_mutex_unlock(&repair->pending_lock);
-            return SOL_OK;
-        }
+    if (find_pending_slot_only(repair, SOL_REPAIR_HIGHEST_SHRED, slot)) {
+        pthread_mutex_unlock(&repair->pending_lock);
+        return SOL_OK;
     }
 
     sol_repair_pending_t* pending = find_pending_slot(repair, SOL_REPAIR_HIGHEST_SHRED);
@@ -1521,7 +2582,7 @@ sol_repair_request_highest(sol_repair_t* repair, sol_slot_t slot, uint64_t shred
         return SOL_ERR_FULL;
     }
 
-    if (!select_repair_peer(repair, &pending->peer, &pending->peer_pubkey)) {
+    if (!select_repair_peer(repair, slot, NULL, &pending->peer, &pending->peer_pubkey)) {
         pthread_mutex_unlock(&repair->pending_lock);
         return SOL_ERR_PEER_UNAVAILABLE;
     }
@@ -1532,16 +2593,25 @@ sol_repair_request_highest(sol_repair_t* repair, sol_slot_t slot, uint64_t shred
     pending->nonce = 0;
     pending->sent_time = sol_gossip_now_ms();
     pending->retries = 0;
+    pending->hedge_retry_mark = UINT32_MAX;
     pending->active = true;
     repair->pending_count++;
 
-    sol_err_t err = send_repair_request(repair, pending);
-    if (err != SOL_OK) {
-        pending->active = false;
-        repair->pending_count--;
-    }
+    (void)ensure_nonce_tracked_locked(repair, pending);
+    req_map_put_locked(repair, pending->type, pending->slot, pending->shred_index, (int32_t)(pending - repair->pending));
+    snap = *pending;
+    tracked = pending;
 
     pthread_mutex_unlock(&repair->pending_lock);
+
+    sol_err_t err = send_repair_request_unlocked_pending(repair, &snap);
+    if (err != SOL_OK && tracked) {
+        pthread_mutex_lock(&repair->pending_lock);
+        if (tracked->active && tracked->nonce == snap.nonce) {
+            pending_deactivate_locked(repair, tracked);
+        }
+        pthread_mutex_unlock(&repair->pending_lock);
+    }
 
     return err;
 }
@@ -1550,14 +2620,14 @@ sol_err_t
 sol_repair_request_orphan(sol_repair_t* repair, sol_slot_t slot) {
     if (!repair) return SOL_ERR_INVAL;
 
+    sol_repair_pending_t snap;
+    sol_repair_pending_t* tracked = NULL;
+
     pthread_mutex_lock(&repair->pending_lock);
 
-    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
-        sol_repair_pending_t* p = &repair->pending[i];
-        if (p->active && p->type == SOL_REPAIR_ORPHAN && p->slot == slot) {
-            pthread_mutex_unlock(&repair->pending_lock);
-            return SOL_OK;
-        }
+    if (find_pending_slot_only(repair, SOL_REPAIR_ORPHAN, slot)) {
+        pthread_mutex_unlock(&repair->pending_lock);
+        return SOL_OK;
     }
 
     sol_repair_pending_t* pending = find_pending_slot(repair, SOL_REPAIR_ORPHAN);
@@ -1566,7 +2636,7 @@ sol_repair_request_orphan(sol_repair_t* repair, sol_slot_t slot) {
         return SOL_ERR_FULL;
     }
 
-    if (!select_repair_peer(repair, &pending->peer, &pending->peer_pubkey)) {
+    if (!select_repair_peer(repair, slot, NULL, &pending->peer, &pending->peer_pubkey)) {
         pthread_mutex_unlock(&repair->pending_lock);
         return SOL_ERR_PEER_UNAVAILABLE;
     }
@@ -1577,16 +2647,25 @@ sol_repair_request_orphan(sol_repair_t* repair, sol_slot_t slot) {
     pending->nonce = 0;
     pending->sent_time = sol_gossip_now_ms();
     pending->retries = 0;
+    pending->hedge_retry_mark = UINT32_MAX;
     pending->active = true;
     repair->pending_count++;
 
-    sol_err_t err = send_repair_request(repair, pending);
-    if (err != SOL_OK) {
-        pending->active = false;
-        repair->pending_count--;
-    }
+    (void)ensure_nonce_tracked_locked(repair, pending);
+    req_map_put_locked(repair, pending->type, pending->slot, pending->shred_index, (int32_t)(pending - repair->pending));
+    snap = *pending;
+    tracked = pending;
 
     pthread_mutex_unlock(&repair->pending_lock);
+
+    sol_err_t err = send_repair_request_unlocked_pending(repair, &snap);
+    if (err != SOL_OK && tracked) {
+        pthread_mutex_lock(&repair->pending_lock);
+        if (tracked->active && tracked->nonce == snap.nonce) {
+            pending_deactivate_locked(repair, tracked);
+        }
+        pthread_mutex_unlock(&repair->pending_lock);
+    }
 
     return err;
 }
@@ -1603,7 +2682,18 @@ sol_repair_set_shred_callback(sol_repair_t* repair,
 void
 sol_repair_stats(const sol_repair_t* repair, sol_repair_stats_t* stats) {
     if (repair && stats) {
-        *stats = repair->stats;
+        stats->requests_sent =
+            __atomic_load_n(&repair->stats.requests_sent, __ATOMIC_RELAXED);
+        stats->responses_received =
+            __atomic_load_n(&repair->stats.responses_received, __ATOMIC_RELAXED);
+        stats->shreds_repaired =
+            __atomic_load_n(&repair->stats.shreds_repaired, __ATOMIC_RELAXED);
+        stats->timeouts =
+            __atomic_load_n(&repair->stats.timeouts, __ATOMIC_RELAXED);
+        stats->duplicates =
+            __atomic_load_n(&repair->stats.duplicates, __ATOMIC_RELAXED);
+        stats->invalid_responses =
+            __atomic_load_n(&repair->stats.invalid_responses, __ATOMIC_RELAXED);
     }
 }
 
@@ -1624,6 +2714,54 @@ sol_repair_pending_count(sol_repair_t* repair) {
     return count;
 }
 
+bool
+sol_repair_pending_slot_stats(sol_repair_t* repair,
+                              sol_slot_t slot,
+                              sol_repair_pending_slot_stats_t* out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!repair || slot == 0) return false;
+
+    bool have_any = false;
+    uint64_t oldest = 0;
+    uint64_t newest = 0;
+
+    pthread_mutex_lock(&repair->pending_lock);
+    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
+        const sol_repair_pending_t* p = &repair->pending[i];
+        if (!p->active) continue;
+        if (p->slot != slot) continue;
+
+        out->total++;
+        switch (p->type) {
+        case SOL_REPAIR_SHRED:           out->shreds++; break;
+        case SOL_REPAIR_HIGHEST_SHRED:   out->highest++; break;
+        case SOL_REPAIR_ORPHAN:          out->orphan++; break;
+        case SOL_REPAIR_ANCESTOR_HASHES: out->ancestor_hashes++; break;
+        }
+
+        if (p->retries > out->max_retries) {
+            out->max_retries = p->retries;
+        }
+
+        if (!have_any || p->sent_time < oldest) {
+            oldest = p->sent_time;
+        }
+        if (!have_any || p->sent_time > newest) {
+            newest = p->sent_time;
+        }
+        have_any = true;
+    }
+    pthread_mutex_unlock(&repair->pending_lock);
+
+    if (have_any) {
+        out->oldest_sent_ms = oldest;
+        out->newest_sent_ms = newest;
+    }
+
+    return true;
+}
+
 size_t
 sol_repair_max_pending(const sol_repair_t* repair) {
     if (!repair) return 0;
@@ -1637,19 +2775,32 @@ sol_repair_set_blockstore(sol_repair_t* repair, void* blockstore) {
     }
 }
 
+void
+sol_repair_set_leader_schedule(sol_repair_t* repair, struct sol_leader_schedule* schedule) {
+    (void)sol_repair_swap_leader_schedule(repair, schedule);
+}
+
+struct sol_leader_schedule*
+sol_repair_swap_leader_schedule(sol_repair_t* repair, struct sol_leader_schedule* schedule) {
+    if (!repair) return NULL;
+    sol_leader_schedule_t* old =
+        __atomic_exchange_n(&repair->leader_schedule, (sol_leader_schedule_t*)schedule, __ATOMIC_ACQ_REL);
+    return (struct sol_leader_schedule*)old;
+}
+
 sol_err_t
 sol_repair_request_ancestor_hashes(sol_repair_t* repair, sol_slot_t slot) {
     if (!repair) return SOL_ERR_INVAL;
 
+    sol_repair_pending_t snap;
+    sol_repair_pending_t* tracked = NULL;
+
     pthread_mutex_lock(&repair->pending_lock);
 
     /* Check if already pending */
-    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
-        sol_repair_pending_t* p = &repair->pending[i];
-        if (p->active && p->type == SOL_REPAIR_ANCESTOR_HASHES && p->slot == slot) {
-            pthread_mutex_unlock(&repair->pending_lock);
-            return SOL_OK;  /* Already requested */
-        }
+    if (find_pending_slot_only(repair, SOL_REPAIR_ANCESTOR_HASHES, slot)) {
+        pthread_mutex_unlock(&repair->pending_lock);
+        return SOL_OK;  /* Already requested */
     }
 
     /* Find free slot */
@@ -1660,7 +2811,7 @@ sol_repair_request_ancestor_hashes(sol_repair_t* repair, sol_slot_t slot) {
     }
 
     /* Select peer */
-    if (!select_repair_peer(repair, &pending->peer, &pending->peer_pubkey)) {
+    if (!select_repair_peer(repair, slot, NULL, &pending->peer, &pending->peer_pubkey)) {
         pthread_mutex_unlock(&repair->pending_lock);
         return SOL_ERR_PEER_UNAVAILABLE;
     }
@@ -1672,20 +2823,29 @@ sol_repair_request_ancestor_hashes(sol_repair_t* repair, sol_slot_t slot) {
     pending->nonce = 0;
     pending->sent_time = sol_gossip_now_ms();
     pending->retries = 0;
+    pending->hedge_retry_mark = UINT32_MAX;
     pending->active = true;
     repair->pending_count++;
+    (void)__atomic_fetch_add(&repair->ancestor_pending_count, 1u, __ATOMIC_RELAXED);
 
-    /* Send request */
-    sol_err_t err = send_repair_request(repair, pending);
-    if (err != SOL_OK) {
-        pending->active = false;
-        repair->pending_count--;
-    } else {
+    (void)ensure_nonce_tracked_locked(repair, pending);
+    req_map_put_locked(repair, pending->type, pending->slot, pending->shred_index, (int32_t)(pending - repair->pending));
+    snap = *pending;
+    tracked = pending;
+
+    pthread_mutex_unlock(&repair->pending_lock);
+
+    sol_err_t err = send_repair_request_unlocked_pending(repair, &snap);
+    if (err != SOL_OK && tracked) {
+        pthread_mutex_lock(&repair->pending_lock);
+        if (tracked->active && tracked->nonce == snap.nonce) {
+            pending_deactivate_locked(repair, tracked);
+        }
+        pthread_mutex_unlock(&repair->pending_lock);
+    } else if (err == SOL_OK) {
         sol_log_debug("Requested ancestor hashes for slot %llu",
                       (unsigned long long)slot);
     }
-
-    pthread_mutex_unlock(&repair->pending_lock);
 
     return err;
 }

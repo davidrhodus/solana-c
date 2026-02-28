@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h>
@@ -28,6 +29,81 @@ static sol_log_config_t g_config = SOL_LOG_CONFIG_DEFAULT;
 static FILE*            g_log_file = NULL;
 static pthread_mutex_t  g_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool             g_initialized = false;
+
+/*
+ * Flush policy
+ *
+ * The previous behavior flushed every log line, which is extremely expensive
+ * for disk-heavy workloads like validator replay (it defeats stdio buffering).
+ *
+ * Env:
+ *   SOL_LOG_FLUSH=0|none  -> never fflush() (except SOL_LOG_FATAL)
+ *   SOL_LOG_FLUSH=1|all   -> fflush() every log line (legacy behavior)
+ *
+ * Default:
+ *   - stderr: no explicit fflush() (stderr is typically unbuffered)
+ *   - file:   fflush() only for WARN+ (and always for FATAL)
+ */
+static int g_flush_mode = -1; /* -1 unknown, 0 default, 1 never, 2 always */
+static uint64_t g_last_file_flush_ns = 0;
+
+static int
+flush_mode_get(void) {
+    int v = __atomic_load_n(&g_flush_mode, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) {
+        return v;
+    }
+
+    int mode = 0;
+    const char* env = getenv("SOL_LOG_FLUSH");
+    if (env && env[0] != '\0') {
+        if (strcmp(env, "1") == 0 || strcasecmp(env, "all") == 0) {
+            mode = 2;
+        } else if (strcmp(env, "0") == 0 || strcasecmp(env, "none") == 0) {
+            mode = 1;
+        }
+    }
+
+    __atomic_store_n(&g_flush_mode, mode, __ATOMIC_RELEASE);
+    return mode;
+}
+
+static inline void
+maybe_flush(FILE* fp, sol_log_level_t level, bool is_file_backend, uint64_t ts_ns) {
+    if (!fp) return;
+
+    /* Ensure fatal logs are visible even when buffering is enabled. */
+    if (level >= SOL_LOG_FATAL) {
+        (void)fflush(fp);
+        return;
+    }
+
+    int mode = flush_mode_get();
+    if (mode == 2) { /* always */
+        (void)fflush(fp);
+        return;
+    }
+    if (mode == 1) { /* never */
+        return;
+    }
+
+    if (is_file_backend) {
+        /* Flush warnings/errors immediately, and flush info/debug periodically
+         * so log tails stay live without paying per-line flush overhead. */
+        if (level >= SOL_LOG_WARN) {
+            (void)fflush(fp);
+            __atomic_store_n(&g_last_file_flush_ns, ts_ns, __ATOMIC_RELEASE);
+            return;
+        }
+
+        uint64_t last = __atomic_load_n(&g_last_file_flush_ns, __ATOMIC_ACQUIRE);
+        if (ts_ns > last && (ts_ns - last) >= 1000000000ULL) {
+            /* At most one flush per second (best-effort). */
+            __atomic_store_n(&g_last_file_flush_ns, ts_ns, __ATOMIC_RELEASE);
+            (void)fflush(fp);
+        }
+    }
+}
 
 /*
  * ANSI color codes
@@ -142,7 +218,6 @@ write_json_log(FILE* out, sol_log_level_t level, uint64_t ts_ns,
             line,
             escaped_func,
             escaped_msg);
-    fflush(out);
 }
 
 /*
@@ -201,6 +276,9 @@ sol_log_init(const sol_log_config_t* config) {
         if (g_log_file == NULL) {
             fprintf(stderr, "WARNING: Failed to open log file: %s\n", g_config.log_file);
             g_config.backends &= ~SOL_LOG_BACKEND_FILE;
+        } else {
+            /* Large buffer for replay performance (avoid fflush() per line). */
+            (void)setvbuf(g_log_file, NULL, _IOFBF, 1 << 20);
         }
     }
 
@@ -333,8 +411,8 @@ sol_log_write(sol_log_level_t level,
             }
 
             fprintf(out, "\n");
-            fflush(out);
         }
+        maybe_flush(out, level, false, ts_ns);
     }
 
     /* Write to file */
@@ -357,8 +435,8 @@ sol_log_write(sol_log_level_t level,
             }
 
             fprintf(g_log_file, "%s\n", msg_buf);
-            fflush(g_log_file);
         }
+        maybe_flush(g_log_file, level, true, ts_ns);
     }
 
     /* Call custom handler */

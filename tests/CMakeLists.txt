@@ -9,6 +9,12 @@ sol_add_unit_test(util
     LIBS sol_util
 )
 
+# Config parser unit tests
+sol_add_unit_test(config
+    SOURCES unit/test_config.c
+    LIBS sol_util
+)
+
 # Crypto unit tests
 sol_add_unit_test(crypto
     SOURCES unit/test_crypto.c

@@ -51,4 +51,3 @@ void sol_account_lt_hash(const sol_pubkey_t* pubkey,
 #endif
 
 #endif /* SOL_LT_HASH_H */
-

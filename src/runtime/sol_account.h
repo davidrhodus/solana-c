@@ -37,6 +37,15 @@ extern const sol_pubkey_t SOL_BPF_LOADER_ID;
 void sol_account_init(sol_account_t* account);
 
 /*
+ * Allocate a zeroed account object.
+ *
+ * Hot path note: accounts are loaded/destroyed extremely frequently during
+ * replay. The implementation may use a thread-local slab allocator to avoid
+ * malloc/free overhead.
+ */
+sol_account_t* sol_account_alloc(void);
+
+/*
  * Create a new account with specified parameters
  */
 sol_account_t* sol_account_new(

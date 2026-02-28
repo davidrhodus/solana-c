@@ -65,6 +65,9 @@ typedef struct {
  */
 typedef struct sol_accounts_db sol_accounts_db_t;
 
+typedef struct sol_io_ctx sol_io_ctx_t;
+typedef struct sol_appendvec_index sol_appendvec_index_t;
+
 /*
  * Local entry kind (for overlay/fork views)
  *
@@ -88,6 +91,22 @@ sol_accounts_db_t* sol_accounts_db_new(const sol_accounts_db_config_t* config);
  * Destroy accounts database
  */
 void sol_accounts_db_destroy(sol_accounts_db_t* db);
+
+/* Optional: attach a shared IO context (used by AppendVec IO paths). */
+void sol_accounts_db_set_io_ctx(sol_accounts_db_t* db, sol_io_ctx_t* io_ctx);
+
+/* Adopt ownership of an in-memory AppendVec index (root AccountsDB only).
+ *
+ * Used during snapshot ingestion to retain the deferred AppendVec index for
+ * runtime reads, avoiding RocksDB lookups in the hot account-load path. */
+void sol_accounts_db_adopt_appendvec_index(sol_accounts_db_t* db, sol_appendvec_index_t* idx);
+
+/* Build an in-memory AppendVec index by iterating the persistent backend.
+ *
+ * This is intended for fast restarts where the node reuses an existing AppendVec
+ * + RocksDB index instead of re-extracting a snapshot. No-op if not applicable
+ * (non-AppendVec backend, overlays, or already built). */
+sol_err_t sol_accounts_db_maybe_build_appendvec_index(sol_accounts_db_t* db);
 
 /*
  * Configure backend durability options (RocksDB only)
@@ -121,6 +140,33 @@ sol_account_t* sol_accounts_db_load(
  * out_stored_slot may be NULL if not needed.
  */
 sol_account_t* sol_accounts_db_load_ex(
+    sol_accounts_db_t*      db,
+    const sol_pubkey_t*     pubkey,
+    sol_slot_t*             out_stored_slot
+);
+
+/*
+ * Load account by pubkey (read-only view when possible)
+ *
+ * In AppendVec mode, this may return an account whose `data` points into a
+ * memory-mapped AppendVec file (account->data_borrowed=true). The returned
+ * account must be treated as read-only (callers must not mutate account->data
+ * in-place).
+ *
+ * For non-AppendVec backends, this falls back to sol_accounts_db_load.
+ */
+sol_account_t* sol_accounts_db_load_view(
+    sol_accounts_db_t*      db,
+    const sol_pubkey_t*     pubkey
+);
+
+/*
+ * Load account by pubkey (read-only view when possible), optionally returning
+ * the stored slot.
+ *
+ * out_stored_slot may be NULL if not needed.
+ */
+sol_account_t* sol_accounts_db_load_view_ex(
     sol_accounts_db_t*      db,
     const sol_pubkey_t*     pubkey,
     sol_slot_t*             out_stored_slot
@@ -168,6 +214,29 @@ sol_err_t sol_accounts_db_store_versioned(
     const sol_account_t*    account,
     sol_slot_t              slot,
     uint64_t                write_version
+);
+
+/*
+ * Store account with a hint for the previously-visible parent meta.
+ *
+ * When storing into an overlay/fork view, AccountsDB may consult the parent to
+ * adjust stats (lamports/data bytes) on the first write to a pubkey.  If the
+ * caller already loaded the prior version (common during transaction
+ * execution), it can provide the previous meta to avoid an extra parent lookup
+ * (RocksDB+AppendVec IO).
+ *
+ * For non-overlay databases, this behaves like sol_accounts_db_store_versioned
+ * (the hint is ignored).
+ */
+sol_err_t sol_accounts_db_store_versioned_with_prev_meta(
+    sol_accounts_db_t*      db,
+    const sol_pubkey_t*     pubkey,
+    const sol_account_t*    account,
+    sol_slot_t              slot,
+    uint64_t                write_version,
+    bool                    prev_exists,
+    uint64_t                prev_lamports,
+    uint64_t                prev_data_len
 );
 
 /*
@@ -434,6 +503,11 @@ void sol_accounts_db_iterate_pubkey_range(
     void*                   ctx
 );
 
+/* Returns true if the root storage backend supports efficient pubkey-range
+ * iteration (iterate_range). This is required for some parallel bootstrap
+ * computations (e.g. full Accounts LtHash recompute). */
+bool sol_accounts_db_iterate_pubkey_range_supported(const sol_accounts_db_t* db);
+
 /*
  * Iterate over the local layer of an overlay AccountsDB
  *
@@ -456,6 +530,54 @@ sol_err_t sol_accounts_db_iterate_local(
     sol_accounts_db_iter_local_cb callback,
     void*                         ctx
 );
+
+/* Snapshot the local layer of an overlay AccountsDB.
+ *
+ * Unlike sol_accounts_db_iterate_local(), this returns ownership of cloned
+ * account values to the caller. This is useful for parallel iteration in
+ * freeze-time paths where cloning under the AccountsDB lock must be decoupled
+ * from heavy compute (hashing, parent lookups, etc).
+ *
+ * The snapshot is valid even if the underlying overlay continues to mutate,
+ * because all returned accounts are clones. */
+typedef struct {
+    sol_pubkey_t   pubkey;
+    sol_account_t* account; /* NULL for tombstone */
+} sol_accounts_db_local_entry_t;
+
+typedef struct {
+    sol_accounts_db_t*             parent;
+    sol_accounts_db_local_entry_t* entries;
+    size_t                         len;
+} sol_accounts_db_local_snapshot_t;
+
+sol_err_t
+sol_accounts_db_snapshot_local(sol_accounts_db_t* db,
+                               sol_accounts_db_local_snapshot_t* out);
+
+void
+sol_accounts_db_local_snapshot_free(sol_accounts_db_local_snapshot_t* snap);
+
+/* Snapshot the local layer of an overlay AccountsDB without cloning account
+ * values.
+ *
+ * Returned `entries[i].account` pointers are BORROWED from the overlay and
+ * remain valid only as long as the overlay does not mutate. This is intended
+ * for freeze-time read-only paths (e.g. bank hashing) where the overlay is
+ * immutable. Unlike sol_accounts_db_snapshot_local(), this avoids copying
+ * account data and drastically reduces per-slot overhead. */
+typedef struct {
+    sol_accounts_db_t*             parent;
+    sol_accounts_db_local_entry_t* entries; /* borrowed account pointers */
+    size_t                         len;
+} sol_accounts_db_local_snapshot_view_t;
+
+sol_err_t
+sol_accounts_db_snapshot_local_view(sol_accounts_db_t* db,
+                                    sol_accounts_db_local_snapshot_view_t* out);
+
+void
+sol_accounts_db_local_snapshot_view_free(sol_accounts_db_local_snapshot_view_t* snap);
 
 /*
  * Ensure the owner index is populated (RocksDB only)
@@ -607,6 +729,32 @@ sol_accounts_db_t* sol_accounts_db_fork(sol_accounts_db_t* parent);
  * not iterated. This is used when advancing root (committing a bank's state).
  */
 sol_err_t sol_accounts_db_apply_delta(sol_accounts_db_t* dst, sol_accounts_db_t* src);
+
+/*
+ * Apply the local delta from src into dst, substituting `default_slot` for any
+ * overlay entries with slot==0.
+ *
+ * Overlay entries should always carry the bank slot they were written in. If
+ * some legacy path stores into an overlay with slot==0, root advancement would
+ * attempt to write into slot 0's (typically sealed) AppendVec and fail with
+ * SOL_ERR_UNSUPPORTED. Bank forks know the bank slot being committed, so they
+ * can use this helper to keep root advancement progressing.
+ */
+sol_err_t sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
+                                                  sol_accounts_db_t* src,
+                                                  sol_slot_t default_slot);
+
+/*
+ * Seal an AppendVec slot file after rooting.
+ *
+ * In AppendVec mode, rooted deltas are materialized into per-slot AppendVec
+ * files keyed by (slot<<32)|file_id. Once a slot is rooted and its delta has
+ * been fully applied, the corresponding AppendVec becomes immutable and safe
+ * to memory-map for fast account loads.
+ *
+ * No-op for non-AppendVec backends.
+ */
+sol_err_t sol_accounts_db_appendvec_seal_slot(sol_accounts_db_t* db, sol_slot_t slot);
 
 /*
  * Clear the local delta in an overlay database

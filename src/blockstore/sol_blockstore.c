@@ -17,6 +17,12 @@
 
 #define SOL_BLOCKSTORE_MAX_SLOT_VARIANTS 4u
 
+/* Blockstore stats are updated from multiple threads (TVU shred verify,
+ * replay, RPC). Use relaxed atomics to avoid a global hot lock. */
+#define BS_STAT_ADD(bs, field, val) \
+    (__atomic_fetch_add(&(bs)->stats.field, (uint64_t)(val), __ATOMIC_RELAXED))
+#define BS_STAT_INC(bs, field) BS_STAT_ADD((bs), field, 1u)
+
 /*
  * Slot storage hash table entry
  */
@@ -52,6 +58,27 @@ typedef struct sol_fec_set_entry {
     struct sol_fec_set_entry*   next;
 } sol_fec_set_entry_t;
 
+/* Defer RocksDB writes until after we release the global blockstore lock.
+ *
+ * The RocksDB C API calls can be relatively expensive; performing them while
+ * holding the blockstore write lock serializes shred ingest and can starve TVU
+ * catchup/replay. These requests are used as a tiny on-stack "post-unlock"
+ * worklist. */
+typedef struct {
+    sol_slot_t       slot;
+    uint32_t         variant_id;
+    bool             is_data;
+    uint32_t         index;
+    const uint8_t*   data;
+    size_t           data_len;
+} sol_blockstore_persist_shred_req_t;
+
+typedef struct {
+    sol_slot_t       slot;
+    uint32_t         variant_id;
+    sol_slot_meta_t  meta;
+} sol_blockstore_persist_meta_req_t;
+
 /*
  * Blockstore structure
  */
@@ -84,7 +111,7 @@ struct sol_blockstore {
     sol_blockstore_stats_t  stats;
 
     /* Thread safety */
-    pthread_rwlock_t        lock;
+    pthread_mutex_t*        bucket_locks; /* One lock per slot-table bucket */
 };
 
 /*
@@ -98,6 +125,34 @@ extern uint64_t sol_gossip_now_ms(void);
 static inline size_t
 slot_hash(sol_slot_t slot, size_t table_size) {
     return (size_t)(slot % table_size);
+}
+
+static inline pthread_mutex_t*
+slot_bucket_lock(sol_blockstore_t* bs, sol_slot_t slot) {
+    if (!bs || !bs->bucket_locks || bs->slot_table_size == 0) {
+        return NULL;
+    }
+    return &bs->bucket_locks[slot_hash(slot, bs->slot_table_size)];
+}
+
+static inline void
+slot_atomic_max(sol_slot_t* dst, sol_slot_t v) {
+    sol_slot_t cur = __atomic_load_n(dst, __ATOMIC_RELAXED);
+    while (v > cur) {
+        if (__atomic_compare_exchange_n(dst, &cur, v, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
+}
+
+static inline void
+slot_atomic_min(sol_slot_t* dst, sol_slot_t v) {
+    sol_slot_t cur = __atomic_load_n(dst, __ATOMIC_RELAXED);
+    while (v < cur) {
+        if (__atomic_compare_exchange_n(dst, &cur, v, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            break;
+        }
+    }
 }
 
 /*
@@ -117,6 +172,12 @@ find_slot_entry(sol_blockstore_t* bs, sol_slot_t slot) {
 
     return NULL;
 }
+
+#ifdef SOL_HAS_ROCKSDB
+/* Forward declare so create_slot_entry() can hydrate from persistent storage. */
+static sol_err_t
+load_slot_meta(sol_blockstore_t* bs, sol_slot_t slot, sol_slot_meta_t* meta);
+#endif
 
 /*
  * Create slot entry
@@ -160,22 +221,67 @@ create_slot_entry(sol_blockstore_t* bs, sol_slot_t slot) {
         return NULL;
     }
 
+    /* If this slot already exists in persistent storage, hydrate metadata and
+     * the received bitmap. This keeps catchup/repair from starting over after a
+     * restart/purge. */
+#ifdef SOL_HAS_ROCKSDB
+    if (bs->slot_meta_backend && bs->shred_backend) {
+        sol_slot_meta_t meta;
+        if (load_slot_meta(bs, slot, &meta) == SOL_OK) {
+            entry->store.meta = meta;
+            entry->any_complete = meta.is_complete;
+
+            /* Rebuild received bitmap for data shreds from RocksDB. */
+            entry->store.meta.received_data = 0;
+            entry->store.meta.first_shred_index = UINT32_MAX;
+
+            uint32_t last = meta.last_shred_index;
+            if (!meta.is_full && last == 0 && meta.received_data > 0) {
+                last = meta.received_data;
+            }
+            if (bs->config.max_shreds_per_slot > 0 &&
+                last >= bs->config.max_shreds_per_slot) {
+                last = (uint32_t)bs->config.max_shreds_per_slot - 1;
+            }
+            if (meta.is_full && meta.num_data_shreds > 0 && last >= meta.num_data_shreds) {
+                last = meta.num_data_shreds - 1;
+            }
+
+            for (uint32_t i = 0; i <= last && i < max_shreds; i++) {
+                uint8_t key[13];
+                size_t key_len = 13;
+                memcpy(key, &slot, 8);
+                key[8] = 1; /* data */
+                memcpy(key + 9, &i, 4);
+
+                if (bs->shred_backend->exists(bs->shred_backend->ctx, key, key_len)) {
+                    entry->store.received_bitmap[i / 8] |= (uint8_t)(1u << (i % 8));
+                    entry->store.meta.received_data++;
+                    if (i < entry->store.meta.first_shred_index) {
+                        entry->store.meta.first_shred_index = i;
+                    }
+                }
+            }
+
+            if (entry->store.meta.received_data == 0) {
+                entry->store.meta.first_shred_index = 0;
+            }
+        }
+    }
+#endif
+
     /* Insert into hash table */
     size_t idx = slot_hash(slot, bs->slot_table_size);
     entry->next = bs->slots[idx];
     bs->slots[idx] = entry;
-    bs->slot_count++;
-    bs->stats.slots_created++;
+    __atomic_fetch_add(&bs->slot_count, 1u, __ATOMIC_RELAXED);
+    BS_STAT_INC(bs, slots_created);
 
     /* Update highest slot */
-    if (slot > bs->highest_slot) {
-        bs->highest_slot = slot;
-    }
+    slot_atomic_max(&bs->highest_slot, slot);
 
     /* Update lowest slot */
-    if (slot < bs->lowest_slot) {
-        bs->lowest_slot = slot;
-    }
+    slot_atomic_min(&bs->lowest_slot, slot);
 
     return entry;
 }
@@ -249,8 +355,47 @@ shred_bytes_equal(const sol_blockstore_shred_t* stored,
                   const uint8_t* raw,
                   size_t raw_len) {
     if (!stored || !stored->data || !raw) return false;
-    if (stored->data_len != raw_len) return false;
-    return memcmp(stored->data, raw, raw_len) == 0;
+
+    /* Treat re-signed shreds as duplicates by comparing only the "content"
+     * portion (excluding signature fields that may legitimately differ across
+     * retransmitters). This avoids unnecessary slot variants on mainnet where
+     * resigned Merkle shreds are common. */
+    if (stored->data_len < SOL_SIGNATURE_SIZE || raw_len < SOL_SIGNATURE_SIZE) {
+        if (stored->data_len != raw_len) return false;
+        return memcmp(stored->data, raw, raw_len) == 0;
+    }
+
+    /* Variant byte sits immediately after the signature. If variants differ,
+     * treat as conflicting content. */
+    uint8_t stored_variant = stored->data[SOL_SIGNATURE_SIZE];
+    uint8_t raw_variant = raw[SOL_SIGNATURE_SIZE];
+    if (stored_variant != raw_variant) {
+        return false;
+    }
+
+    size_t stored_end = stored->data_len;
+    size_t raw_end = raw_len;
+
+    if (sol_shred_variant_is_merkle(raw_variant)) {
+        uint8_t prefix = raw_variant & 0xF0;
+        bool resigned =
+            prefix == SOL_SHRED_VARIANT_MERKLE_CODE_RESIGNED ||
+            prefix == SOL_SHRED_VARIANT_MERKLE_DATA_RESIGNED;
+        if (resigned) {
+            if (stored_end < SOL_SIGNATURE_SIZE || raw_end < SOL_SIGNATURE_SIZE) return false;
+            stored_end -= SOL_SIGNATURE_SIZE;
+            raw_end -= SOL_SIGNATURE_SIZE;
+        }
+    }
+
+    if (stored_end < SOL_SIGNATURE_SIZE || raw_end < SOL_SIGNATURE_SIZE) return false;
+    size_t stored_msg_len = stored_end - SOL_SIGNATURE_SIZE;
+    size_t raw_msg_len = raw_end - SOL_SIGNATURE_SIZE;
+    if (stored_msg_len != raw_msg_len) return false;
+
+    return memcmp(stored->data + SOL_SIGNATURE_SIZE,
+                  raw + SOL_SIGNATURE_SIZE,
+                  raw_msg_len) == 0;
 }
 
 static sol_slot_variant_entry_t*
@@ -431,11 +576,8 @@ maybe_mark_slot_complete_locked(sol_blockstore_t* bs,
     store->meta.completed_time = sol_gossip_now_ms();
     if (first_complete) {
         entry->any_complete = true;
-        bs->stats.slots_completed++;
-
-        if (slot > bs->highest_complete) {
-            bs->highest_complete = slot;
-        }
+        BS_STAT_INC(bs, slots_completed);
+        slot_atomic_max(&bs->highest_complete, slot);
     }
 
     sol_log_debug("Slot %llu complete with %u data shreds",
@@ -461,8 +603,10 @@ maybe_mark_slot_complete_locked(sol_blockstore_t* bs,
 #endif
 
     /* Notify callback only once per slot (first complete variant). */
-    if (first_complete && bs->slot_callback) {
-        bs->slot_callback(slot, bs->slot_callback_ctx);
+    sol_blockstore_slot_cb cb = __atomic_load_n(&bs->slot_callback, __ATOMIC_RELAXED);
+    void* cb_ctx = __atomic_load_n(&bs->slot_callback_ctx, __ATOMIC_RELAXED);
+    if (first_complete && cb) {
+        cb(slot, cb_ctx);
     }
 }
 
@@ -531,7 +675,13 @@ static sol_err_t
 store_recovered_data_shred_locked(sol_blockstore_t* bs, sol_slot_store_t* store,
                                   sol_slot_t slot, uint32_t index,
                                   uint8_t* raw_owned, size_t raw_len,
-                                  const sol_shred_t* parsed) {
+                                  const sol_shred_t* parsed,
+                                  sol_blockstore_persist_shred_req_t* persist_shreds,
+                                  size_t persist_shreds_cap,
+                                  size_t* persist_shreds_len,
+                                  sol_blockstore_persist_meta_req_t* persist_metas,
+                                  size_t persist_metas_cap,
+                                  size_t* persist_metas_len) {
     if (!bs || !store || !raw_owned || raw_len == 0 || !parsed) return SOL_ERR_INVAL;
     if (index >= bs->config.max_shreds_per_slot) return SOL_ERR_INVAL;
 
@@ -547,17 +697,7 @@ store_recovered_data_shred_locked(sol_blockstore_t* bs, sol_slot_store_t* store,
 
     store->meta.received_data++;
     bitmap_set(store->received_bitmap, index);
-    bs->stats.shreds_inserted++;
-
-#ifdef SOL_HAS_ROCKSDB
-    if (bs->shred_backend) {
-        sol_err_t persist_err = persist_shred(bs, slot, 0, true, index, raw_owned, raw_len);
-        if (persist_err != SOL_OK) {
-            sol_log_warn("Failed to persist recovered shred slot=%llu index=%u: %d",
-                         (unsigned long long)slot, index, persist_err);
-        }
-    }
-#endif
+    BS_STAT_INC(bs, shreds_inserted);
 
     /* Update metadata (best-effort) */
     if (store->meta.received_data == 1) {
@@ -566,6 +706,31 @@ store_recovered_data_shred_locked(sol_blockstore_t* bs, sol_slot_store_t* store,
     if (index < store->meta.first_shred_index || store->meta.received_data == 1) {
         store->meta.first_shred_index = index;
     }
+
+#ifdef SOL_HAS_ROCKSDB
+    if (bs->shred_backend && persist_shreds && persist_shreds_len &&
+        *persist_shreds_len < persist_shreds_cap) {
+        persist_shreds[(*persist_shreds_len)++] = (sol_blockstore_persist_shred_req_t){
+            .slot = slot,
+            .variant_id = 0,
+            .is_data = true,
+            .index = index,
+            .data = raw_owned,
+            .data_len = raw_len,
+        };
+    }
+
+    if (bs->slot_meta_backend &&
+        store->meta.received_data == 1 &&
+        persist_metas && persist_metas_len &&
+        *persist_metas_len < persist_metas_cap) {
+        persist_metas[(*persist_metas_len)++] = (sol_blockstore_persist_meta_req_t){
+            .slot = slot,
+            .variant_id = 0,
+            .meta = store->meta,
+        };
+    }
+#endif
 
     return SOL_OK;
 }
@@ -839,11 +1004,6 @@ sol_blockstore_new(const sol_blockstore_config_t* config) {
         bs->config = (sol_blockstore_config_t)SOL_BLOCKSTORE_CONFIG_DEFAULT;
     }
 
-    if (pthread_rwlock_init(&bs->lock, NULL) != 0) {
-        sol_free(bs);
-        return NULL;
-    }
-
     /* Initialize RocksDB storage if configured */
     if (bs->config.storage_type == SOL_BLOCKSTORE_STORAGE_ROCKSDB) {
 #ifdef SOL_HAS_ROCKSDB
@@ -860,7 +1020,6 @@ sol_blockstore_new(const sol_blockstore_config_t* config) {
         bs->rocksdb = sol_rocksdb_new(&rocksdb_config);
         if (!bs->rocksdb) {
             sol_log_error("Failed to create blockstore RocksDB instance");
-            pthread_rwlock_destroy(&bs->lock);
             sol_free(bs);
             return NULL;
         }
@@ -870,7 +1029,6 @@ sol_blockstore_new(const sol_blockstore_config_t* config) {
         if (err != SOL_OK) {
             sol_log_error("Failed to open blockstore column family");
             sol_rocksdb_destroy(bs->rocksdb);
-            pthread_rwlock_destroy(&bs->lock);
             sol_free(bs);
             return NULL;
         }
@@ -879,7 +1037,6 @@ sol_blockstore_new(const sol_blockstore_config_t* config) {
         if (err != SOL_OK) {
             sol_log_error("Failed to open slot_meta column family");
             sol_rocksdb_destroy(bs->rocksdb);
-            pthread_rwlock_destroy(&bs->lock);
             sol_free(bs);
             return NULL;
         }
@@ -888,7 +1045,6 @@ sol_blockstore_new(const sol_blockstore_config_t* config) {
         if (err != SOL_OK) {
             sol_log_error("Failed to open address_signatures column family");
             sol_rocksdb_destroy(bs->rocksdb);
-            pthread_rwlock_destroy(&bs->lock);
             sol_free(bs);
             return NULL;
         }
@@ -901,7 +1057,6 @@ sol_blockstore_new(const sol_blockstore_config_t* config) {
         if (!bs->shred_backend || !bs->slot_meta_backend || !bs->address_sig_backend) {
             sol_log_error("Failed to get blockstore storage backends");
             sol_rocksdb_destroy(bs->rocksdb);
-            pthread_rwlock_destroy(&bs->lock);
             sol_free(bs);
             return NULL;
         }
@@ -923,9 +1078,37 @@ sol_blockstore_new(const sol_blockstore_config_t* config) {
             sol_rocksdb_destroy(bs->rocksdb);
 #endif
         }
-        pthread_rwlock_destroy(&bs->lock);
         sol_free(bs);
         return NULL;
+    }
+
+    bs->bucket_locks = sol_calloc(bs->slot_table_size, sizeof(pthread_mutex_t));
+    if (!bs->bucket_locks) {
+        if (bs->rocksdb) {
+#ifdef SOL_HAS_ROCKSDB
+            sol_rocksdb_destroy(bs->rocksdb);
+#endif
+        }
+        sol_free(bs->slots);
+        sol_free(bs);
+        return NULL;
+    }
+    for (size_t i = 0; i < bs->slot_table_size; i++) {
+        if (pthread_mutex_init(&bs->bucket_locks[i], NULL) != 0) {
+            for (size_t j = 0; j < i; j++) {
+                pthread_mutex_destroy(&bs->bucket_locks[j]);
+            }
+            sol_free(bs->bucket_locks);
+            bs->bucket_locks = NULL;
+            if (bs->rocksdb) {
+#ifdef SOL_HAS_ROCKSDB
+                sol_rocksdb_destroy(bs->rocksdb);
+#endif
+            }
+            sol_free(bs->slots);
+            sol_free(bs);
+            return NULL;
+        }
     }
 
     /* Initialize lowest_slot to max (unset) */
@@ -948,6 +1131,14 @@ sol_blockstore_new(const sol_blockstore_config_t* config) {
 void
 sol_blockstore_destroy(sol_blockstore_t* bs) {
     if (!bs) return;
+
+    if (bs->bucket_locks) {
+        for (size_t i = 0; i < bs->slot_table_size; i++) {
+            pthread_mutex_destroy(&bs->bucket_locks[i]);
+        }
+        sol_free(bs->bucket_locks);
+        bs->bucket_locks = NULL;
+    }
 
     if (bs->address_sig_backend_owned && bs->address_sig_backend) {
         bs->address_sig_backend->destroy(bs->address_sig_backend->ctx);
@@ -980,7 +1171,6 @@ sol_blockstore_destroy(sol_blockstore_t* bs) {
         sol_free(bs->slots);
     }
 
-    pthread_rwlock_destroy(&bs->lock);
     sol_free(bs);
 }
 
@@ -1008,32 +1198,39 @@ update_slot_meta_from_data_shred_locked(sol_slot_store_t* store,
         store->meta.first_shred_index = index;
     }
 
+    /* DATA_COMPLETE indicates end-of-FEC-set, not end-of-slot. The slot is only
+     * "full" once we observe LAST_IN_SLOT. */
+    const bool terminal = last_in_slot;
+
     if (index > store->meta.last_shred_index) {
-        if (store->meta.is_full && !last_in_slot) {
-            /* Higher index arrived after a previous LAST_IN_SLOT; treat as incomplete. */
+        if (store->meta.is_full && !terminal) {
+            /* Higher index arrived after a previous terminal marker; treat as incomplete. */
             store->meta.is_full = false;
         }
         store->meta.last_shred_index = index;
     }
 
     /* Track DATA_COMPLETE for debugging/metrics, but only treat LAST_IN_SLOT as
-     * the definitive "slot is full" marker (required for tick verification). */
+     * the definitive "slot is full" marker (required for tick verification).
+     *
+     * NOTE: This fires at very high frequency on mainnet and must remain
+     * debug-level to avoid throttling shred ingest/replay. */
     if (data_complete && !store->meta.is_full) {
         if (variant_id == 0) {
-            sol_log_info("Slot %llu observed DATA_COMPLETE shred index=%u (flags=0x%02X)",
-                         (unsigned long long)shred->slot,
-                         (unsigned)index,
-                         (unsigned)shred->header.data.flags);
+            sol_log_debug("Slot %llu observed DATA_COMPLETE shred index=%u (flags=0x%02X)",
+                          (unsigned long long)shred->slot,
+                          (unsigned)index,
+                          (unsigned)shred->header.data.flags);
         } else {
-            sol_log_info("Slot %llu variant %u observed DATA_COMPLETE shred index=%u (flags=0x%02X)",
-                         (unsigned long long)shred->slot,
-                         (unsigned)variant_id,
-                         (unsigned)index,
-                         (unsigned)shred->header.data.flags);
+            sol_log_debug("Slot %llu variant %u observed DATA_COMPLETE shred index=%u (flags=0x%02X)",
+                          (unsigned long long)shred->slot,
+                          (unsigned)variant_id,
+                          (unsigned)index,
+                          (unsigned)shred->header.data.flags);
         }
     }
 
-    if (last_in_slot) {
+    if (terminal) {
         store->meta.is_full = true;
         store->meta.last_shred_index = index;
         store->meta.num_data_shreds = index + 1;
@@ -1057,7 +1254,13 @@ insert_data_shred_multi_locked(sol_blockstore_t* bs,
                                uint32_t index,
                                const uint8_t* raw_data,
                                size_t raw_len,
-                               bool* out_stored_in_primary) {
+                               bool* out_stored_in_primary,
+                               sol_blockstore_persist_shred_req_t* persist_shreds,
+                               size_t persist_shreds_cap,
+                               size_t* persist_shreds_len,
+                               sol_blockstore_persist_meta_req_t* persist_metas,
+                               size_t persist_metas_cap,
+                               size_t* persist_metas_len) {
     if (out_stored_in_primary) *out_stored_in_primary = false;
     if (!bs || !entry || !shred || !raw_data || raw_len == 0) return SOL_ERR_INVAL;
 
@@ -1115,24 +1318,11 @@ insert_data_shred_multi_locked(sol_blockstore_t* bs,
         shred_store->is_data = true;
 
         bool was_complete = store->meta.is_complete;
+        bool was_full = store->meta.is_full;
         uint32_t old_last = store->meta.last_shred_index;
 
         store->meta.received_data++;
         bitmap_set(store->received_bitmap, index);
-
-#ifdef SOL_HAS_ROCKSDB
-        if (bs->shred_backend) {
-            sol_err_t persist_err = persist_shred(bs, shred->slot, ref.variant_id, true,
-                                                 index, shred_store->data, raw_len);
-            if (persist_err != SOL_OK) {
-                sol_log_warn("Failed to persist shred slot=%llu variant=%u index=%u: %d",
-                             (unsigned long long)shred->slot,
-                             (unsigned)ref.variant_id,
-                             (unsigned)index,
-                             persist_err);
-            }
-        }
-#endif
 
         update_slot_meta_from_data_shred_locked(store, shred, index, data_complete, last_in_slot, ref.variant_id);
         if (was_complete && index > old_last) {
@@ -1142,16 +1332,27 @@ insert_data_shred_multi_locked(sol_blockstore_t* bs,
         maybe_mark_slot_complete_locked(bs, entry, store, ref.variant_id);
 
 #ifdef SOL_HAS_ROCKSDB
-        /* Persist slot metadata incrementally so catchup/repair can reason about
-         * partially-received slots after restarts or cache eviction. */
-        if (bs->slot_meta_backend) {
-            sol_err_t persist_err = persist_slot_meta_variant(bs, shred->slot, ref.variant_id, &store->meta);
-            if (persist_err != SOL_OK) {
-                sol_log_warn("Failed to persist slot meta for slot %llu (variant %u): %d",
-                             (unsigned long long)shred->slot,
-                             (unsigned)ref.variant_id,
-                             persist_err);
-            }
+        if (bs->shred_backend && persist_shreds && persist_shreds_len &&
+            *persist_shreds_len < persist_shreds_cap) {
+            persist_shreds[(*persist_shreds_len)++] = (sol_blockstore_persist_shred_req_t){
+                .slot = shred->slot,
+                .variant_id = ref.variant_id,
+                .is_data = true,
+                .index = index,
+                .data = shred_store->data,
+                .data_len = raw_len,
+            };
+        }
+
+        if (bs->slot_meta_backend &&
+            (store->meta.received_data == 1 || (!was_full && store->meta.is_full) || (was_complete && index > old_last)) &&
+            persist_metas && persist_metas_len &&
+            *persist_metas_len < persist_metas_cap) {
+            persist_metas[(*persist_metas_len)++] = (sol_blockstore_persist_meta_req_t){
+                .slot = shred->slot,
+                .variant_id = ref.variant_id,
+                .meta = store->meta,
+            };
         }
 #endif
 
@@ -1163,12 +1364,12 @@ insert_data_shred_multi_locked(sol_blockstore_t* bs,
     }
 
     if (any_stored) {
-        bs->stats.shreds_inserted++;
+        BS_STAT_INC(bs, shreds_inserted);
         return SOL_OK;
     }
 
     if (any_duplicate) {
-        bs->stats.shreds_duplicate++;
+        BS_STAT_INC(bs, shreds_duplicate);
         return SOL_ERR_EXISTS;
     }
 
@@ -1250,16 +1451,16 @@ insert_data_shred_multi_locked(sol_blockstore_t* bs,
         created++;
 
 #ifdef SOL_HAS_ROCKSDB
-        if (bs->shred_backend) {
-            sol_err_t persist_err = persist_shred(bs, shred->slot, variant->variant_id, true,
-                                                 index, v_shred->data, raw_len);
-            if (persist_err != SOL_OK) {
-                sol_log_warn("Failed to persist variant shred slot=%llu variant=%u index=%u: %d",
-                             (unsigned long long)shred->slot,
-                             (unsigned)variant->variant_id,
-                             (unsigned)index,
-                             persist_err);
-            }
+        if (bs->shred_backend && persist_shreds && persist_shreds_len &&
+            *persist_shreds_len < persist_shreds_cap) {
+            persist_shreds[(*persist_shreds_len)++] = (sol_blockstore_persist_shred_req_t){
+                .slot = shred->slot,
+                .variant_id = variant->variant_id,
+                .is_data = true,
+                .index = index,
+                .data = v_shred->data,
+                .data_len = raw_len,
+            };
         }
 
         if (bs->slot_meta_backend) {
@@ -1274,10 +1475,25 @@ insert_data_shred_multi_locked(sol_blockstore_t* bs,
 #endif
 
         maybe_mark_slot_complete_locked(bs, entry, &variant->store, variant->variant_id);
+
+#ifdef SOL_HAS_ROCKSDB
+        /* Persist meta *after* completion is computed so we don't overwrite a
+         * freshly completed meta with an earlier stale copy during the flush
+         * after unlocking. */
+        if (bs->slot_meta_backend &&
+            persist_metas && persist_metas_len &&
+            *persist_metas_len < persist_metas_cap) {
+            persist_metas[(*persist_metas_len)++] = (sol_blockstore_persist_meta_req_t){
+                .slot = shred->slot,
+                .variant_id = variant->variant_id,
+                .meta = variant->store.meta,
+            };
+        }
+#endif
     }
 
     if (created > 0) {
-        bs->stats.shreds_inserted++;
+        BS_STAT_INC(bs, shreds_inserted);
         return SOL_OK;
     }
 
@@ -1295,16 +1511,29 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
         return SOL_ERR_INVAL;
     }
 
-    pthread_rwlock_wrlock(&bs->lock);
+    sol_err_t ret = SOL_OK;
 
-    bs->stats.shreds_received++;
+#ifdef SOL_HAS_ROCKSDB
+    sol_blockstore_persist_shred_req_t persist_shreds[256];
+    size_t persist_shreds_len = 0;
+    sol_blockstore_persist_meta_req_t persist_metas[64];
+    size_t persist_metas_len = 0;
+#endif
+
+    pthread_mutex_t* mu = slot_bucket_lock(bs, shred->slot);
+    if (!mu) {
+        return SOL_ERR_UNINITIALIZED;
+    }
+    pthread_mutex_lock(mu);
+
+    BS_STAT_INC(bs, shreds_received);
 
     /* Find or create slot entry */
     sol_slot_entry_t* entry = find_slot_entry(bs, shred->slot);
     if (!entry) {
         entry = create_slot_entry(bs, shred->slot);
         if (!entry) {
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return SOL_ERR_NOMEM;
         }
     }
@@ -1315,7 +1544,7 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
 
     /* Check bounds */
     if (index >= bs->config.max_shreds_per_slot) {
-        pthread_rwlock_unlock(&bs->lock);
+        pthread_mutex_unlock(mu);
         return SOL_ERR_INVAL;
     }
 
@@ -1326,7 +1555,7 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
     } else {
         /* For code shreds, use a separate index space */
         if (index >= store->code_capacity) {
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return SOL_ERR_INVAL;
         }
         shred_store = &store->code_shreds[index];
@@ -1334,11 +1563,32 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
 
     if (is_data) {
         bool stored_in_primary = false;
-        sol_err_t derr = insert_data_shred_multi_locked(bs, entry, shred, index,
-                                                       raw_data, raw_len,
-                                                       &stored_in_primary);
+        sol_err_t derr = insert_data_shred_multi_locked(
+            bs,
+            entry,
+            shred,
+            index,
+            raw_data,
+            raw_len,
+            &stored_in_primary,
+#ifdef SOL_HAS_ROCKSDB
+            persist_shreds,
+            sizeof(persist_shreds) / sizeof(persist_shreds[0]),
+            &persist_shreds_len,
+            persist_metas,
+            sizeof(persist_metas) / sizeof(persist_metas[0]),
+            &persist_metas_len
+#else
+            NULL,
+            0,
+            NULL,
+            NULL,
+            0,
+            NULL
+#endif
+        );
         if (derr != SOL_OK) {
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return derr;
         }
 
@@ -1350,36 +1600,36 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
     if (shred_store->data) {
         if (shred_bytes_equal(shred_store, raw_data, raw_len)) {
             /* Already have this shred */
-            bs->stats.shreds_duplicate++;
-            pthread_rwlock_unlock(&bs->lock);
+            BS_STAT_INC(bs, shreds_duplicate);
+            pthread_mutex_unlock(mu);
             return SOL_ERR_EXISTS;
         }
 
         /* For now, only track duplicate variants for data shreds. */
         if (!is_data) {
-            bs->stats.shreds_duplicate++;
-            pthread_rwlock_unlock(&bs->lock);
+            BS_STAT_INC(bs, shreds_duplicate);
+            pthread_mutex_unlock(mu);
             return SOL_ERR_EXISTS;
         }
 
         /* If an existing variant already matches these bytes, treat as duplicate. */
         for (sol_slot_variant_entry_t* v = entry->variants; v; v = v->next) {
             if (variant_has_shred_bytes(&v->store, index, true, raw_data, raw_len)) {
-                bs->stats.shreds_duplicate++;
-                pthread_rwlock_unlock(&bs->lock);
+                BS_STAT_INC(bs, shreds_duplicate);
+                pthread_mutex_unlock(mu);
                 return SOL_ERR_EXISTS;
             }
         }
 
         /* Conflicting data shred -> create a new variant store (best-effort). */
         if (entry->variant_count >= SOL_BLOCKSTORE_MAX_SLOT_VARIANTS) {
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return SOL_ERR_FULL;
         }
 
         sol_slot_variant_entry_t* variant = sol_calloc(1, sizeof(*variant));
         if (!variant) {
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return SOL_ERR_NOMEM;
         }
 
@@ -1388,14 +1638,14 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
         sol_err_t cerr = clone_slot_store(&entry->store, &variant->store);
         if (cerr != SOL_OK) {
             sol_free(variant);
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return cerr;
         }
 
         if (index >= variant->store.data_capacity) {
             free_slot_store_contents(&variant->store);
             sol_free(variant);
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return SOL_ERR_INVAL;
         }
 
@@ -1405,7 +1655,7 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
         if (!v_shred->data) {
             free_slot_store_contents(&variant->store);
             sol_free(variant);
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return SOL_ERR_NOMEM;
         }
         memcpy(v_shred->data, raw_data, raw_len);
@@ -1418,7 +1668,9 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
         if (index < variant->store.meta.first_shred_index) {
             variant->store.meta.first_shred_index = index;
         }
-        if (sol_shred_is_last_in_slot(shred)) {
+        const bool terminal = sol_shred_is_last_in_slot(shred) ||
+                              ((shred->header.data.flags & SOL_SHRED_FLAG_DATA_COMPLETE) != 0);
+        if (terminal) {
             variant->store.meta.is_full = true;
             variant->store.meta.last_shred_index = index;
             variant->store.meta.num_data_shreds = index + 1;
@@ -1432,19 +1684,19 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
         entry->variants = variant;
         entry->variant_count++;
 
-        bs->stats.shreds_inserted++;
+        BS_STAT_INC(bs, shreds_inserted);
 
 #ifdef SOL_HAS_ROCKSDB
-        if (bs->shred_backend) {
-            sol_err_t persist_err = persist_shred(bs, shred->slot, variant->variant_id, true,
-                                                  index, v_shred->data, raw_len);
-            if (persist_err != SOL_OK) {
-                sol_log_warn("Failed to persist variant shred slot=%llu variant=%u index=%u: %d",
-                             (unsigned long long)shred->slot,
-                             (unsigned)variant->variant_id,
-                             (unsigned)index,
-                             persist_err);
-            }
+        if (bs->shred_backend &&
+            persist_shreds_len < (sizeof(persist_shreds) / sizeof(persist_shreds[0]))) {
+            persist_shreds[persist_shreds_len++] = (sol_blockstore_persist_shred_req_t){
+                .slot = shred->slot,
+                .variant_id = variant->variant_id,
+                .is_data = true,
+                .index = index,
+                .data = v_shred->data,
+                .data_len = raw_len,
+            };
         }
 
         if (bs->slot_meta_backend) {
@@ -1460,14 +1712,25 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
 
         maybe_mark_slot_complete_locked(bs, entry, &variant->store, variant->variant_id);
 
-        pthread_rwlock_unlock(&bs->lock);
-        return SOL_OK;
+#ifdef SOL_HAS_ROCKSDB
+        if (bs->slot_meta_backend &&
+            persist_metas_len < (sizeof(persist_metas) / sizeof(persist_metas[0]))) {
+            persist_metas[persist_metas_len++] = (sol_blockstore_persist_meta_req_t){
+                .slot = shred->slot,
+                .variant_id = variant->variant_id,
+                .meta = variant->store.meta,
+            };
+        }
+#endif
+
+        ret = SOL_OK;
+        goto out_unlock;
     }
 
     /* Allocate and copy shred data */
     shred_store->data = sol_alloc(raw_len);
     if (!shred_store->data) {
-        pthread_rwlock_unlock(&bs->lock);
+        pthread_mutex_unlock(mu);
         return SOL_ERR_NOMEM;
     }
 
@@ -1476,7 +1739,7 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
     shred_store->index = index;
     shred_store->is_data = is_data;
 
-    bs->stats.shreds_inserted++;
+    BS_STAT_INC(bs, shreds_inserted);
 
     if (is_data) {
         store->meta.received_data++;
@@ -1487,13 +1750,16 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
 
     /* Persist to RocksDB if configured */
 #ifdef SOL_HAS_ROCKSDB
-    if (bs->shred_backend) {
-        sol_err_t persist_err = persist_shred(bs, shred->slot, 0, is_data,
-                                               index, shred_store->data, raw_len);
-        if (persist_err != SOL_OK) {
-            sol_log_warn("Failed to persist shred slot=%llu index=%u: %d",
-                        (unsigned long long)shred->slot, index, persist_err);
-        }
+    if (bs->shred_backend &&
+        persist_shreds_len < (sizeof(persist_shreds) / sizeof(persist_shreds[0]))) {
+        persist_shreds[persist_shreds_len++] = (sol_blockstore_persist_shred_req_t){
+            .slot = shred->slot,
+            .variant_id = 0,
+            .is_data = is_data,
+            .index = index,
+            .data = shred_store->data,
+            .data_len = raw_len,
+        };
     }
 #endif
 
@@ -1501,6 +1767,7 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
     if (is_data) {
         bool data_complete = (shred->header.data.flags & SOL_SHRED_FLAG_DATA_COMPLETE) != 0;
         bool last_in_slot = sol_shred_is_last_in_slot(shred);
+        bool terminal = last_in_slot || data_complete;
 
         /* Update parent slot from first data shred */
         if (store->meta.received_data == 1) {
@@ -1512,7 +1779,10 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
             store->meta.first_shred_index = index;
         }
 
-        if (!store->meta.is_full && index > store->meta.last_shred_index) {
+        if (index > store->meta.last_shred_index) {
+            if (store->meta.is_full && !terminal) {
+                store->meta.is_full = false;
+            }
             store->meta.last_shred_index = index;
         }
 
@@ -1525,7 +1795,7 @@ sol_blockstore_insert_shred(sol_blockstore_t* bs, const sol_shred_t* shred,
                          (unsigned)shred->header.data.flags);
         }
 
-        if (last_in_slot) {
+        if (terminal) {
             store->meta.is_full = true;
             store->meta.last_shred_index = index;
             store->meta.num_data_shreds = index + 1;
@@ -1637,11 +1907,30 @@ fec:
                         if (!recovered || !recovered->raw_data || recovered->raw_len == 0) continue;
 
                         uint8_t* raw_owned = (uint8_t*)(uintptr_t)recovered->raw_data;
-                        sol_err_t serr = store_recovered_data_shred_locked(bs, store, shred->slot,
-                                                                           data_index,
-                                                                           raw_owned,
-                                                                           recovered->raw_len,
-                                                                           recovered);
+                        sol_err_t serr = store_recovered_data_shred_locked(
+                            bs,
+                            store,
+                            shred->slot,
+                            data_index,
+                            raw_owned,
+                            recovered->raw_len,
+                            recovered,
+#ifdef SOL_HAS_ROCKSDB
+                            persist_shreds,
+                            sizeof(persist_shreds) / sizeof(persist_shreds[0]),
+                            &persist_shreds_len,
+                            persist_metas,
+                            sizeof(persist_metas) / sizeof(persist_metas[0]),
+                            &persist_metas_len
+#else
+                            NULL,
+                            0,
+                            NULL,
+                            NULL,
+                            0,
+                            NULL
+#endif
+                        );
                         if (serr != SOL_OK) continue;
                     }
 
@@ -1651,8 +1940,47 @@ fec:
         }
     }
 
-    pthread_rwlock_unlock(&bs->lock);
-    return SOL_OK;
+    ret = SOL_OK;
+
+out_unlock:
+    pthread_mutex_unlock(mu);
+
+#ifdef SOL_HAS_ROCKSDB
+    if (bs->slot_meta_backend) {
+        for (size_t i = 0; i < persist_metas_len; i++) {
+            const sol_blockstore_persist_meta_req_t* req = &persist_metas[i];
+            sol_err_t err = persist_slot_meta_variant(bs, req->slot, req->variant_id, &req->meta);
+            if (err != SOL_OK) {
+                sol_log_warn("Failed to persist slot meta for slot %llu (variant %u): %d",
+                             (unsigned long long)req->slot,
+                             (unsigned)req->variant_id,
+                             err);
+            }
+        }
+    }
+
+    if (bs->shred_backend) {
+        for (size_t i = 0; i < persist_shreds_len; i++) {
+            const sol_blockstore_persist_shred_req_t* req = &persist_shreds[i];
+            sol_err_t err = persist_shred(bs,
+                                          req->slot,
+                                          req->variant_id,
+                                          req->is_data,
+                                          req->index,
+                                          req->data,
+                                          req->data_len);
+            if (err != SOL_OK) {
+                sol_log_warn("Failed to persist shred slot=%llu variant=%u index=%u: %d",
+                             (unsigned long long)req->slot,
+                             (unsigned)req->variant_id,
+                             (unsigned)req->index,
+                             err);
+            }
+        }
+    }
+#endif
+
+    return ret;
 }
 
 sol_err_t
@@ -1691,20 +2019,24 @@ sol_blockstore_get_shred(sol_blockstore_t* bs, sol_slot_t slot,
         return SOL_ERR_INVAL;
     }
 
-    pthread_rwlock_rdlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return SOL_ERR_UNINITIALIZED;
+    }
+    pthread_mutex_lock(mu);
 
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     if (entry) {
         sol_blockstore_shred_t* shred;
         if (is_data) {
             if (index >= entry->store.data_capacity) {
-                pthread_rwlock_unlock(&bs->lock);
+                pthread_mutex_unlock(mu);
                 return SOL_ERR_INVAL;
             }
             shred = &entry->store.data_shreds[index];
         } else {
             if (index >= entry->store.code_capacity) {
-                pthread_rwlock_unlock(&bs->lock);
+                pthread_mutex_unlock(mu);
                 return SOL_ERR_INVAL;
             }
             shred = &entry->store.code_shreds[index];
@@ -1713,19 +2045,19 @@ sol_blockstore_get_shred(sol_blockstore_t* bs, sol_slot_t slot,
         if (shred->data) {
             if (*buf_len < shred->data_len) {
                 *buf_len = shred->data_len;
-                pthread_rwlock_unlock(&bs->lock);
+                pthread_mutex_unlock(mu);
                 return SOL_ERR_OVERFLOW;
             }
 
             memcpy(buf, shred->data, shred->data_len);
             *buf_len = shred->data_len;
 
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return SOL_OK;
         }
     }
 
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
 
 #ifdef SOL_HAS_ROCKSDB
     if (bs->shred_backend) {
@@ -1760,7 +2092,11 @@ sol_blockstore_has_shred(sol_blockstore_t* bs, sol_slot_t slot,
         return false;
     }
 
-    pthread_rwlock_rdlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return false;
+    }
+    pthread_mutex_lock(mu);
 
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     bool has = false;
@@ -1774,7 +2110,7 @@ sol_blockstore_has_shred(sol_blockstore_t* bs, sol_slot_t slot,
         }
     }
 
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
 
     if (has) return true;
 
@@ -1795,16 +2131,20 @@ sol_blockstore_get_slot_meta(sol_blockstore_t* bs, sol_slot_t slot,
                              sol_slot_meta_t* meta) {
     if (!bs || !meta) return SOL_ERR_INVAL;
 
-    pthread_rwlock_rdlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return SOL_ERR_UNINITIALIZED;
+    }
+    pthread_mutex_lock(mu);
 
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     if (entry) {
         *meta = entry->store.meta;
-        pthread_rwlock_unlock(&bs->lock);
+        pthread_mutex_unlock(mu);
         return SOL_OK;
     }
 
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
 
 #ifdef SOL_HAS_ROCKSDB
     if (bs->slot_meta_backend) {
@@ -1826,19 +2166,23 @@ sol_blockstore_get_slot_meta_variant(sol_blockstore_t* bs,
         return sol_blockstore_get_slot_meta(bs, slot, meta);
     }
 
-    pthread_rwlock_rdlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return SOL_ERR_UNINITIALIZED;
+    }
+    pthread_mutex_lock(mu);
 
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     if (entry) {
         sol_slot_variant_entry_t* v = find_variant_by_id(entry, variant_id);
         if (v) {
             *meta = v->store.meta;
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return SOL_OK;
         }
     }
 
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
 
 #ifdef SOL_HAS_ROCKSDB
     if (bs->slot_meta_backend) {
@@ -1853,7 +2197,11 @@ bool
 sol_blockstore_is_slot_complete(sol_blockstore_t* bs, sol_slot_t slot) {
     if (!bs) return false;
 
-    pthread_rwlock_rdlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return false;
+    }
+    pthread_mutex_lock(mu);
 
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     bool complete = false;
@@ -1869,7 +2217,7 @@ sol_blockstore_is_slot_complete(sol_blockstore_t* bs, sol_slot_t slot) {
         }
     }
 
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
     if (complete) return true;
 
 #ifdef SOL_HAS_ROCKSDB
@@ -1900,11 +2248,15 @@ sol_blockstore_get_missing_shreds(sol_blockstore_t* bs, sol_slot_t slot,
                                   uint32_t* indices, size_t max_indices) {
     if (!bs || !indices || max_indices == 0) return 0;
 
-    pthread_rwlock_rdlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return 0;
+    }
+    pthread_mutex_lock(mu);
 
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     if (!entry) {
-        pthread_rwlock_unlock(&bs->lock);
+        pthread_mutex_unlock(mu);
 #ifdef SOL_HAS_ROCKSDB
         if (bs->slot_meta_backend && bs->shred_backend) {
             sol_slot_meta_t meta;
@@ -1973,21 +2325,29 @@ sol_blockstore_get_missing_shreds(sol_blockstore_t* bs, sol_slot_t slot,
         }
     }
 
-    /* When all known shreds are present but the slot isn't complete (no
-     * LAST_IN_SLOT flag seen yet), probe beyond the highest known index to
-     * discover additional shreds.  Use exponentially growing offsets to
-     * quickly find the true slot extent when there are gaps between FEC sets. */
-    if (count == 0 && !store->meta.is_full && last > 0) {
+    /* Probe beyond the highest known index when we haven't seen LAST_IN_SLOT yet.
+     *
+     * Previously we only probed once there were no gaps (count==0). During
+     * bootstrap/catchup, that can stall progress because the "true last shred"
+     * might live far beyond the current last index, and we may spend a long
+     * time filling gaps before requesting higher indices.  Keep probes shallow
+     * when there are still gaps to avoid overloading repair traffic. */
+    if (!store->meta.is_full && last > 0 && count < max_indices) {
         uint32_t offset = 1;
-        while (offset <= 16384 && count < max_indices) {
+        uint32_t limit = (count == 0) ? 16384u : 512u;
+        while (offset <= limit && count < max_indices) {
             uint32_t probe = last + offset;
-            if (probe < last) break;  /* overflow */
+            if (probe < last) break; /* overflow */
+            if (bs->config.max_shreds_per_slot > 0 &&
+                probe >= bs->config.max_shreds_per_slot) {
+                break;
+            }
             indices[count++] = probe;
             offset *= 2;
         }
     }
 
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
     return count;
 }
 
@@ -1995,10 +2355,14 @@ size_t
 sol_blockstore_num_variants(sol_blockstore_t* bs, sol_slot_t slot) {
     if (!bs) return 0;
 
-    pthread_rwlock_rdlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return 0;
+    }
+    pthread_mutex_lock(mu);
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     size_t count = entry ? entry->variant_count : 0;
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
 
 #ifdef SOL_HAS_ROCKSDB
     if (count == 0 && bs->slot_meta_backend) {
@@ -2022,11 +2386,30 @@ sol_block_t*
 sol_blockstore_get_block_variant(sol_blockstore_t* bs, sol_slot_t slot, uint32_t variant_id) {
     if (!bs) return NULL;
 
-    pthread_rwlock_rdlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return NULL;
+    }
+    pthread_mutex_lock(mu);
 
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     sol_slot_store_t* store = entry ? store_for_variant(entry, variant_id) : NULL;
     if (store && store->meta.is_complete) {
+#ifdef SOL_HAS_ROCKSDB
+        /* When using RocksDB, the in-memory slot cache may not have all shred
+         * bytes populated (e.g. after restart/hydration). Do not assemble a
+         * partial block from sparse cached shreds, as it can parse but fail
+         * replay validation. Fall back to the RocksDB read path instead. */
+        if (bs->shred_backend) {
+            for (uint32_t i = 0; i <= store->meta.last_shred_index; i++) {
+                if (!store->data_shreds[i].data) {
+                    pthread_mutex_unlock(mu);
+                    return sol_blockstore_get_block_variant_rocksdb(bs, slot, variant_id);
+                }
+            }
+        }
+#endif
+
         /* Calculate total data size */
         size_t total_size = 0;
         for (uint32_t i = 0; i <= store->meta.last_shred_index; i++) {
@@ -2037,7 +2420,7 @@ sol_blockstore_get_block_variant(sol_blockstore_t* bs, sol_slot_t slot, uint32_t
                     parsed.type == SOL_SHRED_TYPE_DATA) {
                     total_size += parsed.payload_len;
                 } else {
-                    pthread_rwlock_unlock(&bs->lock);
+                    pthread_mutex_unlock(mu);
                     return NULL;
                 }
             }
@@ -2046,7 +2429,7 @@ sol_blockstore_get_block_variant(sol_blockstore_t* bs, sol_slot_t slot, uint32_t
         /* Allocate block */
         sol_block_t* block = sol_calloc(1, sizeof(sol_block_t));
         if (!block) {
-            pthread_rwlock_unlock(&bs->lock);
+            pthread_mutex_unlock(mu);
             return NULL;
         }
 
@@ -2058,7 +2441,7 @@ sol_blockstore_get_block_variant(sol_blockstore_t* bs, sol_slot_t slot, uint32_t
             block->data = sol_alloc(total_size);
             if (!block->data) {
                 sol_free(block);
-                pthread_rwlock_unlock(&bs->lock);
+                pthread_mutex_unlock(mu);
                 return NULL;
             }
 
@@ -2071,7 +2454,7 @@ sol_blockstore_get_block_variant(sol_blockstore_t* bs, sol_slot_t slot, uint32_t
                     if (sol_shred_parse(&parsed, shred->data, shred->data_len) != SOL_OK ||
                         parsed.type != SOL_SHRED_TYPE_DATA) {
                         sol_block_destroy(block);
-                        pthread_rwlock_unlock(&bs->lock);
+                        pthread_mutex_unlock(mu);
                         return NULL;
                     }
 
@@ -2084,13 +2467,13 @@ sol_blockstore_get_block_variant(sol_blockstore_t* bs, sol_slot_t slot, uint32_t
             block->data_len = offset;
         }
 
-        bs->stats.blocks_assembled++;
+        BS_STAT_INC(bs, blocks_assembled);
 
-        pthread_rwlock_unlock(&bs->lock);
+        pthread_mutex_unlock(mu);
         return block;
     }
 
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
     return sol_blockstore_get_block_variant_rocksdb(bs, slot, variant_id);
 }
 
@@ -2178,9 +2561,7 @@ sol_blockstore_get_block_variant_rocksdb(sol_blockstore_t* bs, sol_slot_t slot, 
         }
     }
 
-    pthread_rwlock_wrlock(&bs->lock);
-    bs->stats.blocks_assembled++;
-    pthread_rwlock_unlock(&bs->lock);
+    BS_STAT_INC(bs, blocks_assembled);
 
     return block;
 #else
@@ -2207,28 +2588,29 @@ sol_err_t
 sol_blockstore_set_rooted(sol_blockstore_t* bs, sol_slot_t slot) {
     if (!bs) return SOL_ERR_INVAL;
 
-    pthread_rwlock_wrlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return SOL_ERR_UNINITIALIZED;
+    }
+    pthread_mutex_lock(mu);
 
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     if (!entry) {
-        pthread_rwlock_unlock(&bs->lock);
+        pthread_mutex_unlock(mu);
         return SOL_ERR_NOTFOUND;
     }
 
     if (!entry->store.meta.is_rooted) {
         entry->store.meta.is_rooted = true;
-        bs->stats.slots_rooted++;
-
-        if (slot > bs->highest_rooted) {
-            bs->highest_rooted = slot;
-        }
+        BS_STAT_INC(bs, slots_rooted);
+        slot_atomic_max(&bs->highest_rooted, slot);
     }
 
     for (sol_slot_variant_entry_t* v = entry->variants; v; v = v->next) {
         v->store.meta.is_rooted = true;
     }
 
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
     return SOL_OK;
 }
 
@@ -2236,11 +2618,15 @@ sol_err_t
 sol_blockstore_set_dead(sol_blockstore_t* bs, sol_slot_t slot) {
     if (!bs) return SOL_ERR_INVAL;
 
-    pthread_rwlock_wrlock(&bs->lock);
+    pthread_mutex_t* mu = slot_bucket_lock(bs, slot);
+    if (!mu) {
+        return SOL_ERR_UNINITIALIZED;
+    }
+    pthread_mutex_lock(mu);
 
     sol_slot_entry_t* entry = find_slot_entry(bs, slot);
     if (!entry) {
-        pthread_rwlock_unlock(&bs->lock);
+        pthread_mutex_unlock(mu);
         return SOL_ERR_NOTFOUND;
     }
 
@@ -2249,7 +2635,7 @@ sol_blockstore_set_dead(sol_blockstore_t* bs, sol_slot_t slot) {
         v->store.meta.is_dead = true;
     }
 
-    pthread_rwlock_unlock(&bs->lock);
+    pthread_mutex_unlock(mu);
     return SOL_OK;
 }
 
@@ -2279,7 +2665,7 @@ sol_blockstore_get_block_hash_variant(sol_blockstore_t* bs,
         return SOL_ERR_NOMEM;
     }
 
-    sol_err_t err = sol_entry_batch_parse(batch, block->data, block->data_len);
+    sol_err_t err = sol_entry_batch_parse_ex(batch, block->data, block->data_len, false);
     if (err != SOL_OK) {
         sol_entry_batch_destroy(batch);
         sol_block_destroy(block);
@@ -2311,9 +2697,7 @@ sol_slot_t
 sol_blockstore_highest_slot(sol_blockstore_t* bs) {
     if (!bs) return 0;
 
-    pthread_rwlock_rdlock(&bs->lock);
-    sol_slot_t slot = bs->highest_slot;
-    pthread_rwlock_unlock(&bs->lock);
+    sol_slot_t slot = __atomic_load_n(&bs->highest_slot, __ATOMIC_RELAXED);
 
     return slot;
 }
@@ -2322,9 +2706,7 @@ sol_slot_t
 sol_blockstore_highest_complete_slot(sol_blockstore_t* bs) {
     if (!bs) return 0;
 
-    pthread_rwlock_rdlock(&bs->lock);
-    sol_slot_t slot = bs->highest_complete;
-    pthread_rwlock_unlock(&bs->lock);
+    sol_slot_t slot = __atomic_load_n(&bs->highest_complete, __ATOMIC_RELAXED);
 
     return slot;
 }
@@ -2333,9 +2715,7 @@ sol_slot_t
 sol_blockstore_highest_rooted_slot(sol_blockstore_t* bs) {
     if (!bs) return 0;
 
-    pthread_rwlock_rdlock(&bs->lock);
-    sol_slot_t slot = bs->highest_rooted;
-    pthread_rwlock_unlock(&bs->lock);
+    sol_slot_t slot = __atomic_load_n(&bs->highest_rooted, __ATOMIC_RELAXED);
 
     return slot;
 }
@@ -2344,9 +2724,7 @@ sol_slot_t
 sol_blockstore_lowest_slot(sol_blockstore_t* bs) {
     if (!bs) return 0;
 
-    pthread_rwlock_rdlock(&bs->lock);
-    sol_slot_t slot = bs->lowest_slot;
-    pthread_rwlock_unlock(&bs->lock);
+    sol_slot_t slot = __atomic_load_n(&bs->lowest_slot, __ATOMIC_RELAXED);
 
     /* If no slots stored yet, return 0 */
     if (slot == UINT64_MAX) {
@@ -2362,21 +2740,18 @@ sol_blockstore_set_slot_callback(sol_blockstore_t* bs,
                                  void* ctx) {
     if (!bs) return;
 
-    pthread_rwlock_wrlock(&bs->lock);
-    bs->slot_callback = callback;
-    bs->slot_callback_ctx = ctx;
-    pthread_rwlock_unlock(&bs->lock);
+    __atomic_store_n(&bs->slot_callback_ctx, ctx, __ATOMIC_RELAXED);
+    __atomic_store_n(&bs->slot_callback, callback, __ATOMIC_RELAXED);
 }
 
 size_t
 sol_blockstore_purge_slots_below(sol_blockstore_t* bs, sol_slot_t min_slot) {
     if (!bs) return 0;
 
-    pthread_rwlock_wrlock(&bs->lock);
-
     size_t purged = 0;
 
     for (size_t i = 0; i < bs->slot_table_size; i++) {
+        pthread_mutex_lock(&bs->bucket_locks[i]);
         sol_slot_entry_t** prev_ptr = &bs->slots[i];
         sol_slot_entry_t* entry = bs->slots[i];
 
@@ -2386,7 +2761,7 @@ sol_blockstore_purge_slots_below(sol_blockstore_t* bs, sol_slot_t min_slot) {
             if (entry->slot < min_slot) {
                 *prev_ptr = next;
                 free_slot_entry(entry);
-                bs->slot_count--;
+                __atomic_fetch_sub(&bs->slot_count, 1u, __ATOMIC_RELAXED);
                 purged++;
             } else {
                 prev_ptr = &entry->next;
@@ -2394,14 +2769,15 @@ sol_blockstore_purge_slots_below(sol_blockstore_t* bs, sol_slot_t min_slot) {
 
             entry = next;
         }
+        pthread_mutex_unlock(&bs->bucket_locks[i]);
     }
 
     /* Update lowest_slot after purge */
-    if (purged > 0 && bs->lowest_slot < min_slot) {
-        bs->lowest_slot = min_slot;
+    sol_slot_t low = __atomic_load_n(&bs->lowest_slot, __ATOMIC_RELAXED);
+    if (purged > 0 && low != UINT64_MAX && low < min_slot) {
+        __atomic_store_n(&bs->lowest_slot, min_slot, __ATOMIC_RELAXED);
     }
 
-    pthread_rwlock_unlock(&bs->lock);
     return purged;
 }
 
@@ -2409,27 +2785,33 @@ void
 sol_blockstore_stats(const sol_blockstore_t* bs, sol_blockstore_stats_t* stats) {
     if (!bs || !stats) return;
 
-    pthread_rwlock_rdlock((pthread_rwlock_t*)&bs->lock);
-    *stats = bs->stats;
-    pthread_rwlock_unlock((pthread_rwlock_t*)&bs->lock);
+    stats->shreds_received = __atomic_load_n(&bs->stats.shreds_received, __ATOMIC_RELAXED);
+    stats->shreds_inserted = __atomic_load_n(&bs->stats.shreds_inserted, __ATOMIC_RELAXED);
+    stats->shreds_duplicate = __atomic_load_n(&bs->stats.shreds_duplicate, __ATOMIC_RELAXED);
+    stats->slots_created = __atomic_load_n(&bs->stats.slots_created, __ATOMIC_RELAXED);
+    stats->slots_completed = __atomic_load_n(&bs->stats.slots_completed, __ATOMIC_RELAXED);
+    stats->slots_rooted = __atomic_load_n(&bs->stats.slots_rooted, __ATOMIC_RELAXED);
+    stats->blocks_assembled = __atomic_load_n(&bs->stats.blocks_assembled, __ATOMIC_RELAXED);
 }
 
 void
 sol_blockstore_stats_reset(sol_blockstore_t* bs) {
     if (!bs) return;
 
-    pthread_rwlock_wrlock(&bs->lock);
-    memset(&bs->stats, 0, sizeof(bs->stats));
-    pthread_rwlock_unlock(&bs->lock);
+    __atomic_store_n(&bs->stats.shreds_received, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&bs->stats.shreds_inserted, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&bs->stats.shreds_duplicate, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&bs->stats.slots_created, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&bs->stats.slots_completed, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&bs->stats.slots_rooted, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&bs->stats.blocks_assembled, 0u, __ATOMIC_RELAXED);
 }
 
 size_t
 sol_blockstore_slot_count(const sol_blockstore_t* bs) {
     if (!bs) return 0;
 
-    pthread_rwlock_rdlock((pthread_rwlock_t*)&bs->lock);
-    size_t count = bs->slot_count;
-    pthread_rwlock_unlock((pthread_rwlock_t*)&bs->lock);
+    size_t count = __atomic_load_n(&bs->slot_count, __ATOMIC_RELAXED);
 
     return count;
 }
@@ -2538,6 +2920,26 @@ sol_blockstore_index_transaction(sol_blockstore_t* bs,
     }
 
     return first_err;
+}
+
+bool
+sol_blockstore_address_sig_batch_supported(const sol_blockstore_t* bs) {
+    if (!bs) {
+        return false;
+    }
+    return bs->address_sig_backend && bs->address_sig_backend->batch_write;
+}
+
+sol_err_t
+sol_blockstore_address_sig_batch_write(sol_blockstore_t* bs,
+                                       sol_storage_batch_t* batch) {
+    if (!bs || !batch) {
+        return SOL_ERR_INVAL;
+    }
+    if (!bs->address_sig_backend || !bs->address_sig_backend->batch_write) {
+        return SOL_ERR_NOT_IMPLEMENTED;
+    }
+    return bs->address_sig_backend->batch_write(bs->address_sig_backend->ctx, batch);
 }
 
 typedef struct {

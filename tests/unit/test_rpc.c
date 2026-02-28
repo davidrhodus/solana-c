@@ -423,6 +423,31 @@ TEST(rpc_get_inflation_governor) {
     sol_rpc_destroy(rpc);
 }
 
+TEST(rpc_get_recent_performance_samples) {
+    sol_bank_t* root = sol_bank_new(123, NULL, NULL, NULL);
+    ASSERT(root != NULL);
+
+    sol_bank_forks_t* forks = sol_bank_forks_new(root, NULL);
+    ASSERT(forks != NULL);
+
+    sol_rpc_t* rpc = sol_rpc_new(forks, NULL);
+    ASSERT(rpc != NULL);
+
+    const char* req =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getRecentPerformanceSamples\",\"params\":[5]}";
+    sol_json_builder_t* b = sol_json_builder_new(1024);
+    ASSERT(b != NULL);
+    sol_rpc_handle_request_json(rpc, req, strlen(req), b);
+    const char* resp = sol_json_builder_str(b);
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "\"numTransactions\"") != NULL);
+    ASSERT(strstr(resp, "\"samplePeriodSecs\"") != NULL);
+    sol_json_builder_destroy(b);
+
+    sol_rpc_destroy(rpc);
+    sol_bank_forks_destroy(forks);
+}
+
 TEST(rpc_get_blocks_with_limit) {
     sol_bank_t* root = sol_bank_new(20, NULL, NULL, NULL);
     ASSERT(root != NULL);
@@ -548,6 +573,7 @@ int main(void) {
     RUN_TEST(rpc_get_health_uses_callback);
     RUN_TEST(rpc_get_epoch_schedule);
     RUN_TEST(rpc_get_inflation_governor);
+    RUN_TEST(rpc_get_recent_performance_samples);
     RUN_TEST(rpc_get_blocks_with_limit);
     RUN_TEST(rpc_get_token_account_balance);
 

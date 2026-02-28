@@ -82,8 +82,8 @@ syscall_sol_log(
         return 1;  /* Access violation */
     }
 
-    /* Log the message */
-    sol_log_info("Program log: %.*s", (int)msg_len, msg);
+    /* Log the message (debug to avoid overwhelming replay logs) */
+    sol_log_debug("Program log: %.*s", (int)msg_len, msg);
 
     return 0;
 }
@@ -228,7 +228,7 @@ syscall_sol_log_data(
         uint64_t data_len = *(uint64_t*)(slice + 8);
 
         if (data_len == 0) {
-            sol_log_info("Program data: <empty>");
+            sol_log_debug("Program data: <empty>");
             continue;
         }
 
@@ -243,7 +243,7 @@ syscall_sol_log_data(
         for (uint64_t j = 0; j < data_len && out + 2 < sizeof(buf); j++) {
             out += (size_t)snprintf(buf + out, sizeof(buf) - out, "%02x", data[j]);
         }
-        sol_log_info("%s", buf);
+        sol_log_debug("%s", buf);
     }
 
     return 0;
@@ -655,14 +655,31 @@ syscall_sol_try_find_program_address(
     bool found = false;
     uint8_t bump_seed = 0;
 
+    /* Fast path: hash seeds once, then clone the SHA256 state per bump attempt. */
+    sol_sha256_ctx_t base_ctx;
+    sol_sha256_init(&base_ctx);
+    for (size_t i = 0; i < (size_t)seeds_len; i++) {
+        sol_sha256_update(&base_ctx, seed_ptrs[i], seed_lens[i]);
+    }
+    static const char PDA_MARKER[] = "ProgramDerivedAddress";
+
     for (int b = 255; b >= 0; b--) {
         if (!consume_compute(vm, SOL_CU_CREATE_PROGRAM_ADDRESS)) {
             return 1;
         }
-        sol_err_t err = sol_ed25519_create_pda_with_bump(
-            &prog_id, seed_ptrs, seed_lens, seeds_len, (uint8_t)b, &pda
-        );
-        if (err == SOL_OK) {
+
+        sol_sha256_ctx_t ctx = base_ctx;
+        sol_sha256_t hash;
+        uint8_t bump_byte = (uint8_t)b;
+
+        /* Hash: seeds || bump || program_id || "ProgramDerivedAddress" */
+        sol_sha256_update(&ctx, &bump_byte, 1);
+        sol_sha256_update(&ctx, prog_id.bytes, 32);
+        sol_sha256_update(&ctx, PDA_MARKER, sizeof(PDA_MARKER) - 1);
+        sol_sha256_final(&ctx, &hash);
+
+        memcpy(pda.bytes, hash.bytes, 32);
+        if (!sol_ed25519_pubkey_is_on_curve(&pda)) {
             bump_seed = (uint8_t)b;
             found = true;
             break;
@@ -934,17 +951,37 @@ syscall_sol_panic(
     /* Agave's SyscallPanic charges `len` (the filename length), not syscall_base_cost */
     (void)consume_compute(vm, file_len);
 
-    const char* file = "unknown";
-    if (file_len > 0 && file_len < 1024) {
-        uint8_t* f = sol_bpf_memory_translate(&vm->memory, file_ptr, file_len, false);
-        if (f != NULL) {
-            file = (const char*)f;
-        }
+    /* Panics are common on mainnet (tx failures) and logging them at ERROR can
+     * dominate replay. Default to DEBUG and allow forcing ERROR for debugging
+     * via SOL_LOG_PROGRAM_PANIC=1. */
+    static int force_error_cached = -1;
+    int force_error = __atomic_load_n(&force_error_cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(force_error < 0, 0)) {
+        const char* env = getenv("SOL_LOG_PROGRAM_PANIC");
+        force_error = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+        __atomic_store_n(&force_error_cached, force_error, __ATOMIC_RELEASE);
     }
 
-    sol_log_error("Program panic at %.*s:%lu:%lu",
-                  (int)file_len, file,
-                  (unsigned long)line, (unsigned long)column);
+    bool should_log = force_error || (sol_log_get_level() <= SOL_LOG_DEBUG);
+    if (__builtin_expect(should_log, 0)) {
+        const char* file = "unknown";
+        if (file_len > 0 && file_len < 1024) {
+            uint8_t* f = sol_bpf_memory_translate(&vm->memory, file_ptr, file_len, false);
+            if (f != NULL) {
+                file = (const char*)f;
+            }
+        }
+
+        if (force_error) {
+            sol_log_error("Program panic at %.*s:%lu:%lu",
+                          (int)file_len, file,
+                          (unsigned long)line, (unsigned long)column);
+        } else {
+            sol_log_debug("Program panic at %.*s:%lu:%lu",
+                          (int)file_len, file,
+                          (unsigned long)line, (unsigned long)column);
+        }
+    }
 
     vm->error = SOL_BPF_ERR_ABORT;
     vm->state = SOL_BPF_STATE_ERROR;
@@ -1175,9 +1212,13 @@ syscall_sol_get_epoch_schedule_sysvar(
         return 1;
     }
 
-    /* EpochSchedule: #[repr(C)]
+    /* EpochSchedule syscall returns the bincode-serialized layout (no struct
+     * padding), matching Solana's stable ABI:
      *   slots_per_epoch(8) + leader_schedule_slot_offset(8) +
-     *   warmup(1) + 7pad + first_normal_epoch(8) + first_normal_slot(8) = 40 bytes */
+     *   warmup(1) + first_normal_epoch(8) + first_normal_slot(8) = 33 bytes.
+     *
+     * The output buffer is still expected to be SOL_EPOCH_SCHEDULE_SIZE bytes
+     * to match existing callers and CU charging conventions. */
     uint8_t* result = sol_bpf_memory_translate(&vm->memory, result_ptr, SOL_EPOCH_SCHEDULE_SIZE, true);
     if (result == NULL) {
         return 1;
@@ -1199,15 +1240,13 @@ syscall_sol_get_epoch_schedule_sysvar(
         first_normal_slot = ctx->epoch_schedule.first_normal_slot;
     }
 
-    /* Write in #[repr(C)] layout with padding */
+    /* Write bincode layout (no padding between fields) */
     memset(result, 0, SOL_EPOCH_SCHEDULE_SIZE);
-    size_t offset = 0;
-    memcpy(result + offset, &slots_per_epoch, 8);         offset += 8;
-    memcpy(result + offset, &leader_schedule_slot_offset, 8); offset += 8;
-    result[offset] = warmup;                               offset += 1;
-    offset += 7;  /* padding to align next u64 */
-    memcpy(result + offset, &first_normal_epoch, 8);       offset += 8;
-    memcpy(result + offset, &first_normal_slot, 8);
+    memcpy(result + 0, &slots_per_epoch, 8);
+    memcpy(result + 8, &leader_schedule_slot_offset, 8);
+    result[16] = warmup;
+    memcpy(result + 17, &first_normal_epoch, 8);
+    memcpy(result + 25, &first_normal_slot, 8);
 
     return 0;
 }

@@ -20,6 +20,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+typedef struct sol_leader_schedule sol_leader_schedule_t;
+
 /*
  * RPC configuration
  */
@@ -210,6 +212,14 @@ bool sol_rpc_is_running(const sol_rpc_t* rpc);
 sol_rpc_stats_t sol_rpc_stats(const sol_rpc_t* rpc);
 
 /*
+ * Set bank forks for state queries.
+ *
+ * This can be called after the RPC server has started (e.g. when the validator
+ * finishes snapshot loading and initializes BankForks).
+ */
+void sol_rpc_set_bank_forks(sol_rpc_t* rpc, sol_bank_forks_t* bank_forks);
+
+/*
  * Set blockstore for block queries
  */
 void sol_rpc_set_blockstore(sol_rpc_t* rpc, void* blockstore);
@@ -223,6 +233,11 @@ void sol_rpc_set_gossip(sol_rpc_t* rpc, void* gossip);
  * Set node identity pubkey
  */
 void sol_rpc_set_identity(sol_rpc_t* rpc, const sol_pubkey_t* identity);
+
+/*
+ * Set leader schedule snapshot for RPC (deep-copied).
+ */
+void sol_rpc_set_leader_schedule(sol_rpc_t* rpc, const sol_leader_schedule_t* schedule);
 
 /*
  * Set transaction sender callback

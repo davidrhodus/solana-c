@@ -118,6 +118,13 @@ sol_leader_schedule_t* sol_leader_schedule_from_slot_leaders(
 );
 
 /*
+ * Clone an existing leader schedule (deep copy).
+ */
+sol_leader_schedule_t* sol_leader_schedule_clone(
+    const sol_leader_schedule_t* schedule
+);
+
+/*
  * Destroy leader schedule
  */
 void sol_leader_schedule_destroy(sol_leader_schedule_t* schedule);

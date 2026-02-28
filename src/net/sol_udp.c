@@ -39,6 +39,14 @@ sol_udp_new(const sol_udp_config_t* config) {
         return NULL;
     }
 
+    /* Ensure sockets aren't inherited by snapshot helper processes (curl/zstd). */
+    {
+        int fd_flags = fcntl(fd, F_GETFD, 0);
+        if (fd_flags >= 0) {
+            (void)fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+        }
+    }
+
     /* Set socket options */
     int opt = 1;
 

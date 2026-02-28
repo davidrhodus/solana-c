@@ -43,8 +43,8 @@ bash ./scripts/run-mainnet-smoke.sh ledger.mainnet
 
 ## Snapshots (bootstrap)
 
-- If no `--snapshot` is provided, `solana-validator` will try to auto-download a full snapshot archive (and the matching incremental, if available) into `<ledger>/snapshot-archives/` using `SOL_MAINNET_SNAPSHOT_MANIFEST_URL` (see `src/snapshot/sol_snapshot_download.h`).
-- Large snapshots are downloaded using parallel HTTP range requests by default (64 connections; auto-scales up to 128 for very large archives) when the server supports it. Override via env: `SOL_SNAPSHOT_DOWNLOAD_CONNECTIONS` (max 128).
+- If no `--snapshot` is provided, `solana-validator` refreshes snapshot archives from `SOL_MAINNET_SNAPSHOT_MANIFEST_URL` on startup (see `src/snapshot/sol_snapshot_download.h`), downloading the freshest full snapshot (and matching incremental when available) into `<ledger>/snapshot-archives/` and using it for bootstrap. If the download fails, it falls back to any local archives.
+- Large snapshots are downloaded with aria2c multi-connection ranges by default (64 connections; auto-scales up to 128 for very large archives). Install `aria2c` for best performance; if unavailable, the downloader falls back to curl. Override via env: `SOL_SNAPSHOT_DOWNLOAD_CONNECTIONS` (max 128).
 - On restarts, the validator prefers a persisted AccountsDB bootstrap state (skips snapshot ingest). If it lags the best available snapshot by >50k slots, it first attempts a fast refresh by applying a matching incremental snapshot to the existing AccountsDB; if unavailable, it falls back to a fresh snapshot load. Tune via CLI `--auto-snapshot-max-lag-slots`, config `snapshots.max_bootstrap_lag_slots`, or env `SOL_AUTO_SNAPSHOT_MAX_LAG_SLOTS` (0 disables refresh).
 - After the first successful bootstrap, the validator persists additional cluster constants (genesis hash + shred version) into the AccountsDB bootstrap state so subsequent restarts don’t require RPC autodiscovery.
 - Snapshot extraction prefers `pzstd` for large `.tar.zst` archives when available (faster than single-threaded decode). Tune via env: `SOL_SNAPSHOT_ARCHIVE_PZSTD_PROCESSES` and `SOL_SNAPSHOT_ARCHIVE_PZSTD=0/1`.
@@ -56,7 +56,7 @@ bash ./scripts/run-mainnet-smoke.sh ledger.mainnet
 - By default, snapshot accounts-hash verification is disabled to keep bootstrap time reasonable. Enable via CLI: `--verify-snapshot-accounts-hash` or config: `snapshots.verify_accounts_hash = true`.
 - When enabled, the `snapshot-<slot>-<hash>` filename hash is verified against the computed accounts hash (and epoch accounts hash when available); mismatches fail bootstrap.
 - Override via config: `snapshots.manifest_url = "..."` (see `config/validator.toml.example`).
-- Optional fallback via config: `snapshots.rpc_urls = ["http://validator-rpc:8899", ...]`.
+- RPC snapshot fallbacks are disabled; `snapshots.rpc_urls` is ignored for downloads.
 - Supported snapshot archive compressions: `.tar.zst`, `.tar.bz2`, `.tar.gz`, `.tar.lz4`, and plain `.tar` (auto-detected).
 
 ## Gossip (mainnet/testnet/devnet)
@@ -71,6 +71,13 @@ bash ./scripts/run-mainnet-smoke.sh ledger.mainnet
   - `snapshots.rpc_urls[0]` (if set), otherwise
   - an official endpoint inferred from `network.entrypoints[0]` (mainnet/testnet/devnet).
 - If `network.advertise_ip` is not set, the validator tries to infer an outbound IP from the first entrypoint route; override if you’re behind NAT or on multi-homed hosts.
+
+## Replay (performance)
+
+- `--fast-replay` skips transaction processing (fees/exec), shred/transaction signature verification, and tx index writes, and it may replay incomplete slots without full ticks to maximize catchup speed. This produces incorrect account state and is intended only for debugging or network-only ingestion.
+- Fast replay also defaults `SOL_FAST_REPLAY_FORCE_ADVANCE=1`, which forces slot advancement after any parsed block variant or any received shreds (even if replay fails) to keep catchup moving. Disable by setting `SOL_FAST_REPLAY_FORCE_ADVANCE=0`.
+- TVU thread counts default to auto-sizing when set to `0` (default): shred verification and replay scale to the online CPU count (min 2 on multi-core, cap 64), and repair scales similarly (cap 32).
+- When running without voting (e.g., `--no-voting`) or in fast replay, the validator periodically auto-advances the root based on `highest_replayed` to keep bank forks bounded.
 
 ## QUIC (TPU)
 

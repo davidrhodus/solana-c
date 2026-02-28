@@ -10,7 +10,17 @@
 
 #include "../util/sol_base.h"
 #include "../util/sol_err.h"
+#include <stdint.h>
 #include <string.h>
+
+/* Build systems should provide this. Default to disabled for safety. */
+#ifndef SOL_USE_OPENSSL
+#define SOL_USE_OPENSSL 0
+#endif
+
+#if SOL_USE_OPENSSL
+#include <openssl/sha.h>
+#endif
 
 /*
  * SHA-256 constants
@@ -28,11 +38,17 @@ typedef struct SOL_ALIGNED(32) {
 /*
  * SHA-256 context for incremental hashing
  */
+#if SOL_USE_OPENSSL
+typedef struct {
+    SHA256_CTX inner;
+} sol_sha256_ctx_t;
+#else
 typedef struct {
     uint32_t state[8];      /* Hash state */
     uint64_t count;         /* Number of bits processed */
     uint8_t  buffer[64];    /* Pending data buffer */
 } sol_sha256_ctx_t;
+#endif
 
 /*
  * One-shot hash functions
@@ -50,6 +66,14 @@ void sol_sha256(const void* data, size_t len, sol_sha256_t* out);
  * Supports `in == out`.
  */
 void sol_sha256_32bytes(const uint8_t in[static 32], uint8_t out[static 32]);
+
+/*
+ * Hash a 32-byte digest repeatedly in-place (cnt times).
+ *
+ * Equivalent to:
+ *   for (i=0; i<cnt; i++) sol_sha256_32bytes(data, data);
+ */
+void sol_sha256_32bytes_repeated(uint8_t data[static 32], uint64_t cnt);
 
 /* Hash data and return result (convenience returning pointer) */
 sol_sha256_t* sol_sha256_hash(const void* data, size_t len, sol_sha256_t* out);

@@ -5,15 +5,18 @@
 #include "sol_snapshot.h"
 #include "sol_snapshot_archive.h"
 #include "../crypto/sol_sha256.h"
+#include "../runtime/sol_appendvec_index.h"
 #include "../txn/sol_pubkey.h"
 #include "../txn/sol_bincode.h"
 #include "../util/sol_alloc.h"
 #include "../util/sol_bits.h"
+#include "../util/sol_io.h"
 #include "../util/sol_log.h"
 #include "../util/sol_map.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -36,18 +39,6 @@ struct sol_snapshot_mgr {
 
 /* Forward declarations */
 static sol_err_t parse_snapshot_manifest(const char* snapshot_dir, sol_snapshot_info_t* info);
-
-typedef struct snapshot_appendvec_index snapshot_appendvec_index_t;
-static sol_err_t snapshot_appendvec_index_update(snapshot_appendvec_index_t* idx,
-                                                 const sol_pubkey_t* pubkey,
-                                                 sol_slot_t slot,
-                                                 uint64_t write_version,
-                                                 const sol_pubkey_t* owner,
-                                                 uint64_t lamports,
-                                                 uint64_t data_len,
-                                                 uint64_t file_key,
-                                                 uint64_t record_offset,
-                                                 const sol_hash_t* leaf_hash);
 
 static void
 bytes32_to_base58(const uint8_t bytes[32], char* out, size_t out_len) {
@@ -1809,7 +1800,9 @@ default_snapshot_load_threads(void) {
      * concurrency helps, but cap to avoid pathological contention.
      * Override with SOL_SNAPSHOT_LOAD_THREADS if you want to experiment. */
     uint32_t cap = 32u;
-    if (threads >= 96u) {
+    if (threads >= 128u) {
+        cap = 128u;
+    } else if (threads >= 96u) {
         cap = 96u;
     } else if (threads >= 64u) {
         cap = 64u;
@@ -1856,7 +1849,7 @@ default_snapshot_load_max_bytes_per_thread(uint32_t threads) {
      * Keeps memory usage sane across different machines while still allowing
      * high-throughput ingestion on validator-grade hardware. */
     uint64_t budget = total / 6u; /* ~16.7% of RAM */
-    uint64_t max_budget = 96ull * 1024ull * 1024ull * 1024ull;
+    uint64_t max_budget = 128ull * 1024ull * 1024ull * 1024ull;
     if (budget > max_budget) budget = max_budget;
 
     uint64_t per = budget / threads;
@@ -1904,6 +1897,31 @@ static SOL_THREAD_LOCAL storage_parse_cache_t g_storage_parse_cache = {0};
  *  0: disabled (meta did not match computed hash)
  *  1: enabled  (meta matched computed hash) */
 static int g_appendvec_meta_hash_mode = -1;
+
+static bool
+buffer_is_all_zero(const void* data, size_t len) {
+    if (!data || len == 0) return true;
+    const uint8_t* p = (const uint8_t*)data;
+
+    /* Fast path: word-at-a-time scan for a non-zero byte. */
+    size_t i = 0;
+    while (i < len && (((uintptr_t)(p + i)) & 7u)) {
+        if (p[i] != 0) return false;
+        i++;
+    }
+    size_t rem = len - i;
+    const uint64_t* q = (const uint64_t*)(p + i);
+    size_t n64 = rem / 8u;
+    for (size_t j = 0; j < n64; j++) {
+        if (q[j] != 0) return false;
+    }
+    i += n64 * 8u;
+    while (i < len) {
+        if (p[i] != 0) return false;
+        i++;
+    }
+    return true;
+}
 
 static bool
 parse_stored_account_record(const uint8_t* data,
@@ -2056,7 +2074,7 @@ load_accounts_from_storage_mapped(const uint8_t* data,
                                  sol_slot_t slot_hint,
                                  sol_accounts_db_t* accounts_db,
                                  sol_accounts_db_bulk_writer_t* bulk_writer,
-                                 snapshot_appendvec_index_t* appendvec_index,
+                                 sol_appendvec_index_t* appendvec_index,
                                  uint64_t* out_count) {
     if (!data || file_size == 0 || !accounts_db) return SOL_ERR_INVAL;
     if (out_count) *out_count = 0;
@@ -2263,6 +2281,14 @@ load_accounts_from_storage_mapped(const uint8_t* data,
     }
 
     if (best.score == 0) {
+        /* Some real-world snapshots can contain preallocated AppendVec files
+         * with no used records (all-zero contents). Treat these as empty
+         * storages rather than "corrupt". */
+        if (buffer_is_all_zero(data, file_size)) {
+            if (out_count) *out_count = 0;
+            return SOL_OK;
+        }
+
         if (out_count) *out_count = 0;
         return SOL_ERR_NOTFOUND;
     }
@@ -2372,7 +2398,7 @@ load_accounts_from_storage_mapped(const uint8_t* data,
                 idx_record_off = 0;
             }
 
-            store_err = snapshot_appendvec_index_update(appendvec_index,
+            store_err = sol_appendvec_index_update(appendvec_index,
                                                         &stored.pubkey,
                                                         storage_slot,
                                                         stored.write_version,
@@ -2447,19 +2473,27 @@ load_accounts_from_storage_mapped(const uint8_t* data,
                                                                          file_key,
                                                                          (uint64_t)record_start);
         } else {
-            sol_account_t account = {0};
-            account.meta.owner = stored.owner;
-            account.meta.lamports = stored.lamports;
-            account.meta.rent_epoch = stored.rent_epoch;
-            account.meta.executable = stored.executable;
-            account.meta.data_len = stored.data_len;
-            account.data = (stored.data_len > 0) ? (uint8_t*)(data + offset) : NULL;
+            if (stored.lamports == 0) {
+                /* Snapshot storages use zero-lamport records as tombstones. */
+                store_err = sol_accounts_db_delete_versioned(accounts_db,
+                                                             &stored.pubkey,
+                                                             storage_slot,
+                                                             stored.write_version);
+            } else {
+                sol_account_t account = {0};
+                account.meta.owner = stored.owner;
+                account.meta.lamports = stored.lamports;
+                account.meta.rent_epoch = stored.rent_epoch;
+                account.meta.executable = stored.executable;
+                account.meta.data_len = stored.data_len;
+                account.data = (stored.data_len > 0) ? (uint8_t*)(data + offset) : NULL;
 
-            store_err = sol_accounts_db_store_versioned(accounts_db,
-                                                        &stored.pubkey,
-                                                        &account,
-                                                        storage_slot,
-                                                        stored.write_version);
+                store_err = sol_accounts_db_store_versioned(accounts_db,
+                                                           &stored.pubkey,
+                                                           &account,
+                                                           storage_slot,
+                                                           stored.write_version);
+            }
         }
         if (store_err != SOL_OK) {
             if (out_count) *out_count = loaded;
@@ -2904,29 +2938,8 @@ load_accounts_from_top_level_dir_parallel(const char* accounts_dir,
 /* AppendVec snapshot index (deferred RocksDB write)                           */
 /* -------------------------------------------------------------------------- */
 
-typedef struct {
-    uint64_t     slot;
-    uint64_t     write_version;
-    uint64_t     file_key;
-    uint64_t     record_offset;
-    sol_hash_t   leaf_hash; /* Zero => deleted */
-    sol_pubkey_t owner;
-    uint64_t     lamports;
-    uint64_t     data_len;
-} snapshot_appendvec_index_val_t;
-
-typedef struct {
-    pthread_mutex_t  lock;
-    sol_pubkey_map_t* map;
-} snapshot_appendvec_index_shard_t;
-
-struct snapshot_appendvec_index {
-    size_t                          shard_count;
-    snapshot_appendvec_index_shard_t* shards;
-};
-
 static uint32_t
-snapshot_appendvec_index_flush_threads_default(const snapshot_appendvec_index_t* idx) {
+snapshot_appendvec_index_flush_threads_default(const sol_appendvec_index_t* idx) {
     if (!idx || idx->shard_count == 0) return 1u;
 
     size_t env = snapshot_env_size_t("SOL_SNAPSHOT_DEFER_APPENDVEC_INDEX_FLUSH_THREADS",
@@ -2945,8 +2958,11 @@ snapshot_appendvec_index_flush_threads_default(const snapshot_appendvec_index_t*
         threads = (uint32_t)cpu_count;
     }
 
-    /* Cap to avoid runaway arenas and too many concurrent RocksDB writers. */
-    if (threads > 32u) threads = 32u;
+    /* Cap to avoid runaway arenas and too many concurrent RocksDB writers.
+     *
+     * On large replay hosts (64+ cores), 32 threads can underutilize CPU/IO and
+     * make the deferred index flush dominate bootstrap time. */
+    if (threads > 128u) threads = 128u;
     if ((size_t)threads > idx->shard_count) threads = (uint32_t)idx->shard_count;
     if (threads < 1u) threads = 1u;
     return threads;
@@ -3010,7 +3026,10 @@ snapshot_appendvec_index_default_capacity_per_shard(uint32_t shard_count) {
     uint64_t target_total_capacity = 0;
 
     if (total >= (1024ull * 1024ull * 1024ull * 1024ull)) {          /* >= 1 TiB */
-        target_total_capacity = 1ull << 30;                           /* 1,073,741,824 */
+        /* Mainnet snapshots can contain ~1.1B+ accounts index entries. 1<<30
+         * (1,073,741,824) is borderline and can force mid-stream flushing when
+         * we slightly exceed it, which stalls snapshot streaming. */
+        target_total_capacity = 1ull << 31;                           /* 2,147,483,648 */
     } else if (total >= (512ull * 1024ull * 1024ull * 1024ull)) {     /* >= 512 GiB */
         target_total_capacity = 1ull << 29;                           /* 536,870,912 */
     } else if (total >= (256ull * 1024ull * 1024ull * 1024ull)) {     /* >= 256 GiB */
@@ -3029,125 +3048,6 @@ snapshot_appendvec_index_default_capacity_per_shard(uint32_t shard_count) {
     if (per < 1024u) per = 1024u;
     if (per > (uint64_t)((size_t)1u << 24)) per = (uint64_t)((size_t)1u << 24);
     return (size_t)per;
-}
-
-static snapshot_appendvec_index_t*
-snapshot_appendvec_index_new(uint32_t shard_count, size_t capacity_per_shard) {
-    if (shard_count == 0) shard_count = 1;
-    shard_count = sol_next_pow2_32(shard_count);
-    if (shard_count == 0) shard_count = 1;
-
-    snapshot_appendvec_index_t* idx = sol_calloc(1, sizeof(*idx));
-    if (!idx) return NULL;
-
-    idx->shard_count = (size_t)shard_count;
-    idx->shards = sol_calloc(idx->shard_count, sizeof(*idx->shards));
-    if (!idx->shards) {
-        sol_free(idx);
-        return NULL;
-    }
-
-    for (size_t i = 0; i < idx->shard_count; i++) {
-        if (pthread_mutex_init(&idx->shards[i].lock, NULL) != 0) {
-            for (size_t j = 0; j < i; j++) {
-                pthread_mutex_destroy(&idx->shards[j].lock);
-                sol_pubkey_map_destroy(idx->shards[j].map);
-            }
-            sol_free(idx->shards);
-            sol_free(idx);
-            return NULL;
-        }
-
-        idx->shards[i].map = sol_pubkey_map_new(sizeof(snapshot_appendvec_index_val_t), capacity_per_shard);
-        if (!idx->shards[i].map) {
-            pthread_mutex_destroy(&idx->shards[i].lock);
-            for (size_t j = 0; j < i; j++) {
-                pthread_mutex_destroy(&idx->shards[j].lock);
-                sol_pubkey_map_destroy(idx->shards[j].map);
-            }
-            sol_free(idx->shards);
-            sol_free(idx);
-            return NULL;
-        }
-    }
-
-    return idx;
-}
-
-static void
-snapshot_appendvec_index_destroy(snapshot_appendvec_index_t* idx) {
-    if (!idx) return;
-    if (idx->shards) {
-        for (size_t i = 0; i < idx->shard_count; i++) {
-            pthread_mutex_destroy(&idx->shards[i].lock);
-            sol_pubkey_map_destroy(idx->shards[i].map);
-        }
-        sol_free(idx->shards);
-    }
-    sol_free(idx);
-}
-
-SOL_INLINE size_t
-snapshot_appendvec_index_shard_for(const snapshot_appendvec_index_t* idx,
-                                   const sol_pubkey_t* pubkey) {
-    if (!idx || idx->shard_count == 0 || !pubkey) return 0;
-    uint64_t h = sol_load_u64_le(pubkey->bytes);
-    return (size_t)(h & (idx->shard_count - 1u));
-}
-
-static sol_err_t
-snapshot_appendvec_index_update(snapshot_appendvec_index_t* idx,
-                                const sol_pubkey_t* pubkey,
-                                sol_slot_t slot,
-                                uint64_t write_version,
-                                const sol_pubkey_t* owner,
-                                uint64_t lamports,
-                                uint64_t data_len,
-                                uint64_t file_key,
-                                uint64_t record_offset,
-                                const sol_hash_t* leaf_hash) {
-    if (!idx || !idx->shards || idx->shard_count == 0) return SOL_ERR_INVAL;
-    if (!pubkey) return SOL_ERR_INVAL;
-
-    snapshot_appendvec_index_val_t v = {0};
-    v.slot = (uint64_t)slot;
-    v.write_version = write_version;
-    v.file_key = file_key;
-    v.record_offset = record_offset;
-    v.lamports = lamports;
-    v.data_len = data_len;
-    if (owner) {
-        v.owner = *owner;
-    } else {
-        memset(v.owner.bytes, 0, sizeof(v.owner.bytes));
-    }
-    if (lamports != 0 && leaf_hash) {
-        v.leaf_hash = *leaf_hash;
-    } else {
-        memset(v.leaf_hash.bytes, 0, sizeof(v.leaf_hash.bytes));
-    }
-
-    size_t shard = snapshot_appendvec_index_shard_for(idx, pubkey);
-    snapshot_appendvec_index_shard_t* s = &idx->shards[shard];
-
-    pthread_mutex_lock(&s->lock);
-
-    snapshot_appendvec_index_val_t* cur =
-        (snapshot_appendvec_index_val_t*)sol_pubkey_map_get(s->map, pubkey);
-    if (cur) {
-        if (cur->write_version > write_version ||
-            (cur->write_version == write_version && cur->slot >= (uint64_t)slot)) {
-            pthread_mutex_unlock(&s->lock);
-            return SOL_OK;
-        }
-        *cur = v;
-        pthread_mutex_unlock(&s->lock);
-        return SOL_OK;
-    }
-
-    void* inserted = sol_pubkey_map_insert(s->map, pubkey, &v);
-    pthread_mutex_unlock(&s->lock);
-    return inserted ? SOL_OK : SOL_ERR_NOMEM;
 }
 
 typedef struct snapshot_stream_task {
@@ -3169,6 +3069,7 @@ typedef struct snapshot_stream_chunk_task {
 
 typedef struct {
     sol_accounts_db_t* accounts_db;
+    sol_io_ctx_t*      io_ctx;
     size_t             batch_capacity;
     size_t             max_bytes_queued;
     uint32_t           thread_count;
@@ -3177,7 +3078,7 @@ typedef struct {
      * in-memory and bulk-write it once after extraction completes. This avoids
      * generating billions of RocksDB merge operands during bootstrap. */
     bool                     defer_appendvec_index;
-    snapshot_appendvec_index_t* appendvec_index;
+    sol_appendvec_index_t* appendvec_index;
 
     /* When using AppendVec storage, streamed account files must be persisted to
      * disk so the stored (file_key,record_offset) references remain valid. */
@@ -3236,25 +3137,28 @@ snapshot_stream_set_err(snapshot_stream_accounts_ctx_t* ctx, sol_err_t err) {
                                      __ATOMIC_RELAXED);
 }
 
+static bool
+snapshot_stream_try_set_err(snapshot_stream_accounts_ctx_t* ctx, sol_err_t err) {
+    if (!ctx || err == SOL_OK) return false;
+    int expected = SOL_OK;
+    return __atomic_compare_exchange_n(&ctx->first_err,
+                                       &expected,
+                                       err,
+                                       false,
+                                       __ATOMIC_RELAXED,
+                                       __ATOMIC_RELAXED);
+}
+
 static sol_err_t
-snapshot_stream_write_all(int fd, const uint8_t* data, size_t len, uint64_t offset) {
+snapshot_stream_write_all(snapshot_stream_accounts_ctx_t* ctx,
+                          int fd,
+                          const uint8_t* data,
+                          size_t len,
+                          uint64_t offset) {
     if (fd < 0) return SOL_ERR_INVAL;
     if (len > 0 && !data) return SOL_ERR_INVAL;
 
-    size_t written = 0;
-    while (written < len) {
-        ssize_t n = pwrite(fd,
-                           data + written,
-                           len - written,
-                           (off_t)(offset + written));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return SOL_ERR_IO;
-        }
-        if (n == 0) return SOL_ERR_IO;
-        written += (size_t)n;
-    }
-    return SOL_OK;
+    return sol_io_pwrite_all(ctx ? ctx->io_ctx : NULL, fd, data, len, offset);
 }
 
 static sol_err_t
@@ -3273,7 +3177,7 @@ snapshot_stream_persist_file(snapshot_stream_accounts_ctx_t* ctx,
     int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
     if (fd < 0) return SOL_ERR_IO;
 
-    sol_err_t err = snapshot_stream_write_all(fd, data, len, 0);
+    sol_err_t err = snapshot_stream_write_all(ctx, fd, data, len, 0);
     close(fd);
     return err;
 }
@@ -3307,7 +3211,7 @@ snapshot_stream_persist_chunk(snapshot_stream_accounts_ctx_t* ctx,
     }
 
     if (len > 0) {
-        sol_err_t werr = snapshot_stream_write_all(ctx->persist_fd, data, len, file_offset);
+        sol_err_t werr = snapshot_stream_write_all(ctx, ctx->persist_fd, data, len, file_offset);
         if (werr != SOL_OK) return werr;
     }
 
@@ -3343,15 +3247,6 @@ snapshot_stream_accounts_file_cb(void* arg,
     if (!base || base[0] == '\0') {
         sol_free(data);
         return SOL_OK;
-    }
-
-    if (ctx->persist_accounts_files) {
-        sol_err_t perr = snapshot_stream_persist_file(ctx, base, data, len);
-        if (perr != SOL_OK) {
-            sol_free(data);
-            snapshot_stream_set_err(ctx, perr);
-            return perr;
-        }
     }
 
     snapshot_stream_task_t* t = sol_alloc(sizeof(*t));
@@ -3437,14 +3332,6 @@ snapshot_stream_accounts_chunk_cb(void* arg,
     base = base ? (base + 1) : rel_path;
     if (!base || base[0] == '\0') {
         return SOL_OK;
-    }
-
-    if (ctx->persist_accounts_files) {
-        sol_err_t perr = snapshot_stream_persist_chunk(ctx, base, data, len, file_offset, is_last);
-        if (perr != SOL_OK) {
-            snapshot_stream_set_err(ctx, perr);
-            return perr;
-        }
     }
 
     snapshot_stream_chunk_task_t* t = sol_alloc(sizeof(*t));
@@ -3605,14 +3492,19 @@ appendvec_stream_finalize(const appendvec_stream_t* s) {
 
 static sol_err_t
 appendvec_stream_feed(appendvec_stream_t* s,
+                      sol_accounts_db_t* accounts_db,
                       sol_accounts_db_bulk_writer_t* bulk,
-                      snapshot_appendvec_index_t* appendvec_index,
+                      sol_appendvec_index_t* appendvec_index,
                       const uint8_t* data,
                       size_t len,
                       uint64_t file_offset,
                       bool is_last,
                       uint64_t* out_loaded_delta) {
-    if (!s || (!bulk && !appendvec_index)) return SOL_ERR_INVAL;
+    /* `appendvec_stream_feed()` can write via:
+     * - deferred appendvec index updates, or
+     * - bulk writer (fast path for persistent backends), or
+     * - direct AccountsDB stores/deletes (fallback for in-memory tests). */
+    if (!s || (!bulk && !appendvec_index && !accounts_db)) return SOL_ERR_INVAL;
     if (len > 0 && !data) return SOL_ERR_INVAL;
     if (out_loaded_delta) *out_loaded_delta = 0;
 
@@ -3665,6 +3557,12 @@ appendvec_stream_feed(appendvec_stream_t* s,
                         s->stopped = true;
                         continue;
                     }
+                    if (buffer_is_all_zero(s->header_buf, s->record_size)) {
+                        /* Empty (all-zero) AppendVec file. */
+                        s->header_filled = 0;
+                        s->stopped = true;
+                        continue;
+                    }
                     return SOL_ERR_NOTFOUND;
                 }
 
@@ -3685,6 +3583,11 @@ appendvec_stream_feed(appendvec_stream_t* s,
                                                  s->layout,
                                                  &stored)) {
                     if (s->loaded > 0) {
+                        s->stopped = true;
+                        continue;
+                    }
+                    if (buffer_is_all_zero(p, s->record_size)) {
+                        /* Empty (all-zero) AppendVec file. */
                         s->stopped = true;
                         continue;
                     }
@@ -3732,7 +3635,7 @@ appendvec_stream_feed(appendvec_stream_t* s,
 
             if (s->skip_data) {
                 sol_err_t derr = appendvec_index
-                    ? snapshot_appendvec_index_update(appendvec_index,
+                    ? sol_appendvec_index_update(appendvec_index,
                                                       &s->stored.pubkey,
                                                       s->slot_hint,
                                                       s->stored.write_version,
@@ -3803,7 +3706,7 @@ appendvec_stream_feed(appendvec_stream_t* s,
                         sol_account_hash(&s->stored.pubkey, &account, &computed);
                         use_leaf = &computed;
                     }
-                    perr = snapshot_appendvec_index_update(appendvec_index,
+                    perr = sol_appendvec_index_update(appendvec_index,
                                                           &s->stored.pubkey,
                                                           s->slot_hint,
                                                           s->stored.write_version,
@@ -3910,9 +3813,9 @@ appendvec_stream_feed(appendvec_stream_t* s,
                 p += n;
                 remaining -= n;
 
-                if (s->data_remaining == 0) {
-                    sol_err_t perr = appendvec_index
-                        ? snapshot_appendvec_index_update(appendvec_index,
+                    if (s->data_remaining == 0) {
+                        sol_err_t perr = appendvec_index
+                        ? sol_appendvec_index_update(appendvec_index,
                                                           &s->stored.pubkey,
                                                           s->slot_hint,
                                                           s->stored.write_version,
@@ -4005,7 +3908,7 @@ appendvec_stream_feed(appendvec_stream_t* s,
                         use_leaf = &computed_leaf;
                     }
 
-                    perr = snapshot_appendvec_index_update(appendvec_index,
+                    perr = sol_appendvec_index_update(appendvec_index,
                                                           &s->stored.pubkey,
                                                           s->slot_hint,
                                                           s->stored.write_version,
@@ -4015,7 +3918,7 @@ appendvec_stream_feed(appendvec_stream_t* s,
                                                           s->file_key,
                                                           s->record_start,
                                                           use_leaf);
-                } else {
+                } else if (bulk) {
                     perr = s->appendvec_mode
                         ? sol_accounts_db_bulk_writer_put_snapshot_account(
                             bulk,
@@ -4042,6 +3945,29 @@ appendvec_stream_feed(appendvec_stream_t* s,
                             s->stored.rent_epoch,
                             s->slot_hint,
                             s->stored.write_version);
+                } else {
+                    /* Fallback when bulk writer is unavailable (e.g. in-memory AccountsDB). */
+                    if (s->stored.lamports == 0) {
+                        /* Snapshot storages use zero-lamport records as tombstones. */
+                        perr = sol_accounts_db_delete_versioned(accounts_db,
+                                                               &s->stored.pubkey,
+                                                               s->slot_hint,
+                                                               s->stored.write_version);
+                    } else {
+                        sol_account_t account = {0};
+                        account.meta.owner = s->stored.owner;
+                        account.meta.lamports = s->stored.lamports;
+                        account.meta.rent_epoch = s->stored.rent_epoch;
+                        account.meta.executable = s->stored.executable;
+                        account.meta.data_len = s->stored.data_len;
+                        account.data = s->data_buf;
+
+                        perr = sol_accounts_db_store_versioned(accounts_db,
+                                                              &s->stored.pubkey,
+                                                              &account,
+                                                              s->slot_hint,
+                                                              s->stored.write_version);
+                    }
                 }
                 if (perr != SOL_OK) return perr;
                 loaded_delta++;
@@ -4136,7 +4062,7 @@ appendvec_stream_feed(appendvec_stream_t* s,
                         use_leaf = &computed_leaf;
                     }
 
-                    perr = snapshot_appendvec_index_update(appendvec_index,
+                    perr = sol_appendvec_index_update(appendvec_index,
                                                           &s->stored.pubkey,
                                                           s->slot_hint,
                                                           s->stored.write_version,
@@ -4232,7 +4158,7 @@ snapshot_stream_accounts_chunk_worker(void* arg) {
     if (!ctx) return NULL;
 
     sol_accounts_db_bulk_writer_t* bulk = NULL;
-    snapshot_appendvec_index_t* appendvec_index = NULL;
+    sol_appendvec_index_t* appendvec_index = NULL;
 
     if (ctx->defer_appendvec_index) {
         appendvec_index = ctx->appendvec_index;
@@ -4246,29 +4172,28 @@ snapshot_stream_accounts_chunk_worker(void* arg) {
     } else {
         bulk = sol_accounts_db_bulk_writer_new(ctx->accounts_db, ctx->batch_capacity);
         if (!bulk) {
-            snapshot_stream_set_err(ctx, SOL_ERR_NOMEM);
-            __atomic_fetch_add(&ctx->done_threads, 1u, __ATOMIC_RELAXED);
-            return NULL;
-        }
+            /* Fallback: direct AccountsDB writes (e.g. in-memory backend in tests). */
+            (void)__atomic_store_n(&ctx->core_index_ok, 0, __ATOMIC_RELAXED);
+        } else {
+            sol_accounts_db_bulk_writer_set_use_merge(bulk, true);
+            if (ctx->max_bytes_queued > 0) {
+                sol_accounts_db_bulk_writer_set_max_bytes(bulk, ctx->max_bytes_queued);
+            }
 
-        sol_accounts_db_bulk_writer_set_use_merge(bulk, true);
-        if (ctx->max_bytes_queued > 0) {
-            sol_accounts_db_bulk_writer_set_max_bytes(bulk, ctx->max_bytes_queued);
-        }
+            if (sol_accounts_db_is_appendvec(ctx->accounts_db)) {
+                (void)sol_accounts_db_bulk_writer_set_write_owner_reverse(bulk, false);
+            }
 
-        if (sol_accounts_db_is_appendvec(ctx->accounts_db)) {
-            (void)sol_accounts_db_bulk_writer_set_write_owner_reverse(bulk, false);
-        }
-
-        if (__atomic_load_n(&ctx->core_index_ok, __ATOMIC_RELAXED) != 0) {
-            sol_err_t idx_err = sol_accounts_db_bulk_writer_set_write_owner_index(bulk, true);
-            if (idx_err == SOL_OK) {
-                sol_accounts_db_bulk_writer_set_write_owner_index_core_only(bulk, true);
-                if (!sol_accounts_db_bulk_writer_is_writing_owner_index(bulk)) {
+            if (__atomic_load_n(&ctx->core_index_ok, __ATOMIC_RELAXED) != 0) {
+                sol_err_t idx_err = sol_accounts_db_bulk_writer_set_write_owner_index(bulk, true);
+                if (idx_err == SOL_OK) {
+                    sol_accounts_db_bulk_writer_set_write_owner_index_core_only(bulk, true);
+                    if (!sol_accounts_db_bulk_writer_is_writing_owner_index(bulk)) {
+                        (void)__atomic_store_n(&ctx->core_index_ok, 0, __ATOMIC_RELAXED);
+                    }
+                } else {
                     (void)__atomic_store_n(&ctx->core_index_ok, 0, __ATOMIC_RELAXED);
                 }
-            } else {
-                (void)__atomic_store_n(&ctx->core_index_ok, 0, __ATOMIC_RELAXED);
             }
         }
     }
@@ -4336,8 +4261,24 @@ snapshot_stream_accounts_chunk_worker(void* arg) {
             break;
         }
 
+        if (ctx->persist_accounts_files) {
+            sol_err_t perr = snapshot_stream_persist_chunk(ctx,
+                                                          t->file_name,
+                                                          t->data,
+                                                          t->len,
+                                                          t->file_offset,
+                                                          t->is_last);
+            if (perr != SOL_OK) {
+                snapshot_stream_set_err(ctx, perr);
+                sol_free(t->data);
+                sol_free(t);
+                break;
+            }
+        }
+
         uint64_t loaded_delta = 0;
         sol_err_t load_err = appendvec_stream_feed(&stream,
+                                                   ctx->accounts_db,
                                                    bulk,
                                                    appendvec_index,
                                                    t->data,
@@ -4349,7 +4290,15 @@ snapshot_stream_accounts_chunk_worker(void* arg) {
             load_err = SOL_ERR_SNAPSHOT_CORRUPT;
         }
         if (load_err != SOL_OK) {
-            snapshot_stream_set_err(ctx, load_err);
+            if (snapshot_stream_try_set_err(ctx, load_err)) {
+                sol_log_error("Snapshot ingest: chunk parse failed (%s): file=%s file_off=%lu chunk_len=%zu file_size=%lu is_last=%d",
+                              sol_err_str(load_err),
+                              t->file_name,
+                              (unsigned long)t->file_offset,
+                              t->len,
+                              (unsigned long)t->file_size,
+                              (int)t->is_last);
+            }
         }
 
         if (loaded_delta > 0) {
@@ -4406,7 +4355,7 @@ snapshot_stream_accounts_worker(void* arg) {
     if (!ctx) return NULL;
 
     sol_accounts_db_bulk_writer_t* bulk = NULL;
-    snapshot_appendvec_index_t* appendvec_index = NULL;
+    sol_appendvec_index_t* appendvec_index = NULL;
 
     if (ctx->defer_appendvec_index) {
         appendvec_index = ctx->appendvec_index;
@@ -4420,29 +4369,28 @@ snapshot_stream_accounts_worker(void* arg) {
     } else {
         bulk = sol_accounts_db_bulk_writer_new(ctx->accounts_db, ctx->batch_capacity);
         if (!bulk) {
-            snapshot_stream_set_err(ctx, SOL_ERR_NOMEM);
-            __atomic_fetch_add(&ctx->done_threads, 1u, __ATOMIC_RELAXED);
-            return NULL;
-        }
+            /* Fallback: direct AccountsDB writes (e.g. in-memory backend in tests). */
+            (void)__atomic_store_n(&ctx->core_index_ok, 0, __ATOMIC_RELAXED);
+        } else {
+            sol_accounts_db_bulk_writer_set_use_merge(bulk, true);
+            if (ctx->max_bytes_queued > 0) {
+                sol_accounts_db_bulk_writer_set_max_bytes(bulk, ctx->max_bytes_queued);
+            }
 
-        sol_accounts_db_bulk_writer_set_use_merge(bulk, true);
-        if (ctx->max_bytes_queued > 0) {
-            sol_accounts_db_bulk_writer_set_max_bytes(bulk, ctx->max_bytes_queued);
-        }
+            if (sol_accounts_db_is_appendvec(ctx->accounts_db)) {
+                (void)sol_accounts_db_bulk_writer_set_write_owner_reverse(bulk, false);
+            }
 
-        if (sol_accounts_db_is_appendvec(ctx->accounts_db)) {
-            (void)sol_accounts_db_bulk_writer_set_write_owner_reverse(bulk, false);
-        }
-
-        if (__atomic_load_n(&ctx->core_index_ok, __ATOMIC_RELAXED) != 0) {
-            sol_err_t idx_err = sol_accounts_db_bulk_writer_set_write_owner_index(bulk, true);
-            if (idx_err == SOL_OK) {
-                sol_accounts_db_bulk_writer_set_write_owner_index_core_only(bulk, true);
-                if (!sol_accounts_db_bulk_writer_is_writing_owner_index(bulk)) {
+            if (__atomic_load_n(&ctx->core_index_ok, __ATOMIC_RELAXED) != 0) {
+                sol_err_t idx_err = sol_accounts_db_bulk_writer_set_write_owner_index(bulk, true);
+                if (idx_err == SOL_OK) {
+                    sol_accounts_db_bulk_writer_set_write_owner_index_core_only(bulk, true);
+                    if (!sol_accounts_db_bulk_writer_is_writing_owner_index(bulk)) {
+                        (void)__atomic_store_n(&ctx->core_index_ok, 0, __ATOMIC_RELAXED);
+                    }
+                } else {
                     (void)__atomic_store_n(&ctx->core_index_ok, 0, __ATOMIC_RELAXED);
                 }
-            } else {
-                (void)__atomic_store_n(&ctx->core_index_ok, 0, __ATOMIC_RELAXED);
             }
         }
     }
@@ -4476,6 +4424,16 @@ snapshot_stream_accounts_worker(void* arg) {
             continue;
         }
 
+        if (ctx->persist_accounts_files) {
+            sol_err_t perr = snapshot_stream_persist_file(ctx, t->file_name, t->data, t->len);
+            if (perr != SOL_OK) {
+                snapshot_stream_set_err(ctx, perr);
+                sol_free(t->data);
+                sol_free(t);
+                break;
+            }
+        }
+
         sol_slot_t file_slot = 0;
         if (strcmp(t->file_name, "storage.bin") == 0) {
             file_slot = 0;
@@ -4501,11 +4459,19 @@ snapshot_stream_accounts_worker(void* arg) {
                                                                bulk,
                                                                appendvec_index,
                                                                &loaded);
+        sol_err_t load_err_raw = load_err;
         if (load_err == SOL_ERR_NOTFOUND) {
             load_err = SOL_ERR_SNAPSHOT_CORRUPT;
         }
         if (load_err != SOL_OK) {
-            snapshot_stream_set_err(ctx, load_err);
+            if (snapshot_stream_try_set_err(ctx, load_err)) {
+                sol_log_error("Snapshot ingest: storage parse failed (%s): file=%s slot=%lu size=%zu (raw=%s)",
+                              sol_err_str(load_err),
+                              t->file_name,
+                              (unsigned long)file_slot,
+                              t->len,
+                              sol_err_str(load_err_raw));
+            }
         }
 
         if (loaded > 0) {
@@ -4630,7 +4596,7 @@ snapshot_stream_accounts_enabled(void) {
 }
 
 typedef struct {
-    const snapshot_appendvec_index_t* idx;
+    const sol_appendvec_index_t* idx;
     sol_accounts_db_t*               accounts_db;
     size_t                          batch_capacity;
     size_t                          max_bytes_queued;
@@ -4710,7 +4676,7 @@ snapshot_appendvec_index_flush_worker(void* arg) {
             }
             if (!key || !val) continue;
 
-            snapshot_appendvec_index_val_t* v = (snapshot_appendvec_index_val_t*)val;
+            sol_appendvec_index_val_t* v = (sol_appendvec_index_val_t*)val;
             if (v->lamports == 0 || sol_hash_is_zero(&v->leaf_hash)) {
                 /* Zero-lamport accounts (tombstones) must be written as deletes
                    to the DB so that stale entries from the full snapshot are
@@ -4771,7 +4737,7 @@ snapshot_appendvec_index_flush_worker(void* arg) {
 }
 
 static sol_err_t
-snapshot_appendvec_index_flush(snapshot_appendvec_index_t* idx,
+snapshot_appendvec_index_flush(sol_appendvec_index_t* idx,
                                sol_accounts_db_t* accounts_db,
                                size_t batch_capacity,
                                size_t max_bytes_queued,
@@ -4906,6 +4872,7 @@ static sol_err_t
 load_accounts_from_archive_streaming(const char* archive_path,
                                      const char* output_dir,
                                      sol_accounts_db_t* accounts_db,
+                                     sol_io_ctx_t* io_ctx,
                                      uint32_t thread_count,
                                      size_t batch_capacity,
                                      size_t max_bytes_queued,
@@ -4918,6 +4885,7 @@ load_accounts_from_archive_streaming(const char* archive_path,
 
     snapshot_stream_accounts_ctx_t ctx = {0};
     ctx.accounts_db = accounts_db;
+    ctx.io_ctx = io_ctx;
     ctx.batch_capacity = batch_capacity ? batch_capacity : 16384;
     ctx.max_bytes_queued = max_bytes_queued;
     ctx.first_err = SOL_OK;
@@ -4949,7 +4917,7 @@ load_accounts_from_archive_streaming(const char* archive_path,
             sol_log_warn("Snapshot ingest: deferred AppendVec index requested but no safe default capacity could be derived; "
                          "set SOL_SNAPSHOT_DEFER_APPENDVEC_INDEX_CAPACITY_PER_SHARD to enable. Falling back to RocksDB merge ingestion.");
         } else {
-            ctx.appendvec_index = snapshot_appendvec_index_new(shards, cap);
+            ctx.appendvec_index = sol_appendvec_index_new(shards, cap);
             if (ctx.appendvec_index) {
                 ctx.defer_appendvec_index = true;
                 sol_log_info("Snapshot ingest: deferring AppendVec index writes (shards=%u, cap/shard=%zu)",
@@ -4969,7 +4937,9 @@ load_accounts_from_archive_streaming(const char* archive_path,
     if (env_qmax > 0) qmax = env_qmax;
     ctx.queue_max = qmax;
 
-    size_t queue_max_bytes = max_bytes_queued ? (max_bytes_queued * 2u) : (512u * 1024u * 1024u);
+    /* Allow a few batches worth of buffering so the archive reader doesn't
+     * frequently stall on backpressure when ingestion experiences write hiccups. */
+    size_t queue_max_bytes = max_bytes_queued ? (max_bytes_queued * 4u) : (512u * 1024u * 1024u);
     size_t env_queue_mb = snapshot_env_size_t("SOL_SNAPSHOT_STREAM_QUEUE_MAX_MB", 64u, 131072u);
     if (env_queue_mb > 0) queue_max_bytes = env_queue_mb * 1024u * 1024u;
     size_t queue_min_bytes = 256u * 1024u * 1024u;
@@ -4985,7 +4955,7 @@ load_accounts_from_archive_streaming(const char* archive_path,
     if (env_chunk_qmax > 0) chunk_qmax = env_chunk_qmax;
     ctx.chunk_queue_max = chunk_qmax;
 
-    size_t chunk_max_bytes = max_bytes_queued ? (max_bytes_queued * 2u) : (512u * 1024u * 1024u);
+    size_t chunk_max_bytes = max_bytes_queued ? (max_bytes_queued * 4u) : (512u * 1024u * 1024u);
     size_t env_chunk_max_mb = snapshot_env_size_t("SOL_SNAPSHOT_STREAM_CHUNK_MAX_MB", 64u, 131072u);
     if (env_chunk_max_mb > 0) chunk_max_bytes = env_chunk_max_mb * 1024u * 1024u;
     size_t chunk_min_bytes = 128u * 1024u * 1024u;
@@ -5071,6 +5041,7 @@ load_accounts_from_archive_streaming(const char* archive_path,
     sol_archive_extract_opts_t opts = SOL_ARCHIVE_EXTRACT_OPTS_DEFAULT;
     opts.output_dir = output_dir;
     opts.verify = false;
+    opts.io_ctx = io_ctx;
     opts.stream_prefix = "accounts/";
     opts.stream_file_callback = snapshot_stream_accounts_file_cb;
     opts.stream_chunk_callback = snapshot_stream_accounts_chunk_cb;
@@ -5165,10 +5136,13 @@ load_accounts_from_archive_streaming(const char* archive_path,
             core_ok = 0;
         } else {
             core_ok = flush_core_ok;
+            /* Retain the in-memory index for runtime account loads. */
+            sol_accounts_db_adopt_appendvec_index(accounts_db, ctx.appendvec_index);
+            ctx.appendvec_index = NULL;
         }
     }
 
-    snapshot_appendvec_index_destroy(ctx.appendvec_index);
+    sol_appendvec_index_destroy(ctx.appendvec_index);
     ctx.appendvec_index = NULL;
     ctx.defer_appendvec_index = false;
 
@@ -5982,14 +5956,15 @@ apply_incremental_snapshot_to_accounts_db(sol_snapshot_mgr_t* mgr,
                 bulk_load_mode = true;
             }
 
-            err = load_accounts_from_archive_streaming(incremental_archive_path,
-                                                       snapshot_dir,
-                                                       accounts_db,
-                                                       load_threads,
-                                                       bulk_batch,
-                                                       max_bytes_per_thread,
-                                                       &streamed,
-                                                       NULL);
+	            err = load_accounts_from_archive_streaming(incremental_archive_path,
+	                                                       snapshot_dir,
+	                                                       accounts_db,
+	                                                       mgr->config.io_ctx,
+	                                                       load_threads,
+	                                                       bulk_batch,
+	                                                       max_bytes_per_thread,
+	                                                       &streamed,
+	                                                       NULL);
 
             if (wal_disabled) {
                 (void)sol_accounts_db_set_disable_wal(accounts_db, false);
@@ -6011,6 +5986,7 @@ apply_incremental_snapshot_to_accounts_db(sol_snapshot_mgr_t* mgr,
             sol_archive_extract_opts_t opts = SOL_ARCHIVE_EXTRACT_OPTS_DEFAULT;
             opts.output_dir = snapshot_dir;
             opts.verify = false;
+            opts.io_ctx = mgr ? mgr->config.io_ctx : NULL;
             err = sol_snapshot_archive_extract(incremental_archive_path, &opts);
             if (err != SOL_OK) {
                 if (cleanup_extracted) {
@@ -6227,11 +6203,33 @@ apply_incremental_snapshot_to_accounts_db(sol_snapshot_mgr_t* mgr,
         sol_bank_set_blockhash(bank, &snapshot_blockhash);
     }
 
+    if (!accounts_lt_hash_valid) {
+        /* The bank snapshot format does not always carry the full Accounts LtHash.
+         * Without it, the first post-snapshot slot may stall while replay
+         * computes a full LtHash recompute in the hot path. Prefer doing that
+         * work here during bootstrap. */
+        sol_log_warn("No accounts LtHash available for snapshot slot %lu; computing from accounts DB (one-time)",
+                     (unsigned long)info.slot);
+
+        struct timespec ts0;
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        if (sol_bank_get_accounts_lt_hash(bank, &accounts_lt_hash)) {
+            accounts_lt_hash_valid = true;
+            struct timespec ts1;
+            clock_gettime(CLOCK_MONOTONIC, &ts1);
+            double dt =
+                (double)(ts1.tv_sec - ts0.tv_sec) +
+                (double)(ts1.tv_nsec - ts0.tv_nsec) / 1000000000.0;
+            sol_log_info("Computed snapshot Accounts LtHash (slot=%lu) in %.2fs",
+                         (unsigned long)info.slot, dt);
+        } else {
+            sol_log_warn("Failed to compute Accounts LtHash for snapshot slot %lu; replay/bank-hash may be slow",
+                         (unsigned long)info.slot);
+        }
+    }
+
     if (accounts_lt_hash_valid) {
         sol_bank_set_accounts_lt_hash(bank, &accounts_lt_hash);
-    } else {
-        sol_log_warn("No accounts LtHash available for snapshot slot %lu; replay/bank-hash may be slow",
-                     (unsigned long)info.slot);
     }
 
     sol_bank_freeze(bank);
@@ -6386,6 +6384,9 @@ sol_snapshot_load_with_accounts_db_config(sol_snapshot_mgr_t* mgr,
      * directly from the archive (avoids writing hundreds of GB to disk). */
     sol_accounts_db_t* accounts_db = sol_accounts_db_new(accounts_db_config);
     if (!accounts_db) return SOL_ERR_NOMEM;
+    if (mgr && mgr->config.io_ctx) {
+        sol_accounts_db_set_io_ctx(accounts_db, mgr->config.io_ctx);
+    }
 
     bool accounts_loaded_from_archive = false;
     uint64_t total_accounts = 0;
@@ -6437,14 +6438,15 @@ sol_snapshot_load_with_accounts_db_config(sol_snapshot_mgr_t* mgr,
                 bulk_load_mode = true;
             }
 
-	            err = load_accounts_from_archive_streaming(archive_path,
-	                                                       snapshot_dir,
-	                                                       accounts_db,
-	                                                       load_threads,
-	                                                       bulk_batch,
-	                                                       max_bytes_per_thread,
-	                                                       &total_accounts,
-	                                                       &core_index_ok);
+		            err = load_accounts_from_archive_streaming(archive_path,
+		                                                       snapshot_dir,
+		                                                       accounts_db,
+		                                                       mgr->config.io_ctx,
+		                                                       load_threads,
+		                                                       bulk_batch,
+		                                                       max_bytes_per_thread,
+		                                                       &total_accounts,
+		                                                       &core_index_ok);
 
             if (wal_disabled) {
                 (void)sol_accounts_db_set_disable_wal(accounts_db, false);
@@ -6464,6 +6466,7 @@ sol_snapshot_load_with_accounts_db_config(sol_snapshot_mgr_t* mgr,
             sol_archive_extract_opts_t opts = SOL_ARCHIVE_EXTRACT_OPTS_DEFAULT;
             opts.output_dir = snapshot_dir;
             opts.verify = false;
+            opts.io_ctx = mgr ? mgr->config.io_ctx : NULL;
             err = sol_snapshot_archive_extract(archive_path, &opts);
         }
 
@@ -6756,6 +6759,27 @@ sol_snapshot_load_with_accounts_db_config(sol_snapshot_mgr_t* mgr,
         sol_bank_set_blockhash(bank, &snapshot_blockhash);
     }
 
+    if (!accounts_lt_hash_valid) {
+        sol_log_warn("No accounts LtHash available for snapshot slot %lu; computing from accounts DB (one-time)",
+                     (unsigned long)info.slot);
+
+        struct timespec ts0;
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+        if (sol_bank_get_accounts_lt_hash(bank, &accounts_lt_hash)) {
+            accounts_lt_hash_valid = true;
+            struct timespec ts1;
+            clock_gettime(CLOCK_MONOTONIC, &ts1);
+            double dt =
+                (double)(ts1.tv_sec - ts0.tv_sec) +
+                (double)(ts1.tv_nsec - ts0.tv_nsec) / 1000000000.0;
+            sol_log_info("Computed snapshot Accounts LtHash (slot=%lu) in %.2fs",
+                         (unsigned long)info.slot, dt);
+        } else {
+            sol_log_warn("Failed to compute Accounts LtHash for snapshot slot %lu; replay/bank-hash may be slow",
+                         (unsigned long)info.slot);
+        }
+    }
+
     if (accounts_lt_hash_valid) {
         sol_bank_set_accounts_lt_hash(bank, &accounts_lt_hash);
         if (sol_log_get_level() <= SOL_LOG_DEBUG) {
@@ -6767,9 +6791,6 @@ sol_snapshot_load_with_accounts_db_config(sol_snapshot_mgr_t* mgr,
             (void)sol_hash_to_hex(&checksum_hash, hex, sizeof(hex));
             sol_log_debug("Snapshot accounts LtHash checksum: %s", hex);
         }
-    } else {
-        sol_log_warn("No accounts LtHash available for snapshot slot %lu; replay/bank-hash may be slow",
-                     (unsigned long)info.slot);
     }
 
     sol_bank_freeze(bank);

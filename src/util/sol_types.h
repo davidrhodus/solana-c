@@ -219,6 +219,7 @@ typedef struct {
 typedef struct {
     sol_account_meta_t  meta;
     uchar*              data;       /* Account data (may be NULL if data_len == 0) */
+    bool                data_borrowed; /* If true, `data` is a non-owning view and must NOT be freed */
 } sol_account_t;
 
 /*

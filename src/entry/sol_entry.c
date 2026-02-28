@@ -30,18 +30,21 @@ sol_entry_cleanup(sol_entry_t* entry) {
     if (!entry) return;
 
     sol_free(entry->transactions);
-    sol_free(entry->raw_data);
+    if (entry->raw_data && !entry->raw_data_borrowed) {
+        sol_free(entry->raw_data);
+    }
 
     entry->transactions = NULL;
     entry->raw_data = NULL;
     entry->num_transactions = 0;
     entry->transactions_capacity = 0;
     entry->raw_data_len = 0;
+    entry->raw_data_borrowed = false;
 }
 
 sol_err_t
-sol_entry_parse(sol_entry_t* entry, const uint8_t* data, size_t len,
-                size_t* bytes_consumed) {
+sol_entry_parse_ex(sol_entry_t* entry, const uint8_t* data, size_t len,
+                   size_t* bytes_consumed, bool copy_tx_bytes) {
     if (!entry || !data || !bytes_consumed) {
         return SOL_ERR_INVAL;
     }
@@ -73,70 +76,106 @@ sol_entry_parse(sol_entry_t* entry, const uint8_t* data, size_t len,
     /* Allocate transaction array if needed */
     if (num_txns > 0) {
         if (num_txns > entry->transactions_capacity) {
-            sol_free(entry->transactions);
-            entry->transactions = sol_calloc(num_txns, sizeof(sol_transaction_t));
-            if (!entry->transactions) return SOL_ERR_NOMEM;
-            entry->transactions_capacity = num_txns;
+            size_t alloc_sz = 0;
+            if (__builtin_mul_overflow((size_t)num_txns, sizeof(sol_transaction_t), &alloc_sz)) {
+                return SOL_ERR_TOO_LARGE;
+            }
+
+            sol_transaction_t* txs = sol_realloc(entry->transactions, alloc_sz);
+            if (!txs) return SOL_ERR_NOMEM;
+            entry->transactions = txs;
+            entry->transactions_capacity = (size_t)num_txns;
         }
 
-        /* First pass: calculate total transaction data size */
-        size_t txn_data_start = offset;
-        size_t temp_offset = offset;
+        if (copy_tx_bytes) {
+            /* First pass: calculate total transaction data size */
+            size_t txn_data_start = offset;
+            size_t temp_offset = offset;
 
-        for (uint64_t i = 0; i < num_txns; i++) {
-            if (temp_offset >= len) return SOL_ERR_TRUNCATED;
+            for (uint64_t i = 0; i < num_txns; i++) {
+                if (temp_offset >= len) return SOL_ERR_TRUNCATED;
 
-            /* Parse transaction to get its size */
-            sol_transaction_t temp_tx;
-            sol_transaction_init(&temp_tx);
+                /* Parse transaction to get its size */
+                sol_transaction_t temp_tx;
 
-            sol_err_t err = sol_transaction_decode(data + temp_offset,
-                                                   len - temp_offset, &temp_tx);
-            if (err != SOL_OK) {
-                return err;
+                sol_err_t err = sol_transaction_decode(data + temp_offset,
+                                                       len - temp_offset, &temp_tx);
+                if (err != SOL_OK) {
+                    return err;
+                }
+
+                size_t txn_size = temp_tx.encoded_len;
+                if (txn_size == 0 || txn_size > (len - temp_offset)) {
+                    return SOL_ERR_TX_MALFORMED;
+                }
+                temp_offset += txn_size;
             }
 
-            size_t txn_size = temp_tx.encoded_len;
-            if (txn_size == 0 || txn_size > (len - temp_offset)) {
-                return SOL_ERR_TX_MALFORMED;
+            size_t txn_data_len = temp_offset - txn_data_start;
+
+            /* Allocate and copy raw transaction data */
+            sol_free(entry->raw_data);
+            entry->raw_data = sol_alloc(txn_data_len);
+            if (!entry->raw_data) return SOL_ERR_NOMEM;
+            memcpy(entry->raw_data, data + txn_data_start, txn_data_len);
+            entry->raw_data_len = txn_data_len;
+            entry->raw_data_borrowed = false;
+
+            /* Parse transactions from our copy */
+            size_t raw_offset = 0;
+            for (uint64_t i = 0; i < num_txns; i++) {
+                sol_err_t err = sol_transaction_decode(entry->raw_data + raw_offset,
+                                                       txn_data_len - raw_offset,
+                                                       &entry->transactions[i]);
+                if (err != SOL_OK) {
+                    return err;
+                }
+
+                size_t txn_size = entry->transactions[i].encoded_len;
+                if (txn_size == 0 || txn_size > (txn_data_len - raw_offset)) {
+                    return SOL_ERR_TX_MALFORMED;
+                }
+                raw_offset += txn_size;
             }
-            temp_offset += txn_size;
+
+            offset = temp_offset;
+        } else {
+            /* Zero-copy parse: borrow transaction bytes directly from the input
+               buffer and decode each transaction once. */
+            size_t txn_data_start = offset;
+
+            for (uint64_t i = 0; i < num_txns; i++) {
+                if (offset >= len) return SOL_ERR_TRUNCATED;
+
+                sol_err_t err = sol_transaction_decode(data + offset,
+                                                       len - offset,
+                                                       &entry->transactions[i]);
+                if (err != SOL_OK) {
+                    return err;
+                }
+
+                size_t txn_size = entry->transactions[i].encoded_len;
+                if (txn_size == 0 || txn_size > (len - offset)) {
+                    return SOL_ERR_TX_MALFORMED;
+                }
+                offset += txn_size;
+            }
+
+            entry->raw_data = (uint8_t*)(uintptr_t)(data + txn_data_start);
+            entry->raw_data_len = offset - txn_data_start;
+            entry->raw_data_borrowed = true;
         }
-
-        size_t txn_data_len = temp_offset - txn_data_start;
-
-        /* Allocate and copy raw transaction data */
-        sol_free(entry->raw_data);
-        entry->raw_data = sol_alloc(txn_data_len);
-        if (!entry->raw_data) return SOL_ERR_NOMEM;
-        memcpy(entry->raw_data, data + txn_data_start, txn_data_len);
-        entry->raw_data_len = txn_data_len;
-
-        /* Parse transactions from our copy */
-        size_t raw_offset = 0;
-        for (uint64_t i = 0; i < num_txns; i++) {
-            sol_transaction_init(&entry->transactions[i]);
-
-            sol_err_t err = sol_transaction_decode(entry->raw_data + raw_offset,
-                                                   txn_data_len - raw_offset,
-                                                   &entry->transactions[i]);
-            if (err != SOL_OK) {
-                return err;
-            }
-
-            size_t txn_size = entry->transactions[i].encoded_len;
-            if (txn_size == 0 || txn_size > (txn_data_len - raw_offset)) {
-                return SOL_ERR_TX_MALFORMED;
-            }
-            raw_offset += txn_size;
-        }
-
-        offset = temp_offset;
     }
 
     entry->num_transactions = (uint32_t)num_txns;
     *bytes_consumed = offset;
     return SOL_OK;
+}
+
+sol_err_t
+sol_entry_parse(sol_entry_t* entry, const uint8_t* data, size_t len,
+                size_t* bytes_consumed) {
+    return sol_entry_parse_ex(entry, data, len, bytes_consumed, true);
 }
 
 sol_err_t
@@ -197,6 +236,35 @@ hash_intermediate(const sol_hash_t* left, const sol_hash_t* right, sol_hash_t* o
     sol_sha256_final_bytes(&ctx, out->bytes);
 }
 
+typedef struct {
+    sol_hash_t* hashes;
+    size_t      cap;
+} entry_merkle_scratch_t;
+
+static __thread entry_merkle_scratch_t g_tls_entry_merkle_scratch = {0};
+
+static sol_hash_t*
+entry_merkle_scratch_ensure(size_t need) {
+    if (need == 0) return NULL;
+    entry_merkle_scratch_t* sc = &g_tls_entry_merkle_scratch;
+    if (sc->hashes && sc->cap >= need) return sc->hashes;
+
+    size_t new_cap = sc->cap ? sc->cap : 64u;
+    while (new_cap < need) {
+        if (new_cap > (SIZE_MAX / 2u)) {
+            new_cap = need;
+            break;
+        }
+        new_cap *= 2u;
+    }
+
+    sol_hash_t* next = sol_realloc_array(sol_hash_t, sc->hashes, new_cap);
+    if (!next) return NULL;
+    sc->hashes = next;
+    sc->cap = new_cap;
+    return sc->hashes;
+}
+
 void
 sol_entry_transaction_merkle_root(const sol_entry_t* entry, sol_hash_t* out_root) {
     if (!entry || !out_root) return;
@@ -228,7 +296,24 @@ sol_entry_transaction_merkle_root(const sol_entry_t* entry, sol_hash_t* out_root
         return;
     }
 
-    sol_hash_t* hashes = sol_alloc(sig_total * sizeof(sol_hash_t));
+    if (sig_total == 1) {
+        /* Common case: single signature -> root is the leaf hash. */
+        const sol_signature_t* sig = NULL;
+        for (uint32_t ti = 0; ti < entry->num_transactions && !sig; ti++) {
+            const sol_transaction_t* tx = &entry->transactions[ti];
+            if (tx->signatures && tx->signatures_len > 0) {
+                sig = &tx->signatures[0];
+            }
+        }
+        if (!sig) {
+            memset(out_root->bytes, 0, 32);
+            return;
+        }
+        hash_leaf_signature(sig, out_root);
+        return;
+    }
+
+    sol_hash_t* hashes = entry_merkle_scratch_ensure(sig_total);
     if (!hashes) {
         memset(out_root->bytes, 0, 32);
         return;
@@ -242,12 +327,12 @@ sol_entry_transaction_merkle_root(const sol_entry_t* entry, sol_hash_t* out_root
         }
     }
 
-    uint32_t level_size = (uint32_t)sig_total;
+    size_t level_size = sig_total;
     while (level_size > 1) {
-        uint32_t next_size = (level_size + 1u) / 2u;
-        for (uint32_t i = 0; i < next_size; i++) {
-            uint32_t left = i * 2u;
-            uint32_t right = left + 1u;
+        size_t next_size = (level_size + 1u) / 2u;
+        for (size_t i = 0; i < next_size; i++) {
+            size_t left = i * 2u;
+            size_t right = left + 1u;
             if (right >= level_size) right = left; /* duplicate */
             hash_intermediate(&hashes[left], &hashes[right], &hashes[i]);
         }
@@ -255,7 +340,6 @@ sol_entry_transaction_merkle_root(const sol_entry_t* entry, sol_hash_t* out_root
     }
 
     *out_root = hashes[0];
-    sol_free(hashes);
 }
 
 void
@@ -274,9 +358,7 @@ sol_entry_compute_hash(const sol_entry_t* entry, const sol_hash_t* prev_hash,
     sol_hash_t current = *prev_hash;
 
     if (entry->num_transactions == 0) {
-        for (uint64_t i = 0; i < entry->num_hashes; i++) {
-            sol_sha256_32bytes(current.bytes, current.bytes);
-        }
+        sol_sha256_32bytes_repeated(current.bytes, entry->num_hashes);
         *out_hash = current;
         return;
     }
@@ -290,9 +372,7 @@ sol_entry_compute_hash(const sol_entry_t* entry, const sol_hash_t* prev_hash,
     sol_entry_transaction_merkle_root(entry, &mixin);
 
     uint64_t hashes_before_record = entry->num_hashes ? (entry->num_hashes - 1) : 0;
-    for (uint64_t i = 0; i < hashes_before_record; i++) {
-        sol_sha256_32bytes(current.bytes, current.bytes);
-    }
+    sol_sha256_32bytes_repeated(current.bytes, hashes_before_record);
 
     sol_sha256_ctx_t ctx;
     sol_sha256_init(&ctx);
@@ -359,7 +439,7 @@ sol_entry_batch_destroy(sol_entry_batch_t* batch) {
 }
 
 sol_err_t
-sol_entry_batch_parse(sol_entry_batch_t* batch, const uint8_t* data, size_t len) {
+sol_entry_batch_parse_ex(sol_entry_batch_t* batch, const uint8_t* data, size_t len, bool copy_tx_bytes) {
     if (!batch || !data) return SOL_ERR_INVAL;
 
     /* Clean up any existing entries if the batch is being reused. */
@@ -396,12 +476,16 @@ sol_entry_batch_parse(sol_entry_batch_t* batch, const uint8_t* data, size_t len)
         offset += 8;
 
         if (entry_count == 0) {
-            /* Empty vec / padding. In practice, Merkle shreds often pad each
-             * erasure batch (FEC set) with zeros up to a fixed boundary, so the
-             * next Vec<Entry> segment may not start at an 8-byte aligned offset
-             * relative to the end of the previous segment. Slide forward to
-             * resynchronize. */
-            if ((segment_start & 7u) != 0u) {
+            /* Empty vec / padding.
+             *
+             * On mainnet, DATA_COMPLETE boundaries (end-of-FEC-set) are often
+             * padded with zeros. The next Vec<Entry> header is not guaranteed
+             * to be 8-byte aligned relative to the end of the previous segment,
+             * so once we've successfully parsed at least one segment, scan
+             * forward byte-by-byte to resynchronize. */
+            if (parsed_any_segment) {
+                offset = segment_start + 1u;
+            } else if ((segment_start & 7u) != 0u) {
                 offset = segment_start + 1u;
             }
             continue;
@@ -450,7 +534,7 @@ sol_entry_batch_parse(sol_entry_batch_t* batch, const uint8_t* data, size_t len)
 
             /* Parse entry */
             size_t consumed = 0;
-            segment_err = sol_entry_parse(entry, data + offset, len - offset, &consumed);
+            segment_err = sol_entry_parse_ex(entry, data + offset, len - offset, &consumed, copy_tx_bytes);
             if (segment_err != SOL_OK) {
                 sol_entry_cleanup(entry);
                 break;
@@ -497,7 +581,13 @@ sol_entry_batch_parse(sol_entry_batch_t* batch, const uint8_t* data, size_t len)
                 break;
             }
 
-            return segment_err;
+            /* Resync: segment parsing failed but we've already successfully
+             * parsed earlier segments. This can happen when padding between
+             * Vec<Entry> segments is shorter than the 8-byte length prefix,
+             * causing a straddled u64 read and a bogus entry_count. Slide
+             * forward and keep scanning for the next segment header. */
+            offset = segment_start + 1u;
+            continue;
         }
 
         parsed_any_segment = true;
@@ -525,6 +615,11 @@ sol_entry_batch_parse(sol_entry_batch_t* batch, const uint8_t* data, size_t len)
     }
 
     return SOL_OK;
+}
+
+sol_err_t
+sol_entry_batch_parse(sol_entry_batch_t* batch, const uint8_t* data, size_t len) {
+    return sol_entry_batch_parse_ex(batch, data, len, true);
 }
 
 sol_entry_verify_result_t

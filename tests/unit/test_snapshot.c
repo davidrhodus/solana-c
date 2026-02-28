@@ -1623,6 +1623,106 @@ TEST(snapshot_load_archive_persists_appendvec_accounts_files) {
 #endif
 }
 
+TEST(snapshot_load_archive_all_zero_large_appendvec_file_ok) {
+#if !defined(SOL_HAS_ZSTD)
+    return;
+#else
+    /* This exercises the streaming chunk callback path used for large AppendVec
+     * files. Real-world snapshots can contain preallocated/empty AppendVec files
+     * that are entirely zero; these should not be treated as corruption. */
+
+    char* old_threads = getenv("SOL_SNAPSHOT_LOAD_THREADS");
+    char* old_stream = getenv("SOL_SNAPSHOT_STREAM_ACCOUNTS");
+    char* old_threads_copy = old_threads ? strdup(old_threads) : NULL;
+    char* old_stream_copy = old_stream ? strdup(old_stream) : NULL;
+
+    setenv("SOL_SNAPSHOT_LOAD_THREADS", "4", 1);
+    setenv("SOL_SNAPSHOT_STREAM_ACCOUNTS", "1", 1);
+
+    char tmpdir[] = "/tmp/solana_c_snapshot_zero_appendvec_XXXXXX";
+    char* base = mkdtemp(tmpdir);
+    ASSERT(base != NULL);
+
+    char archive_path[512];
+    snprintf(archive_path, sizeof(archive_path), "%s/test.tar.zst", base);
+
+    const size_t accounts_sz = (64u * 1024u * 1024u) + 512u; /* > 64MB, tar-block aligned */
+    const size_t tar_sz = accounts_sz + 2560u;
+    uint8_t* tar = sol_alloc(tar_sz);
+    ASSERT(tar != NULL);
+    memset(tar, 0, tar_sz);
+
+    size_t off = 0;
+
+    /* Minimal bank snapshot header file: snapshots/5/5 */
+    uint8_t bank_hdr[64];
+    memset(bank_hdr, 0, sizeof(bank_hdr));
+    bank_hdr[8] = 1; /* Option<Hash> tag */
+    for (size_t i = 0; i < SOL_HASH_SIZE; i++) {
+        bank_hdr[9 + i] = (uint8_t)(0xA0u + (uint8_t)i);
+    }
+
+    write_test_tar_header(tar + off, "snapshots/5/5", 0644, sizeof(bank_hdr), '0');
+    off += 512;
+    memcpy(tar + off, bank_hdr, sizeof(bank_hdr));
+    off += sizeof(bank_hdr);
+    off += 512 - sizeof(bank_hdr);
+
+    /* Large, all-zero AppendVec-style accounts file (forces chunk streaming). */
+    write_test_tar_header(tar + off, "accounts/5.0", 0644, accounts_sz, '0');
+    off += 512;
+    off += accounts_sz; /* data already zero-filled */
+
+    /* End-of-archive marker (two zero blocks). Buffer already zero-filled. */
+    off += 1024;
+    ASSERT(off <= tar_sz);
+
+    size_t max_out = ZSTD_compressBound(off);
+    void* comp = sol_alloc(max_out);
+    ASSERT(comp != NULL);
+
+    size_t comp_sz = ZSTD_compress(comp, max_out, tar, off, 1);
+    ASSERT(!ZSTD_isError(comp_sz));
+
+    FILE* f = fopen(archive_path, "wb");
+    ASSERT(f != NULL);
+    ASSERT(fwrite(comp, 1, comp_sz, f) == comp_sz);
+    fclose(f);
+
+    sol_free(comp);
+    sol_free(tar);
+
+    sol_snapshot_mgr_t* mgr = sol_snapshot_mgr_new(NULL);
+    ASSERT(mgr != NULL);
+
+    sol_bank_t* loaded_bank = NULL;
+    sol_accounts_db_t* loaded_db = NULL;
+    sol_err_t err = sol_snapshot_load(mgr, archive_path, &loaded_bank, &loaded_db);
+    ASSERT(err == SOL_OK);
+    ASSERT(loaded_bank != NULL);
+    ASSERT(loaded_db != NULL);
+
+    sol_bank_destroy(loaded_bank);
+    sol_accounts_db_destroy(loaded_db);
+    sol_snapshot_mgr_destroy(mgr);
+
+    sol_snapshot_archive_rmdir(base);
+
+    if (old_threads_copy) {
+        setenv("SOL_SNAPSHOT_LOAD_THREADS", old_threads_copy, 1);
+    } else {
+        unsetenv("SOL_SNAPSHOT_LOAD_THREADS");
+    }
+    if (old_stream_copy) {
+        setenv("SOL_SNAPSHOT_STREAM_ACCOUNTS", old_stream_copy, 1);
+    } else {
+        unsetenv("SOL_SNAPSHOT_STREAM_ACCOUNTS");
+    }
+    free(old_threads_copy);
+    free(old_stream_copy);
+#endif
+}
+
 TEST(snapshot_load_from_directory) {
     char tmpdir[] = "/tmp/solana_c_snapshot_XXXXXX";
     char* dir = mkdtemp(tmpdir);
@@ -2657,16 +2757,14 @@ TEST(accounts_db_versioned_upsert_and_delete) {
     ASSERT(loaded->meta.lamports == 111);
     sol_account_destroy(loaded);
 
-    /* Older tombstone must not delete */
-    sol_account_t tombstone = {0};
-    tombstone.meta.lamports = 0;
-    ASSERT(sol_accounts_db_store_versioned(db, &pk, &tombstone, 7, 9) == SOL_OK);
+    /* Older delete must not remove a newer version */
+    ASSERT(sol_accounts_db_delete_versioned(db, &pk, 7, 9) == SOL_OK);
     loaded = sol_accounts_db_load(db, &pk);
     ASSERT(loaded != NULL);
     sol_account_destroy(loaded);
 
-    /* Newer tombstone deletes */
-    ASSERT(sol_accounts_db_store_versioned(db, &pk, &tombstone, 8, 12) == SOL_OK);
+    /* Newer delete removes */
+    ASSERT(sol_accounts_db_delete_versioned(db, &pk, 8, 12) == SOL_OK);
     loaded = sol_accounts_db_load(db, &pk);
     ASSERT(loaded == NULL);
 
@@ -3874,6 +3972,7 @@ int main(void) {
 
     RUN_TEST(snapshot_load_from_directory);
     RUN_TEST(snapshot_load_archive_persists_appendvec_accounts_files);
+    RUN_TEST(snapshot_load_archive_all_zero_large_appendvec_file_ok);
     RUN_TEST(snapshot_archive_filename_hash_verify);
     RUN_TEST(snapshot_load_accounts_solana_layout_aligned);
     RUN_TEST(snapshot_load_accounts_solana2_layout_aligned);

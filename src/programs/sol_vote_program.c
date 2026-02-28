@@ -13,31 +13,7 @@
 
 static sol_err_t
 verify_hash_against_slot_hashes(sol_bank_t* bank, sol_slot_t slot, const sol_hash_t* hash) {
-    if (!bank || !hash) {
-        return SOL_ERR_INVAL;
-    }
-
-    sol_account_t* slot_hashes_account =
-        sol_bank_load_account(bank, &SOL_SYSVAR_SLOT_HASHES_ID);
-    if (!slot_hashes_account) {
-        return SOL_ERR_SLOT_HASH_MISMATCH;
-    }
-
-    sol_slot_hashes_t slot_hashes;
-    sol_slot_hashes_init(&slot_hashes);
-    sol_err_t err = sol_slot_hashes_deserialize(
-        &slot_hashes, slot_hashes_account->data, slot_hashes_account->meta.data_len);
-    sol_account_destroy(slot_hashes_account);
-    if (err != SOL_OK) {
-        return err;
-    }
-
-    const sol_hash_t* expected = sol_slot_hashes_get(&slot_hashes, slot);
-    if (!expected || !sol_hash_eq(expected, hash)) {
-        return SOL_ERR_SLOT_HASH_MISMATCH;
-    }
-
-    return SOL_OK;
+    return sol_bank_verify_hash_against_slot_hashes(bank, slot, hash);
 }
 
 /*
@@ -68,7 +44,7 @@ get_account(sol_invoke_context_t* ctx, uint8_t index,
 
     /* Agave creates a default account for any key not in the DB */
     if (!*account) {
-        *account = sol_calloc(1, sizeof(sol_account_t));
+        *account = sol_account_alloc();
         if (*account) {
             (*account)->meta.owner = SOL_SYSTEM_PROGRAM_ID;
             (*account)->meta.rent_epoch = UINT64_MAX;
@@ -834,7 +810,7 @@ sol_vote_state_process_vote(sol_vote_state_t* state,
         state->votes_len++;
 
         /* Double lockouts: new vote confirms all prior votes */
-        for (uint8_t j = 0; j < state->votes_len; j++) {
+        for (uint8_t j = 0; (uint8_t)(j + 1u) < state->votes_len; j++) {
             if (state->votes[j].confirmation_count < UINT32_MAX) {
                 state->votes[j].confirmation_count++;
             }
@@ -978,6 +954,13 @@ execute_initialize(sol_invoke_context_t* ctx) {
         sol_account_destroy(vote_account);
         return err;
     }
+
+    /* Keep the bank's Clock median timestamp cache hot by updating the
+     * last_timestamp fields whenever the vote state is modified. */
+    sol_bank_vote_timestamp_cache_update(ctx->bank,
+                                         vote_pubkey,
+                                         state.last_timestamp_slot,
+                                         state.last_timestamp);
 
     sol_bank_store_account(ctx->bank, vote_pubkey, vote_account);
     sol_account_destroy(vote_account);

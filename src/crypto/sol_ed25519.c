@@ -20,6 +20,182 @@
 #include <openssl/rand.h>
 #endif
 
+/*
+ * Fast Ed25519 curve point decompression check for PDA derivation.
+ *
+ * This must match Solana's `bytes_are_curve_point()` semantics:
+ * - Uses canonical y encoding (y < p), where p = 2^255 - 19
+ * - Treats any decompressible point (including torsion points) as "on curve"
+ * - No subgroup membership checks
+ *
+ * Implementation uses fixed-size field arithmetic (fiat-crypto) via
+ * Firedancer's ref backend.
+ */
+#define HEADER_fd_src_ballet_ed25519_fd_f25519_h 1
+#define FD_25519_INLINE static inline
+#include "../../external/fd-src/src/ballet/ed25519/ref/fd_f25519.h"
+#undef FD_25519_INLINE
+
+static inline int
+sol_f25519_eq(fd_f25519_t const* a, fd_f25519_t const* b) {
+    fd_f25519_t r[1];
+    fd_f25519_sub(r, a, b);
+    return fd_f25519_is_zero(r);
+}
+
+static inline int
+sol_f25519_sgn(fd_f25519_t const* a) {
+    uchar buf[32];
+    fd_f25519_tobytes(buf, a);
+    return buf[0] & 1;
+}
+
+static inline fd_f25519_t*
+sol_f25519_abs(fd_f25519_t* r, fd_f25519_t const* a) {
+    fd_f25519_t neg_a[1];
+    fd_f25519_neg(neg_a, a);
+    return fd_f25519_if(r, sol_f25519_sgn(a), neg_a, a);
+}
+
+static fd_f25519_t*
+sol_f25519_pow22523(fd_f25519_t* r, fd_f25519_t const* a) {
+    fd_f25519_t t0[1];
+    fd_f25519_t t1[1];
+    fd_f25519_t t2[1];
+
+    fd_f25519_sqr(t0, a);
+    fd_f25519_sqr(t1, t0);
+    for (int i = 1; i < 2; i++) fd_f25519_sqr(t1, t1);
+
+    fd_f25519_mul(t1, a, t1);
+    fd_f25519_mul(t0, t0, t1);
+    fd_f25519_sqr(t0, t0);
+    fd_f25519_mul(t0, t1, t0);
+    fd_f25519_sqr(t1, t0);
+    for (int i = 1; i < 5; i++) fd_f25519_sqr(t1, t1);
+
+    fd_f25519_mul(t0, t1, t0);
+    fd_f25519_sqr(t1, t0);
+    for (int i = 1; i < 10; i++) fd_f25519_sqr(t1, t1);
+
+    fd_f25519_mul(t1, t1, t0);
+    fd_f25519_sqr(t2, t1);
+    for (int i = 1; i < 20; i++) fd_f25519_sqr(t2, t2);
+
+    fd_f25519_mul(t1, t2, t1);
+    fd_f25519_sqr(t1, t1);
+    for (int i = 1; i < 10; i++) fd_f25519_sqr(t1, t1);
+
+    fd_f25519_mul(t0, t1, t0);
+    fd_f25519_sqr(t1, t0);
+    for (int i = 1; i < 50; i++) fd_f25519_sqr(t1, t1);
+
+    fd_f25519_mul(t1, t1, t0);
+    fd_f25519_sqr(t2, t1);
+    for (int i = 1; i < 100; i++) fd_f25519_sqr(t2, t2);
+
+    fd_f25519_mul(t1, t2, t1);
+    fd_f25519_sqr(t1, t1);
+    for (int i = 1; i < 50; i++) fd_f25519_sqr(t1, t1);
+
+    fd_f25519_mul(t0, t1, t0);
+    fd_f25519_sqr(t0, t0);
+    for (int i = 1; i < 2; i++) fd_f25519_sqr(t0, t0);
+
+    fd_f25519_mul(r, t0, a);
+    return r;
+}
+
+static int
+sol_f25519_sqrt_ratio(fd_f25519_t* r, fd_f25519_t const* u, fd_f25519_t const* v) {
+    /* r = (u * v^3) * (u * v^7)^((p-5)/8) */
+    fd_f25519_t v2[1]; fd_f25519_sqr(v2, v);
+    fd_f25519_t v3[1]; fd_f25519_mul(v3, v2, v);
+    fd_f25519_t uv3[1]; fd_f25519_mul(uv3, u, v3);
+    fd_f25519_t v6[1]; fd_f25519_sqr(v6, v3);
+    fd_f25519_t v7[1]; fd_f25519_mul(v7, v6, v);
+    fd_f25519_t uv7[1]; fd_f25519_mul(uv7, u, v7);
+
+    sol_f25519_pow22523(r, uv7);
+    fd_f25519_mul(r, r, uv3);
+
+    /* check = v * r^2 */
+    fd_f25519_t check[1];
+    fd_f25519_sqr(check, r);
+    fd_f25519_mul(check, check, v);
+
+    fd_f25519_t u_neg[1];        fd_f25519_neg(u_neg, u);
+    fd_f25519_t u_neg_sqrtm1[1]; fd_f25519_mul(u_neg_sqrtm1, u_neg, fd_f25519_sqrtm1);
+    int correct_sign_sqrt   = sol_f25519_eq(check, u);
+    int flipped_sign_sqrt   = sol_f25519_eq(check, u_neg);
+    int flipped_sign_sqrt_i = sol_f25519_eq(check, u_neg_sqrtm1);
+
+    /* r_prime = SQRT_M1 * r */
+    fd_f25519_t r_prime[1];
+    fd_f25519_mul(r_prime, r, fd_f25519_sqrtm1);
+
+    /* r = CT_SELECT(r_prime IF flipped_sign_sqrt | flipped_sign_sqrt_i ELSE r) */
+    fd_f25519_if(r, flipped_sign_sqrt | flipped_sign_sqrt_i, r_prime, r);
+    sol_f25519_abs(r, r);
+    return correct_sign_sqrt | flipped_sign_sqrt;
+}
+
+static inline bool
+sol_ed25519_is_canonical_y(const uint8_t y_bytes[static 32]) {
+    /* p = 2^255 - 19, little endian: ed ff..ff 7f */
+    static const uint8_t P_LE[32] = {
+        0xed,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0x7f,
+    };
+
+    for (int i = 31; i >= 0; i--) {
+        if (y_bytes[i] < P_LE[i]) return true;
+        if (y_bytes[i] > P_LE[i]) return false;
+    }
+    return false; /* y == p is not canonical */
+}
+
+static bool
+sol_ed25519_bytes_are_curve_point(const sol_pubkey_t* pubkey) {
+    if (!pubkey) return false;
+
+    uint8_t y_bytes[32];
+    memcpy(y_bytes, pubkey->bytes, sizeof(y_bytes));
+
+    uint8_t expected_x_sign = (uint8_t)((y_bytes[31] >> 7) & 1);
+    y_bytes[31] &= 0x7F;
+
+    if (!sol_ed25519_is_canonical_y(y_bytes)) {
+        return false;
+    }
+
+    fd_f25519_t x[1], y[1], u[1], v[1];
+    fd_f25519_frombytes(y, (uchar const*)y_bytes);
+
+    fd_f25519_sqr(u, y);
+    fd_f25519_mul(v, u, fd_f25519_d);
+    fd_f25519_sub(u, u, fd_f25519_one); /* u = y^2 - 1 */
+    fd_f25519_add(v, v, fd_f25519_one); /* v = d*y^2 + 1 */
+
+    if (!sol_f25519_sqrt_ratio(x, u, v)) {
+        return false;
+    }
+
+    /* Reject encodings where the sign bit can't be satisfied (x == 0). */
+    if (sol_f25519_sgn(x) != expected_x_sign) {
+        fd_f25519_neg(x, x);
+        if (sol_f25519_sgn(x) != expected_x_sign) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 #if SOL_USE_LIBSODIUM
 /*
  * Initialize libsodium (called once)
@@ -381,163 +557,9 @@ sol_ed25519_pubkey_is_valid(const sol_pubkey_t* pubkey) {
     (void)ge;
 }
 
-#if SOL_USE_OPENSSL
-static bool
-ed25519_pubkey_is_on_curve_bn(const sol_pubkey_t* pubkey) {
-    if (!pubkey) return false;
-
-    bool valid = false;
-
-    uint8_t y_bytes[SOL_ED25519_PUBKEY_SIZE];
-    memcpy(y_bytes, pubkey->bytes, sizeof(y_bytes));
-
-    uint8_t sign = (uint8_t)((y_bytes[31] >> 7) & 1);
-    y_bytes[31] &= 0x7F;
-
-    uint8_t y_be[SOL_ED25519_PUBKEY_SIZE];
-    for (size_t i = 0; i < sizeof(y_be); i++) {
-        y_be[sizeof(y_be) - 1 - i] = y_bytes[i];
-    }
-
-    BN_CTX* ctx = BN_CTX_new();
-    if (ctx == NULL) {
-        return false;
-    }
-
-    BN_CTX_start(ctx);
-    BIGNUM* y = BN_CTX_get(ctx);
-    BIGNUM* p = BN_CTX_get(ctx);
-    BIGNUM* one = BN_CTX_get(ctx);
-    BIGNUM* y2 = BN_CTX_get(ctx);
-    BIGNUM* u = BN_CTX_get(ctx);
-    BIGNUM* v = BN_CTX_get(ctx);
-    BIGNUM* d = BN_CTX_get(ctx);
-    BIGNUM* inv = BN_CTX_get(ctx);
-    BIGNUM* x2 = BN_CTX_get(ctx);
-    BIGNUM* x = BN_CTX_get(ctx);
-    BIGNUM* numer = BN_CTX_get(ctx);
-    BIGNUM* denom = BN_CTX_get(ctx);
-    BIGNUM* x_alt = BN_CTX_get(ctx);
-
-    if (x_alt == NULL) {
-        BN_CTX_end(ctx);
-        BN_CTX_free(ctx);
-        return false;
-    }
-
-    BN_bin2bn(y_be, sizeof(y_be), y);
-
-    BN_one(p);
-    BN_lshift(p, p, 255);
-    BN_sub_word(p, 19);
-    BN_one(one);
-
-    if (BN_cmp(y, p) >= 0) {
-        goto done;
-    }
-
-    if (BN_mod_sqr(y2, y, p, ctx) != 1) {
-        goto done;
-    }
-    if (BN_mod_sub(u, y2, one, p, ctx) != 1) {
-        goto done;
-    }
-
-    BN_set_word(numer, 121665);
-    BN_set_word(denom, 121666);
-    if (BN_mod_inverse(inv, denom, p, ctx) == NULL) {
-        goto done;
-    }
-    if (BN_mod_mul(d, numer, inv, p, ctx) != 1) {
-        goto done;
-    }
-    if (BN_mod_sub(d, p, d, p, ctx) != 1) {
-        goto done;
-    }
-
-    if (BN_mod_mul(v, d, y2, p, ctx) != 1) {
-        goto done;
-    }
-    if (BN_mod_add(v, v, one, p, ctx) != 1) {
-        goto done;
-    }
-
-    if (BN_mod_inverse(inv, v, p, ctx) == NULL) {
-        goto done;
-    }
-    if (BN_mod_mul(x2, u, inv, p, ctx) != 1) {
-        goto done;
-    }
-
-    if (BN_mod_sqrt(x, x2, p, ctx) == NULL) {
-        goto done;
-    }
-
-    if ((BN_is_odd(x) ? 1 : 0) != sign) {
-        if (BN_mod_sub(x_alt, p, x, p, ctx) != 1) {
-            goto done;
-        }
-        if ((BN_is_odd(x_alt) ? 1 : 0) != sign) {
-            goto done;
-        }
-    }
-
-    valid = true;
-
-done:
-    BN_CTX_end(ctx);
-    BN_CTX_free(ctx);
-    return valid;
-}
-#endif
-
 bool
 sol_ed25519_pubkey_is_on_curve(const sol_pubkey_t* pubkey) {
-    if (!pubkey) return false;
-
-#if SOL_USE_OPENSSL
-    /* Prefer OpenSSL-based decompression check to match Solana's
-     * `bytes_are_curve_point()` semantics (no subgroup membership checks). */
-    return ed25519_pubkey_is_on_curve_bn(pubkey);
-#else
-    ensure_sodium_init();
-
-    /* libsodium's `crypto_core_ed25519_is_valid_point` rejects small-order points
-     * (torsion subgroup), while Solana's PDA derivation rejects any point that
-     * decompresses (including small-order). Treat the 8 torsion points as
-     * "on curve" as well. */
-    if (crypto_core_ed25519_is_valid_point(pubkey->bytes) == 1) {
-        return true;
-    }
-
-    static const uint8_t torsion[8][32] = {
-        /* curve25519-dalek constants::EIGHT_TORSION compressed Edwards-Y */
-        {0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-        {0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
-         0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a},
-        {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80},
-        {0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0,
-         0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05},
-        {0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-         0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f},
-        {0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0,
-         0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x85},
-        {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
-        {0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
-         0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0xfa},
-    };
-
-    for (size_t i = 0; i < 8; i++) {
-        if (sodium_memcmp(pubkey->bytes, torsion[i], 32) == 0) {
-            return true;
-        }
-    }
-
-    return false;
-#endif
+    return sol_ed25519_bytes_are_curve_point(pubkey);
 }
 #elif SOL_USE_OPENSSL
 static void
@@ -767,21 +789,25 @@ sol_ed25519_verify(
         return false;
     }
 
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
-    if (!ctx) {
+    /* Signature verification is hot (bank replay). Avoid per-call EVP_MD_CTX
+     * allocation/free by using a per-thread cached context. */
+    static __thread EVP_MD_CTX* tls_ctx = NULL;
+    if (tls_ctx == NULL) {
+        tls_ctx = EVP_MD_CTX_new();
+    } else {
+        EVP_MD_CTX_reset(tls_ctx);
+    }
+    if (!tls_ctx) {
         EVP_PKEY_free(pkey);
         return false;
     }
 
-    if (EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) != 1) {
-        EVP_MD_CTX_free(ctx);
+    if (EVP_DigestVerifyInit(tls_ctx, NULL, NULL, NULL, pkey) != 1) {
         EVP_PKEY_free(pkey);
         return false;
     }
 
-    int ok = EVP_DigestVerify(ctx, sig->bytes, SOL_ED25519_SIGNATURE_SIZE, msg, msg_len);
-
-    EVP_MD_CTX_free(ctx);
+    int ok = EVP_DigestVerify(tls_ctx, sig->bytes, SOL_ED25519_SIGNATURE_SIZE, msg, msg_len);
     EVP_PKEY_free(pkey);
 
     return ok == 1;
@@ -815,7 +841,7 @@ sol_ed25519_pubkey_is_valid(const sol_pubkey_t* pubkey) {
 
 bool
 sol_ed25519_pubkey_is_on_curve(const sol_pubkey_t* pubkey) {
-    return ed25519_pubkey_is_valid_bn(pubkey);
+    return sol_ed25519_bytes_are_curve_point(pubkey);
 }
 #else
 #error "No Ed25519 backend available. Install libsodium or enable OpenSSL."
@@ -836,13 +862,29 @@ sol_ed25519_create_pda(
     sol_pubkey_t*         pda,
     uint8_t*              bump
 ) {
+    sol_sha256_ctx_t base_ctx;
+    sol_sha256_init(&base_ctx);
+    for (size_t i = 0; i < seed_count; i++) {
+        if (seed_lens[i] > 0 && seeds[i] != NULL) {
+            sol_sha256_update(&base_ctx, seeds[i], seed_lens[i]);
+        }
+    }
+    static const char PDA_MARKER[] = "ProgramDerivedAddress";
+
     /* Try bump seeds from 255 down to 0 */
     for (int b = 255; b >= 0; b--) {
+        sol_sha256_ctx_t ctx = base_ctx;
+        sol_sha256_t hash;
         uint8_t bump_byte = (uint8_t)b;
-        sol_err_t err = sol_ed25519_create_pda_with_bump(
-            program_id, seeds, seed_lens, seed_count, bump_byte, pda
-        );
-        if (err == SOL_OK) {
+
+        /* Hash: seeds || bump || program_id || "ProgramDerivedAddress" */
+        sol_sha256_update(&ctx, &bump_byte, 1);
+        sol_sha256_update(&ctx, program_id->bytes, 32);
+        sol_sha256_update(&ctx, PDA_MARKER, sizeof(PDA_MARKER) - 1);
+        sol_sha256_final(&ctx, &hash);
+
+        memcpy(pda->bytes, hash.bytes, 32);
+        if (!sol_ed25519_pubkey_is_on_curve(pda)) {
             if (bump != NULL) {
                 *bump = bump_byte;
             }
@@ -869,7 +911,9 @@ sol_ed25519_create_pda_with_bump(
     sol_sha256_init(&ctx);
 
     for (size_t i = 0; i < seed_count; i++) {
-        sol_sha256_update(&ctx, seeds[i], seed_lens[i]);
+        if (seed_lens[i] > 0 && seeds[i] != NULL) {
+            sol_sha256_update(&ctx, seeds[i], seed_lens[i]);
+        }
     }
     sol_sha256_update(&ctx, &bump, 1);
     sol_sha256_update(&ctx, program_id->bytes, 32);

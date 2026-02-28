@@ -603,10 +603,15 @@ sol_bpf_elf_load(
     }
 
     /* Find relocations via .dynamic section's DT_REL entry, matching Agave/rbpf.
-     * rbpf reads relocations from dynamic_table[DT_REL] only, NOT by scanning
-     * section headers for SHT_REL/SHT_RELA. If no .dynamic section exists or
-     * DT_REL is 0, zero relocations are processed. This is critical for SBPFv2
-     * programs which may have relocation sections that should not be applied. */
+     * For SBPFv2+ programs, rbpf reads relocations from dynamic_table[DT_REL]
+     * only, NOT by scanning section headers for SHT_REL/SHT_RELA. If no
+     * .dynamic section exists or DT_REL is 0, zero relocations are processed.
+     * This is critical for SBPFv2 programs which may have relocation sections
+     * that should not be applied.
+     *
+     * For SBPFv0/v1 programs, older toolchains commonly omit .dynamic.  In that
+     * case, apply relocations by scanning SHT_REL sections to preserve legacy
+     * compatibility (and unit-test behavior). */
     uint64_t dt_rel_vaddr = 0;
     uint64_t dt_rel_size = 0;
     for (uint16_t i = 0; i < ehdr.e_shnum; i++) {
@@ -637,18 +642,42 @@ sol_bpf_elf_load(
         break; /* Only one .dynamic section */
     }
 
-    /* Process relocations - only from the section matching DT_REL */
-    for (uint16_t i = 0; i < ehdr.e_shnum && dt_rel_vaddr != 0; i++) {
+    bool scan_all_rel_sections = false;
+    if (dt_rel_vaddr == 0 && prog->sbpf_version < SOL_SBPF_V2) {
+        scan_all_rel_sections = true;
+    }
+
+    /* Process relocations.
+     * - SBPFv2+: Only process the REL section that matches DT_REL from .dynamic.
+     * - SBPFv0/v1: If DT_REL is missing, scan all SHT_REL sections. */
+    for (uint16_t i = 0; i < ehdr.e_shnum; i++) {
         size_t shdr_off = ehdr.e_shoff + (size_t)i * ehdr.e_shentsize;
         if (shdr_off + sizeof(elf64_shdr_t) > elf_len) continue;
 
         elf64_shdr_t rel_shdr;
         parse_section_header(elf_data + shdr_off, &rel_shdr);
 
-        /* Only process the REL section that matches DT_REL from .dynamic.
-         * rbpf only supports DT_REL (REL without addend), never RELA. */
-        if (rel_shdr.sh_type != SHT_REL || rel_shdr.sh_addr != dt_rel_vaddr) {
+        /* rbpf only supports DT_REL (REL without addend), never RELA. */
+        if (rel_shdr.sh_type != SHT_REL) {
             continue;
+        }
+
+        if (!scan_all_rel_sections) {
+            /* SBPFv2+ strict behavior: no DT_REL => no relocations. */
+            if (dt_rel_vaddr == 0) {
+                continue;
+            }
+
+            /* Only process the REL section that matches DT_REL from .dynamic. */
+            if (rel_shdr.sh_addr != dt_rel_vaddr) {
+                continue;
+            }
+
+            /* Optional sanity check: if DT_RELSZ is present, ensure the section
+             * size does not exceed it. */
+            if (dt_rel_size != 0 && rel_shdr.sh_size > dt_rel_size) {
+                return SOL_ERR_BPF_ELF;
+            }
         }
 
         if (rel_shdr.sh_entsize == 0 ||

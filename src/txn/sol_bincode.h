@@ -389,6 +389,8 @@ sol_encode_compact_u16(sol_encoder_t* enc, uint16_t val) {
  */
 static inline sol_err_t
 sol_encode_bytes(sol_encoder_t* enc, const uint8_t* data, size_t len) {
+    if (!enc) return SOL_ERR_INVAL;
+    if (len > 0 && data == NULL) return SOL_ERR_INVAL;
     if (!sol_encoder_has_space(enc, len)) return SOL_ERR_ENCODE;
     for (size_t i = 0; i < len; i++) {
         enc->data[enc->pos++] = data[i];

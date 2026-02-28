@@ -5,6 +5,7 @@
 #include "sol_snapshot_archive.h"
 #include "../util/sol_alloc.h"
 #include "../util/sol_log.h"
+#include "../util/sol_io.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,6 +116,14 @@ path_has_executable(const char* exe) {
 
 static bool
 snapshot_has_pzstd(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached != 0;
+    cached = path_has_executable("pzstd") ? 1 : 0;
+    return cached != 0;
+}
+
+static bool
+snapshot_has_zstd_cli(void) {
     static int cached = -1;
     if (cached >= 0) return cached != 0;
     cached = path_has_executable("zstd") ? 1 : 0;
@@ -406,13 +415,15 @@ typedef struct {
     uint64_t                 entry_size;
     uint64_t                 file_remaining;
     uint64_t                 skip_remaining;
-    FILE*                    out;
+    int                      out_fd;
+    uint64_t                 out_off;
     char                     path[512];
     char                     rel_path[512];
     uint64_t                 bytes_extracted;
     sol_archive_progress_fn  progress;
     void*                    progress_ctx;
     const char*              output_dir;
+    sol_io_ctx_t*            io_ctx;
     bool                     done;
     bool                     skip_unmatched;
 
@@ -578,7 +589,8 @@ tar_stream_process(tar_stream_t* ts, stream_buf_t* b) {
                     if (want_stream_chunk) {
                         ts->stream_active = true;
                         ts->stream_chunk_mode = true;
-                        ts->out = NULL;
+                        ts->out_fd = -1;
+                        ts->out_off = 0;
                         ts->file_remaining = size;
                         ts->state = TAR_STREAM_STATE_FILE_DATA;
 
@@ -620,7 +632,8 @@ tar_stream_process(tar_stream_t* ts, stream_buf_t* b) {
                         ts->stream_buf_written = 0;
                         ts->stream_active = true;
                         ts->stream_chunk_mode = false;
-                        ts->out = NULL;
+                        ts->out_fd = -1;
+                        ts->out_off = 0;
                         ts->file_remaining = size;
                         ts->state = TAR_STREAM_STATE_FILE_DATA;
 
@@ -660,18 +673,20 @@ tar_stream_process(tar_stream_t* ts, stream_buf_t* b) {
                         if (derr != SOL_OK) return derr;
                     }
 
-                    ts->out = fopen(ts->path, "wb");
-                    if (!ts->out) {
+                    int fd = open(ts->path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
+                    if (fd < 0) {
                         sol_log_error("Failed to create: %s", ts->path);
                         return SOL_ERR_IO;
                     }
+                    ts->out_fd = fd;
+                    ts->out_off = 0;
 
                     ts->file_remaining = size;
                     ts->state = TAR_STREAM_STATE_FILE_DATA;
 
                     if (size == 0) {
-                        fclose(ts->out);
-                        ts->out = NULL;
+                        close(ts->out_fd);
+                        ts->out_fd = -1;
 
                         uint32_t mode = parse_octal(ts->header.mode, 8);
                         mode &= 0777;
@@ -792,11 +807,16 @@ tar_stream_process(tar_stream_t* ts, stream_buf_t* b) {
                     ts->stream_buf_written += to_write;
                 }
             } else {
-                size_t n = fwrite(stream_buf_ptr(b), 1, to_write, ts->out);
-                if (n != to_write) {
+                sol_err_t werr = sol_io_pwrite_all(ts->io_ctx,
+                                                  ts->out_fd,
+                                                  stream_buf_ptr(b),
+                                                  to_write,
+                                                  ts->out_off);
+                if (werr != SOL_OK) {
                     sol_log_error("Write failed for: %s", ts->path);
                     return SOL_ERR_IO;
                 }
+                ts->out_off += to_write;
             }
 
             stream_buf_consume(b, to_write);
@@ -833,9 +853,9 @@ tar_stream_process(tar_stream_t* ts, stream_buf_t* b) {
                         ts->stream_buf = NULL;
                     }
                     ts->stream_active = false;
-                } else if (ts->out) {
-                    fclose(ts->out);
-                    ts->out = NULL;
+                } else if (ts->out_fd >= 0) {
+                    close(ts->out_fd);
+                    ts->out_fd = -1;
 
                     /* Set file mode */
                     uint32_t mode = parse_octal(ts->header.mode, 8);
@@ -890,7 +910,8 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
                  sol_archive_stream_file_cb stream_cb,
                  sol_archive_stream_chunk_cb stream_chunk_cb,
                  void* stream_ctx,
-                 uint64_t stream_max_size) {
+                 uint64_t stream_max_size,
+                 sol_io_ctx_t* io_ctx) {
     struct stat st;
     if (stat(archive_path, &st) != 0) return SOL_ERR_NOTFOUND;
     uint64_t total_size = (uint64_t)st.st_size;
@@ -898,11 +919,13 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
     stream_buf_t tar_buf = {0};
     tar_stream_t tar_stream = {0};
     tar_stream.state = TAR_STREAM_STATE_HEADER;
-    tar_stream.out = NULL;
+    tar_stream.out_fd = -1;
+    tar_stream.out_off = 0;
     tar_stream.bytes_extracted = 0;
     tar_stream.progress = progress;
     tar_stream.progress_ctx = ctx;
     tar_stream.output_dir = output_dir;
+    tar_stream.io_ctx = io_ctx;
     tar_stream.done = false;
     tar_stream.rel_path[0] = '\0';
     tar_stream.skip_unmatched = skip_unmatched;
@@ -919,14 +942,19 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
 
     sol_err_t ret = SOL_OK;
 
-    bool use_pzstd = snapshot_has_pzstd() && snapshot_pzstd_enabled_for_size(total_size);
+    bool cli_enabled = snapshot_pzstd_enabled_for_size(total_size);
+    bool use_pzstd = cli_enabled && snapshot_has_pzstd();
+    bool use_zstd_cli = cli_enabled && !use_pzstd && snapshot_has_zstd_cli();
     bool pzstd_stalled = false;
-    if (use_pzstd) {
+    if (use_pzstd || use_zstd_cli) {
         int pipefd[2];
         if (pipe(pipefd) != 0) {
             use_pzstd = false;
+            use_zstd_cli = false;
         } else {
-            sol_log_info("Snapshot archive: using zstd CLI (compressed=%lu bytes): %s",
+            const char* exe = use_pzstd ? "pzstd" : "zstd";
+            sol_log_info("Snapshot archive: using %s (compressed=%lu bytes): %s",
+                         exe,
                          (unsigned long)total_size,
                          archive_path);
 
@@ -935,6 +963,7 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
                 close(pipefd[0]);
                 close(pipefd[1]);
                 use_pzstd = false;
+                use_zstd_cli = false;
             } else if (pid == 0) {
                 (void)dup2(pipefd[1], STDOUT_FILENO);
                 close(pipefd[0]);
@@ -948,10 +977,16 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
 
                 const char* argv[16];
                 size_t argc = 0;
-                argv[argc++] = "zstd";
+                argv[argc++] = exe;
                 argv[argc++] = "-d";
                 argv[argc++] = "-c";
                 argv[argc++] = "-q";
+                if (use_zstd_cli) {
+                    /* Use all cores for large snapshot archives. If the local zstd
+                     * build does not support -T, the CLI path will fall back to the
+                     * libzstd decoder below. */
+                    argv[argc++] = "-T0";
+                }
                 argv[argc++] = archive_path;
                 argv[argc++] = NULL;
                 execvp_const_argv(argv);
@@ -968,7 +1003,7 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
                 (void)waitpid(pid, NULL, 0);
                 ret = SOL_ERR_NOMEM;
             } else {
-                /* Use poll() to detect pzstd hangs: if no data arrives for
+                /* Use poll() to detect decompressor hangs: if no data arrives for
                  * 30 seconds, assume pzstd is stuck and fall through to
                  * libzstd path for a clean retry. */
                 struct pollfd pfd = { .fd = pipefd[0], .events = POLLIN };
@@ -984,7 +1019,7 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
                         /* Timeout - no data from pzstd for 10s */
                         stall_count++;
                         if (stall_count >= 3) {
-                            sol_log_warn("zstd stalled for 30s, killing");
+                            sol_log_warn("%s stalled for 30s, killing", exe);
                             pzstd_stalled = true;
                             break;
                         }
@@ -1035,7 +1070,15 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
                 }
 
                 if (ret == SOL_OK && !tar_stream.done && !pzstd_stalled) {
-                    ret = SOL_ERR_SNAPSHOT_CORRUPT;
+                    /* EOF before tar completion can happen if the zstd CLI
+                     * doesn't support a flag we passed (e.g. -T on older builds)
+                     * or crashes early. Only retry when we made no forward
+                     * progress; otherwise treat as a corrupt archive. */
+                    if (tar_stream.bytes_extracted == 0) {
+                        pzstd_stalled = true;
+                    } else {
+                        ret = SOL_ERR_SNAPSHOT_CORRUPT;
+                    }
                 }
             }
 
@@ -1044,11 +1087,12 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
                  * Need to clean up partial state first. */
                 sol_log_warn("zstd CLI failed, retrying with libzstd");
                 use_pzstd = false;
+                use_zstd_cli = false;
                 ret = SOL_OK;
                 /* Close any partially-written file */
-                if (tar_stream.out) {
-                    fclose(tar_stream.out);
-                    tar_stream.out = NULL;
+                if (tar_stream.out_fd >= 0) {
+                    close(tar_stream.out_fd);
+                    tar_stream.out_fd = -1;
                 }
                 /* Reset tar stream state for retry */
                 tar_stream.state = TAR_STREAM_STATE_HEADER;
@@ -1063,9 +1107,9 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
         }
     }
 
-    if (!use_pzstd) {
-        FILE* in = fopen(archive_path, "rb");
-        if (!in) {
+    if (!(use_pzstd || use_zstd_cli)) {
+        int fd = open(archive_path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
             ret = SOL_ERR_NOTFOUND;
             goto cleanup;
         }
@@ -1073,7 +1117,7 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
         /* Create decompression context */
         ZSTD_DCtx* dctx = ZSTD_createDCtx();
         if (!dctx) {
-            fclose(in);
+            close(fd);
             ret = SOL_ERR_NOMEM;
             goto cleanup;
         }
@@ -1096,7 +1140,7 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
             sol_free(in_buf);
             sol_free(out_buf);
             ZSTD_freeDCtx(dctx);
-            fclose(in);
+            close(fd);
             ret = SOL_ERR_NOMEM;
             goto cleanup;
         }
@@ -1105,10 +1149,21 @@ extract_zstd_tar(const char* archive_path, const char* output_dir,
         uint64_t bytes_read = 0;
         size_t last_ret = 1;
 
-        while (1) {
-            size_t n = fread(in_buf, 1, in_buf_size, in);
-            if (n == 0) break;
+        uint64_t offset = 0;
+        while (offset < total_size) {
+            uint64_t remaining = total_size - offset;
+            size_t n = in_buf_size;
+            if (remaining < (uint64_t)n) {
+                n = (size_t)remaining;
+            }
 
+            sol_err_t rerr = sol_io_pread_all(io_ctx, fd, in_buf, n, offset);
+            if (rerr != SOL_OK) {
+                ret = (rerr == SOL_ERR_TRUNCATED) ? SOL_ERR_SNAPSHOT_CORRUPT : rerr;
+                goto zstd_cleanup;
+            }
+
+            offset += n;
             bytes_read += n;
 
             ZSTD_inBuffer input = { in_buf, n, 0 };
@@ -1158,13 +1213,13 @@ zstd_cleanup:
         sol_free(in_buf);
         sol_free(out_buf);
         ZSTD_freeDCtx(dctx);
-        fclose(in);
+        close(fd);
     }
 
 cleanup:
-    if (tar_stream.out) {
-        fclose(tar_stream.out);
-        tar_stream.out = NULL;
+    if (tar_stream.out_fd >= 0) {
+        close(tar_stream.out_fd);
+        tar_stream.out_fd = -1;
     }
     if (tar_stream.stream_buf) {
         sol_free(tar_stream.stream_buf);
@@ -1280,7 +1335,8 @@ sol_snapshot_archive_extract(const char* archive_path,
                                 options.stream_file_callback,
                                 options.stream_chunk_callback,
                                 options.stream_file_ctx,
-                                options.stream_max_file_size);
+                                options.stream_max_file_size,
+                                options.io_ctx);
     }
 #endif
 

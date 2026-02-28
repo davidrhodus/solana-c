@@ -30,3 +30,21 @@ target_link_libraries(bench_accounts PRIVATE
     sol_util
 )
 
+add_executable(bench_poh
+    bench_poh.c
+)
+target_link_libraries(bench_poh PRIVATE
+    sol_crypto
+    sol_util
+)
+
+add_executable(bench_entry_verify
+    bench_entry_verify.c
+)
+target_link_libraries(bench_entry_verify PRIVATE
+    sol_blockstore
+    sol_entry
+    sol_txn
+    sol_crypto
+    sol_util
+)

@@ -25,7 +25,7 @@
 /*
  * Repair constants
  */
-#define SOL_REPAIR_MAX_REQUESTS     512     /* Max concurrent requests */
+#define SOL_REPAIR_MAX_REQUESTS     8192    /* Max concurrent requests */
 #define SOL_REPAIR_REQUEST_TIMEOUT  1000    /* Request timeout in ms */
 #define SOL_REPAIR_MAX_RESPONSE     64      /* Max shreds per response */
 
@@ -138,6 +138,8 @@ typedef struct {
     uint32_t            nonce;          /* Request nonce (echoed in responses) */
     uint64_t            sent_time;      /* When request was sent */
     uint32_t            retries;        /* Number of retries */
+    /* Hedged repair sends (best-effort) are rate-limited to once per retry. */
+    uint32_t            hedge_retry_mark; /* retries value when we last hedged */
     bool                active;
 } sol_repair_pending_t;
 
@@ -154,6 +156,20 @@ typedef struct {
 } sol_repair_stats_t;
 
 /*
+ * Pending request summary for a specific slot (best-effort diagnostics)
+ */
+typedef struct {
+    size_t      total;          /* Total pending entries matching slot */
+    size_t      shreds;         /* Pending SHRED requests */
+    size_t      highest;        /* Pending HIGHEST_SHRED requests */
+    size_t      orphan;         /* Pending ORPHAN requests */
+    size_t      ancestor_hashes;/* Pending ANCESTOR_HASHES requests */
+    uint32_t    max_retries;    /* Max retries across matching entries */
+    uint64_t    oldest_sent_ms; /* Oldest sent_time among matching entries */
+    uint64_t    newest_sent_ms; /* Newest sent_time among matching entries */
+} sol_repair_pending_slot_stats_t;
+
+/*
  * Repair configuration
  */
 typedef struct {
@@ -164,9 +180,9 @@ typedef struct {
 } sol_repair_config_t;
 
 #define SOL_REPAIR_CONFIG_DEFAULT {         \
-    .request_timeout_ms = 1000,             \
-    .max_pending_requests = 512,            \
-    .max_retries = 3,                       \
+    .request_timeout_ms = 200,              \
+    .max_pending_requests = 8192,           \
+    .max_retries = 7,                       \
     .serve_repairs = true,                  \
 }
 
@@ -174,6 +190,13 @@ typedef struct {
  * Repair service handle
  */
 typedef struct sol_repair sol_repair_t;
+
+/*
+ * Leader schedule (used to target repair requests at the slot leader).
+ *
+ * The repair service does not take ownership of the schedule pointer.
+ */
+struct sol_leader_schedule;
 
 /*
  * Seed repair peers (serve-repair socket + identity) for bootstrap.
@@ -243,6 +266,22 @@ sol_err_t sol_repair_run_once(sol_repair_t* repair, uint32_t timeout_ms);
 sol_err_t sol_repair_local_addr(const sol_repair_t* repair, sol_sockaddr_t* addr);
 
 /*
+ * Set/Swap leader schedule.
+ *
+ * When set, repair peer selection will prefer the slot leader's serve-repair
+ * socket (when present in gossip CRDS) to reduce timeouts during catchup.
+ */
+void sol_repair_set_leader_schedule(
+    sol_repair_t*                   repair,
+    struct sol_leader_schedule*     schedule
+);
+
+struct sol_leader_schedule* sol_repair_swap_leader_schedule(
+    sol_repair_t*                   repair,
+    struct sol_leader_schedule*     schedule
+);
+
+/*
  * Request a specific shred
  */
 sol_err_t sol_repair_request_shred(
@@ -253,12 +292,43 @@ sol_err_t sol_repair_request_shred(
 );
 
 /*
+ * Request a specific shred, with optional fanout (hedged requests).
+ *
+ * `fanout` includes the primary request. When `fanout` > 1, additional copies
+ * of the request are sent to other peers (best-effort) using the same nonce to
+ * reduce tail latency when we're missing only a few shreds on the critical
+ * catchup slot.
+ */
+sol_err_t sol_repair_request_shred_fanout(
+    sol_repair_t*   repair,
+    sol_slot_t      slot,
+    uint64_t        shred_index,
+    bool            is_data,
+    uint32_t        fanout
+);
+
+/*
  * Request highest shred for slot at or above shred_index
  */
 sol_err_t sol_repair_request_highest(
     sol_repair_t*   repair,
     sol_slot_t      slot,
     uint64_t        shred_index
+);
+
+/*
+ * Request highest shred for slot at or above shred_index, with optional fanout
+ * (hedged requests).
+ *
+ * `fanout` includes the primary request. When `fanout` > 1, additional copies
+ * of the request are sent to other peers (best-effort) using the same nonce to
+ * reduce tail latency for catchup.
+ */
+sol_err_t sol_repair_request_highest_fanout(
+    sol_repair_t*   repair,
+    sol_slot_t      slot,
+    uint64_t        shred_index,
+    uint32_t        fanout
 );
 
 /*
@@ -323,6 +393,15 @@ void sol_repair_stats_reset(sol_repair_t* repair);
  * Get number of active pending requests.
  */
 size_t sol_repair_pending_count(sol_repair_t* repair);
+
+/*
+ * Summarize pending requests for a given slot.
+ *
+ * This is intended for debugging / stats and is O(max_pending_requests).
+ */
+bool sol_repair_pending_slot_stats(sol_repair_t* repair,
+                                  sol_slot_t slot,
+                                  sol_repair_pending_slot_stats_t* out);
 
 /*
  * Get configured maximum number of pending requests.

@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 
 /*
@@ -215,6 +216,14 @@ http_server_thread(void* arg) {
             continue;
         }
 
+        /* Don't leak client sockets into snapshot helper processes (curl/zstd). */
+        {
+            int fd_flags = fcntl(client_fd, F_GETFD, 0);
+            if (fd_flags >= 0) {
+                (void)fcntl(client_fd, F_SETFD, fd_flags | FD_CLOEXEC);
+            }
+        }
+
         /* Read HTTP request */
         char request[MAX_HTTP_REQUEST];
         ssize_t n = read(client_fd, request, sizeof(request) - 1);
@@ -288,6 +297,14 @@ sol_prometheus_start(sol_prometheus_t* prom) {
     if (prom->server_fd < 0) {
         sol_log_error("Prometheus: socket failed: %s", strerror(errno));
         return SOL_ERR_IO;
+    }
+
+    /* Ensure listen socket isn't inherited by snapshot helper processes (curl/zstd). */
+    {
+        int fd_flags = fcntl(prom->server_fd, F_GETFD, 0);
+        if (fd_flags < 0 || fcntl(prom->server_fd, F_SETFD, fd_flags | FD_CLOEXEC) < 0) {
+            sol_log_warn("Prometheus: fcntl(FD_CLOEXEC) failed: %s", strerror(errno));
+        }
     }
 
     /* Allow reuse */

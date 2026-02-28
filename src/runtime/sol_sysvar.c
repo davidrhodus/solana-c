@@ -804,23 +804,22 @@ sol_instructions_sysvar_serialize(const sol_transaction_t* txn,
     uint16_t num_ix = (uint16_t)msg->instructions_len;
 
     /*
-     * Agave Instructions sysvar format:
+     * Instructions sysvar format (matches Agave):
      *
      * HEADER:
      *   u16: num_instructions
      *   u16[num_ix]: offset table (byte offsets to each instruction)
+     *   u16: current instruction index
      *
      * PER INSTRUCTION (at recorded offset):
-     *   u16: num_accounts
+     *   u8: num_accounts
      *   For each account:
-     *     u8: flags (bit 0 = is_signer, bit 1 = is_writable)
-     *     [u8; 32]: full pubkey
+     *     u8: pubkey index (into message account keys)
+     *     u8: is_signer (0/1)
+     *     u8: is_writable (0/1)
      *   [u8; 32]: program_id (full pubkey)
      *   u16: data_len
      *   [u8; data_len]: data
-     *
-     * TRAILER (last 2 bytes of buffer):
-     *   u16: current_instruction_index
      */
 
     /* Resolve account keys */
@@ -830,16 +829,20 @@ sol_instructions_sysvar_serialize(const sol_transaction_t* txn,
         ? msg->resolved_accounts_len : (uint16_t)msg->account_keys_len;
 
     /* Calculate required size */
-    size_t header_size = 2 + (size_t)num_ix * 2;  /* num_ix + offset table */
+    size_t header_size = 2u + (size_t)num_ix * 2u + 2u;  /* count + offsets + current */
     size_t instr_data_size = 0;
 
     for (size_t i = 0; i < num_ix; i++) {
         const sol_compiled_instruction_t* ix = &msg->instructions[i];
-        /* num_accounts(2) + accounts(33*n) + program_id(32) + data_len(2) + data */
-        instr_data_size += 2 + ((size_t)ix->account_indices_len * 33) + 32 + 2 + ix->data_len;
+        /* num_accounts(1) + accounts(3*n) + program_id(32) + data_len(2) + data */
+        instr_data_size += 1u + ((size_t)ix->account_indices_len * 3u) + 32u + 2u + (size_t)ix->data_len;
     }
 
-    size_t total_size = header_size + instr_data_size + 2;  /* +2 for trailing current_idx */
+    size_t total_size = header_size + instr_data_size;
+    if (total_size > UINT16_MAX) {
+        /* Offsets are serialized as u16, so the sysvar cannot exceed 64KiB. */
+        return SOL_ERR_OVERFLOW;
+    }
     if (*out_len < total_size) {
         *out_len = total_size;
         return SOL_ERR_INVAL;
@@ -859,19 +862,21 @@ sol_instructions_sysvar_serialize(const sol_transaction_t* txn,
         offset += 2;
 
         const sol_compiled_instruction_t* ix = &msg->instructions[i];
-        ix_data_start += 2 + ((size_t)ix->account_indices_len * 33) + 32 + 2 + ix->data_len;
+        ix_data_start += 1u + ((size_t)ix->account_indices_len * 3u) + 32u + 2u + (size_t)ix->data_len;
     }
+
+    /* Write current instruction index (u16 LE) */
+    memcpy(out_data + offset, &current_idx, 2);
+    offset += 2;
 
     /* Write each instruction */
     for (size_t i = 0; i < num_ix; i++) {
         const sol_compiled_instruction_t* ix = &msg->instructions[i];
 
-        /* Number of accounts (u16 LE) */
-        uint16_t num_accounts = (uint16_t)ix->account_indices_len;
-        memcpy(out_data + offset, &num_accounts, 2);
-        offset += 2;
+        /* Number of accounts (u8) */
+        out_data[offset++] = (uint8_t)ix->account_indices_len;
 
-        /* Account metas: flags(1) + pubkey(32) = 33 bytes each */
+        /* Account metas: (pubkey_index, is_signer, is_writable) = 3 bytes each */
         for (uint8_t j = 0; j < ix->account_indices_len; j++) {
             uint8_t key_index = ix->account_indices[j];
 
@@ -891,19 +896,9 @@ sol_instructions_sysvar_serialize(const sol_transaction_t* txn,
                 key_is_writable = sol_message_is_writable_index(msg, key_index);
             }
 
-            /* Flags byte: bit 0 = is_signer, bit 1 = is_writable */
-            uint8_t flags = 0;
-            if (key_is_signer)   flags |= (1u << 0);
-            if (key_is_writable) flags |= (1u << 1);
-            out_data[offset++] = flags;
-
-            /* Full 32-byte pubkey */
-            if (acct_keys && key_index < acct_keys_len) {
-                memcpy(out_data + offset, acct_keys[key_index].bytes, 32);
-            } else {
-                memset(out_data + offset, 0, 32);
-            }
-            offset += 32;
+            out_data[offset++] = key_index;
+            out_data[offset++] = (uint8_t)(key_is_signer ? 1 : 0);
+            out_data[offset++] = (uint8_t)(key_is_writable ? 1 : 0);
         }
 
         /* Program ID (full 32-byte pubkey) */
@@ -919,15 +914,15 @@ sol_instructions_sysvar_serialize(const sol_transaction_t* txn,
         memcpy(out_data + offset, &data_len, 2);
         offset += 2;
 
-        if (ix->data_len > 0 && ix->data) {
-            memcpy(out_data + offset, ix->data, ix->data_len);
-            offset += ix->data_len;
+        if (data_len > 0) {
+            if (ix->data) {
+                memcpy(out_data + offset, ix->data, data_len);
+            } else {
+                memset(out_data + offset, 0, data_len);
+            }
+            offset += (size_t)data_len;
         }
     }
-
-    /* Trailer: current instruction index (last 2 bytes of buffer) */
-    memcpy(out_data + offset, &current_idx, 2);
-    offset += 2;
 
     *out_len = offset;
     return SOL_OK;
@@ -950,9 +945,16 @@ sol_instructions_sysvar_get_current(const uint8_t* data, size_t len) {
         return 0;
     }
 
-    /* Current instruction index is stored as the LAST 2 bytes of the buffer */
-    uint16_t current;
-    memcpy(&current, data + len - 2, 2);
+    uint16_t count;
+    memcpy(&count, data, 2);
+
+    size_t current_off = 2u + (size_t)count * 2u;
+    if (len < current_off + 2u) {
+        return 0;
+    }
+
+    uint16_t current = 0;
+    memcpy(&current, data + current_off, 2);
     return current;
 }
 
@@ -989,16 +991,14 @@ sol_instructions_sysvar_load_instruction(const uint8_t* data,
 
     size_t pos = ix_offset;
 
-    /* Read number of accounts (u16 LE) */
-    if (len < pos + 2) {
+    /* Read number of accounts (u8) */
+    if (len < pos + 1) {
         return SOL_ERR_TRUNCATED;
     }
-    uint16_t num_accounts;
-    memcpy(&num_accounts, data + pos, 2);
-    pos += 2;
+    uint8_t num_accounts = data[pos++];
 
-    /* Skip account metas: 33 bytes each (1 flags + 32 pubkey) */
-    size_t meta_size = (size_t)num_accounts * 33;
+    /* Skip account metas: 3 bytes each (index, is_signer, is_writable) */
+    size_t meta_size = (size_t)num_accounts * 3u;
     if (len < pos + meta_size) {
         return SOL_ERR_TRUNCATED;
     }
@@ -1010,7 +1010,7 @@ sol_instructions_sysvar_load_instruction(const uint8_t* data,
 
     /* Read program ID */
     if (out_program_id) {
-        memcpy(out_program_id, data + pos, 32);
+        memcpy(out_program_id->bytes, data + pos, 32);
     }
     pos += 32;
 

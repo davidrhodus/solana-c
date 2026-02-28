@@ -205,7 +205,11 @@ parse_value(const char** pp, sol_config_value_t* value) {
     /* String */
     if (*p == '"' || *p == '\'') {
         value->type = SOL_CONFIG_STRING;
-        return parse_string(&p, &value->data.string);
+        sol_err_t err = parse_string(&p, &value->data.string);
+        if (err == SOL_OK) {
+            *pp = p;
+        }
+        return err;
     }
 
     /* Array */

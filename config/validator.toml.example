@@ -73,11 +73,12 @@ incremental_interval = 5000
 # Optional: verify snapshot accounts hash at load time (very expensive)
 # verify_accounts_hash = false
 # Optional: snapshot service manifest URL for auto-bootstrapping
+# Defaults to https://data.pipedev.network/snapshot-manifest.json. When no
+# ledger.snapshot_path is set, the validator refreshes snapshot archives from
+# this manifest on startup.
 # manifest_url = "https://data.pipedev.network/snapshot-manifest.json"
-# Optional: RPC URLs to try if snapshot service fails (each URL should serve /snapshot.tar.*)
-# rpc_urls = [
-#   "http://127.0.0.1:8899"
-# ]
+# Optional: snapshot RPC URLs for fallback download when the manifest is stale.
+# rpc_urls = ["http://69.67.148.123:18899", "http://5.199.164.220:8899"]
 
 [logging]
 # Log level: trace, debug, info, warn, error

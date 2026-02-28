@@ -431,7 +431,7 @@ sol_crds_get_entries_since(
     for (size_t i = 0; i < crds->capacity && count < max_count; i++) {
         sol_crds_bucket_t* b = &crds->buckets[i];
         if (b->occupied && !b->deleted &&
-            b->entry.local_timestamp > since) {
+            b->entry.insert_timestamp > since) {
             out[count++] = &b->entry;
         }
     }

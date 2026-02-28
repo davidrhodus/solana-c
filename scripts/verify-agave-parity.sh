@@ -98,7 +98,7 @@ Environment:
   AGAVE_EXPECT_VERSION    If set (default: 3.1.8), warn when Agave --version doesn't contain this string. Set empty to disable.
   SNAPSHOT_FETCH_BIN      Path to sol-snapshot-fetch helper (default: ./build.local/bin/sol-snapshot-fetch)
   REFRESH_SNAPSHOTS       If 1, refresh snapshot archives via sol-snapshot-fetch (default: 1)
-  SNAPSHOT_FETCH_RPC_URL  Optional RPC URL for snapshot-fetch fallback (default: unset)
+  SNAPSHOT_FETCH_RPC_URL  (ignored) RPC URL for snapshot-fetch (manifest-only)
   SOLANAC_LEDGER_DIR      Reuse an existing solana-c ledger dir (default: <workdir>/solanac.ledger)
   AGAVE_LEDGER_DIR        Reuse an existing Agave ledger dir (default: <workdir>/agave.ledger)
   AGAVE_SNAPSHOTS_DIR     Reuse an existing Agave snapshots dir (default: <workdir>/agave.snapshots)
@@ -492,14 +492,15 @@ if (( TIMEOUT_SECS > 0 )); then
   fi
 fi
 
+if [[ -n "$SNAPSHOT_FETCH_RPC_URL" ]]; then
+  echo "warn: SNAPSHOT_FETCH_RPC_URL is ignored; snapshot fetch uses manifest only" >&2
+fi
+
 if (( REFRESH_SNAPSHOTS )); then
   if [[ -x "$SNAPSHOT_FETCH_BIN" ]]; then
     net="$(infer_network)"
     echo "Refreshing snapshot archives in $SOURCE_ARCHIVES (network=${net})..." >&2
     fetch_args=(--output-dir "$SOURCE_ARCHIVES" --network "$net")
-    if [[ -n "$SNAPSHOT_FETCH_RPC_URL" ]]; then
-      fetch_args+=(--rpc-url "$SNAPSHOT_FETCH_RPC_URL")
-    fi
     if ! "$SNAPSHOT_FETCH_BIN" "${fetch_args[@]}"; then
       die "failed to refresh snapshot archives (set REFRESH_SNAPSHOTS=0 to skip)"
     fi
@@ -544,9 +545,6 @@ if ! FULL_SNAPSHOT="$(find_latest_full_snapshot "$SOURCE_ARCHIVES")"; then
     net="$(infer_network)"
     echo "No full snapshot found under $SOURCE_ARCHIVES; downloading latest snapshots (network=${net})..." >&2
     fetch_args=(--output-dir "$SOURCE_ARCHIVES" --network "$net")
-    if [[ -n "$SNAPSHOT_FETCH_RPC_URL" ]]; then
-      fetch_args+=(--rpc-url "$SNAPSHOT_FETCH_RPC_URL")
-    fi
     "$SNAPSHOT_FETCH_BIN" "${fetch_args[@]}" || true
   else
     die "no full snapshot found under $SOURCE_ARCHIVES (and SNAPSHOT_FETCH_BIN not executable: $SNAPSHOT_FETCH_BIN)"

@@ -297,6 +297,50 @@ TEST(blockstore_insert_duplicate) {
     sol_blockstore_destroy(bs);
 }
 
+TEST(blockstore_signature_only_difference_is_duplicate) {
+    sol_blockstore_t* bs = sol_blockstore_new(NULL);
+    TEST_ASSERT_NOT_NULL(bs);
+
+    const sol_slot_t slot = 1000;
+    const uint32_t index = 0;
+
+    sol_shred_t shred;
+    memset(&shred, 0, sizeof(shred));
+    shred.slot = slot;
+    shred.index = index;
+    shred.type = SOL_SHRED_TYPE_DATA;
+    shred.header.data.parent_slot = slot - 1;
+    shred.header.data.flags = SOL_SHRED_FLAG_LAST_IN_SLOT;
+
+    uint8_t payload[16];
+    memset(payload, 0xA5, sizeof(payload));
+
+    uint8_t raw1[256];
+    uint8_t raw2[256];
+    size_t len = build_mock_legacy_data_shred(raw1, sizeof(raw1),
+                                              slot, index,
+                                              0, 0,
+                                              SOL_SHRED_FLAG_LAST_IN_SLOT,
+                                              payload, sizeof(payload));
+    TEST_ASSERT(len > 0);
+    memcpy(raw2, raw1, len);
+
+    /* Mutate only the signature bytes. The shred content (signed bytes after
+     * the signature) is identical, so blockstore should treat it as a duplicate. */
+    raw1[0] = 0x11;
+    raw2[0] = 0x22;
+
+    sol_err_t err = sol_blockstore_insert_shred(bs, &shred, raw1, len);
+    TEST_ASSERT_EQ(err, SOL_OK);
+
+    err = sol_blockstore_insert_shred(bs, &shred, raw2, len);
+    TEST_ASSERT_EQ(err, SOL_ERR_EXISTS);
+
+    TEST_ASSERT_EQ(sol_blockstore_num_variants(bs, slot), 1);
+
+    sol_blockstore_destroy(bs);
+}
+
 TEST(blockstore_conflicting_data_shred_creates_variant) {
     sol_blockstore_t* bs = sol_blockstore_new(NULL);
     TEST_ASSERT(bs != NULL);
@@ -1435,6 +1479,7 @@ static test_case_t blockstore_tests[] = {
     TEST_CASE(blockstore_address_signature_index),
     TEST_CASE(blockstore_insert_single_shred),
     TEST_CASE(blockstore_insert_duplicate),
+    TEST_CASE(blockstore_signature_only_difference_is_duplicate),
     TEST_CASE(blockstore_conflicting_data_shred_creates_variant),
     TEST_CASE(blockstore_variant_can_complete_without_primary_full),
     TEST_CASE(blockstore_conflicting_shred_forks_all_conflicting_variants),

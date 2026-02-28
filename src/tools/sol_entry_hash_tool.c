@@ -27,6 +27,9 @@
 
 #define VERSION "0.1.0"
 
+static bool g_have_leader = false;
+static sol_pubkey_t g_leader_pubkey;
+
 static void
 dump_data_shred_info(sol_blockstore_t* bs, sol_slot_t slot, uint32_t index) {
     if (!bs) return;
@@ -65,7 +68,12 @@ dump_data_shred_info(sol_blockstore_t* bs, sol_slot_t slot, uint32_t index) {
         }
     }
 
-    printf("shred[%u]: variant=0x%02x flags=0x%02x size=%u payload_len=%zu merkle=%d proof=%u resigned=%d cap=%zu\n",
+    bool sig_ok = false;
+    if (g_have_leader) {
+        sig_ok = sol_shred_verify(&shred, &g_leader_pubkey);
+    }
+
+    printf("shred[%u]: variant=0x%02x flags=0x%02x size=%u payload_len=%zu merkle=%d proof=%u resigned=%d cap=%zu%s%s\n",
            (unsigned)index,
            (unsigned)shred.variant,
            (unsigned)shred.header.data.flags,
@@ -74,7 +82,9 @@ dump_data_shred_info(sol_blockstore_t* bs, sol_slot_t slot, uint32_t index) {
            shred.has_merkle ? 1 : 0,
            (unsigned)shred.merkle_proof_size,
            shred.resigned ? 1 : 0,
-           cap);
+           cap,
+           g_have_leader ? " sig_ok=" : "",
+           g_have_leader ? (sig_ok ? "1" : "0") : "");
 }
 
 static void
@@ -83,13 +93,14 @@ print_usage(const char* prog) {
             "sol-entry-hash %s - Debug Solana Entry/PoH hashing\n"
             "\n"
             "Usage:\n"
-            "  %s --rocksdb-path PATH --slot SLOT [--variant ID] [--start-hash HEX] [--parse-only]\n"
+            "  %s --rocksdb-path PATH --slot SLOT [--variant ID] [--start-hash HEX] [--leader PUBKEY] [--parse-only]\n"
             "\n"
             "Options:\n"
             "  --rocksdb-path PATH   RocksDB base directory (contains blockstore/ and accounts/)\n"
             "  --slot SLOT           Slot to inspect\n"
             "  --variant ID          Block variant id (default: 0)\n"
             "  --start-hash HEX      64-char hex start hash (optional)\n"
+            "  --leader PUBKEY       Verify shred signatures against this base58 leader pubkey (optional)\n"
             "  --parse-only          Only parse entries and print counts (skip hash derivation/checks)\n"
             "  -h, --help            Show help\n"
             "  -V, --version         Show version\n",
@@ -1901,6 +1912,7 @@ main(int argc, char** argv) {
     uint64_t slot = 0;
     uint32_t variant = 0;
     const char* start_hash_hex = NULL;
+    const char* leader_b58 = NULL;
     bool parse_only = false;
 
     static struct option long_opts[] = {
@@ -1909,6 +1921,7 @@ main(int argc, char** argv) {
         {"variant", required_argument, 0, 1002},
         {"start-hash", required_argument, 0, 1003},
         {"parse-only", no_argument, 0, 1004},
+        {"leader", required_argument, 0, 1005},
         {"help", no_argument, 0, 'h'},
         {"version", no_argument, 0, 'V'},
         {0, 0, 0, 0},
@@ -1932,6 +1945,9 @@ main(int argc, char** argv) {
         case 1004:
             parse_only = true;
             break;
+        case 1005:
+            leader_b58 = optarg;
+            break;
         case 'h':
             print_usage(argv[0]);
             return 0;
@@ -1947,6 +1963,17 @@ main(int argc, char** argv) {
     if (!rocksdb_base || slot == 0) {
         print_usage(argv[0]);
         return 1;
+    }
+
+    if (leader_b58 && leader_b58[0] != '\0') {
+        sol_pubkey_t pk = {{0}};
+        sol_err_t err = sol_pubkey_from_base58(leader_b58, &pk);
+        if (err != SOL_OK) {
+            fprintf(stderr, "Invalid --leader pubkey: %s\n", sol_err_str(err));
+            return 1;
+        }
+        g_leader_pubkey = pk;
+        g_have_leader = true;
     }
 
     sol_log_config_t log_cfg = (sol_log_config_t)SOL_LOG_CONFIG_DEFAULT;
@@ -2030,6 +2057,8 @@ main(int argc, char** argv) {
             block->data && block->data_len > 0) {
             size_t cumulative = 0;
             size_t boundaries = 0;
+            size_t boundary_offsets[8] = {0};
+            uint64_t boundary_next_u64[8] = {0};
             size_t first_boundary = 0;
             uint64_t first_boundary_next = 0;
             for (uint32_t i = 0; i <= meta.last_shred_index; i++) {
@@ -2056,6 +2085,10 @@ main(int argc, char** argv) {
                     if (first_boundary == 0 && have) {
                         first_boundary = cumulative;
                         first_boundary_next = next_u64;
+                    }
+                    if (boundaries < (sizeof(boundary_offsets) / sizeof(boundary_offsets[0]))) {
+                        boundary_offsets[boundaries] = cumulative;
+                        boundary_next_u64[boundaries] = next_u64;
                     }
                     boundaries++;
                     if (boundaries >= 8) break;
@@ -2100,6 +2133,67 @@ main(int argc, char** argv) {
                 printf("segment0.expected_next_u64=%" PRIu64 "\n", first_boundary_next);
                 if (seg_err != SOL_OK) {
                     printf("segment0.parse_err=%s\n", sol_err_str(seg_err));
+                }
+            }
+
+            /* Try to parse additional segments at DATA_COMPLETE boundaries.
+             *
+             * Each erasure batch may start a new Vec<Entry> segment, and segment
+             * headers are often located at the start of the next batch (i.e.
+             * right after the boundary). This helps diagnose misalignment vs a
+             * truly malformed transaction in a later segment. */
+            if (boundaries > 0) {
+                size_t seg_count = boundaries < 8 ? boundaries : 8;
+                for (size_t si = 0; si < seg_count; si++) {
+                    size_t start = (si == 0) ? 0 : boundary_offsets[si - 1];
+                    size_t expected_end = boundary_offsets[si];
+                    if (start + 8u > block->data_len) {
+                        printf("segment%zu: start=%zu (eof)\n", si, start);
+                        continue;
+                    }
+
+                    uint64_t entry_count = 0;
+                    memcpy(&entry_count, block->data + start, 8);
+                    size_t off = start + 8u;
+                    sol_err_t seg_err = SOL_OK;
+                    for (uint64_t ei = 0; ei < entry_count; ei++) {
+                        sol_entry_t entry;
+                        sol_entry_init(&entry);
+                        size_t consumed = 0;
+                        seg_err = sol_entry_parse_ex(&entry,
+                                                     block->data + off,
+                                                     block->data_len - off,
+                                                     &consumed,
+                                                     false);
+                        sol_entry_cleanup(&entry);
+                        if (seg_err != SOL_OK || consumed == 0) {
+                            break;
+                        }
+                        off += consumed;
+                        if (off > block->data_len) {
+                            seg_err = SOL_ERR_DECODE;
+                            break;
+                        }
+                    }
+
+                    uint64_t next_at_off = 0;
+                    bool have_next_at_off = (off + 8u <= block->data_len);
+                    if (have_next_at_off) {
+                        memcpy(&next_at_off, block->data + off, 8);
+                    }
+
+                    printf("segment%zu.boundary: start=%zu entries=%" PRIu64 " consumed=%zu expected_end=%zu delta=%zd next_u64=%" PRIu64 "%s\n",
+                           si,
+                           start,
+                           entry_count,
+                           off,
+                           expected_end,
+                           (ssize_t)off - (ssize_t)expected_end,
+                           next_at_off,
+                           have_next_at_off ? "" : " (eof)");
+                    if (seg_err != SOL_OK) {
+                        printf("segment%zu.boundary.parse_err=%s\n", si, sol_err_str(seg_err));
+                    }
                 }
             }
         }

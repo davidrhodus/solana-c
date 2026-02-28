@@ -32,6 +32,7 @@ GOSSIP_PORT="${GOSSIP_PORT:-8027}"
 TPU_PORT="${TPU_PORT:-8026}"
 TVU_PORT="${TVU_PORT:-8028}"
 RPC_PORT="${RPC_PORT:-8899}"
+RPC_BIND="${RPC_BIND:-127.0.0.1}"
 
 if [[ ! -x "${BIN}" ]]; then
   BIN="./build/bin/solana-validator"
@@ -61,6 +62,22 @@ mkdir -p "${ROCKSDB_PATH}"
 
 # Best-effort: raise fd limit for gossip + RocksDB.
 ulimit -n 1000000 >/dev/null 2>&1 || true
+
+# Best-effort: keep CPUs at max frequency during bootstrap/replay.
+# On some hosts the default governor ("schedutil") can leave cores stuck at low
+# clocks, making snapshot load and replay look artificially slow.
+if [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
+  if [[ -w /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+    echo "Setting CPU governor to performance (best-effort)..." >&2
+    for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+      [[ -w "${gov}" ]] || continue
+      echo performance > "${gov}" 2>/dev/null || true
+    done
+  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    echo "Setting CPU governor to performance via sudo (best-effort)..." >&2
+    echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1 || true
+  fi
+fi
 
 if [[ -z "${HALT_AT}" && "${HALT_AT_PROVIDED}" -eq 0 ]]; then
   # Prefer the snapshot service manifest so the halt slot stays consistent even
@@ -134,7 +151,7 @@ args=(
   --ledger "${LEDGER_DIR}"
   --rocksdb-path "${ROCKSDB_PATH}"
   --no-voting
-  --rpc-bind 0.0.0.0
+  --rpc-bind "${RPC_BIND}"
   --rpc-port "${RPC_PORT}"
   --log-level info
   --log-file "${LOG_FILE}"

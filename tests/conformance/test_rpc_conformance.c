@@ -14,6 +14,7 @@
 #include "../src/blockstore/sol_blockstore.h"
 #include "../src/shred/sol_shred.h"
 #include "../src/programs/sol_token_program.h"
+#include "../src/txn/sol_bincode.h"
 
 #include <errno.h>
 #include <netinet/in.h>
@@ -41,20 +42,121 @@ fill_pubkey(sol_pubkey_t* out, uint8_t seed) {
     memset(out->bytes, seed, SOL_PUBKEY_SIZE);
 }
 
+static void
+hash_to_base58(const sol_hash_t* h, char* out, size_t out_sz) {
+    /* Avoid strict-aliasing UB from casting sol_hash_t* to sol_pubkey_t*. */
+    sol_pubkey_t pk;
+    memcpy(pk.bytes, h->bytes, SOL_HASH_SIZE);
+    sol_pubkey_to_base58(&pk, out, out_sz);
+}
+
+static size_t
+test_base64_encode(const uint8_t* input, size_t input_len, char* output, size_t output_max) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    size_t out_len = ((input_len + 2) / 3) * 4;
+    if (!output || output_max < out_len + 1) {
+        return 0;
+    }
+
+    size_t i = 0;
+    size_t o = 0;
+    while (i < input_len) {
+        size_t rem = input_len - i;
+        uint32_t b0 = input[i++];
+        uint32_t b1 = (rem > 1) ? input[i++] : 0;
+        uint32_t b2 = (rem > 2) ? input[i++] : 0;
+        uint32_t triple = (b0 << 16) | (b1 << 8) | b2;
+
+        output[o++] = table[(triple >> 18) & 0x3F];
+        output[o++] = table[(triple >> 12) & 0x3F];
+        output[o++] = (rem > 1) ? table[(triple >> 6) & 0x3F] : '=';
+        output[o++] = (rem > 2) ? table[triple & 0x3F] : '=';
+    }
+
+    output[o] = '\0';
+    return o;
+}
+
+static size_t
+build_minimal_legacy_message(uint8_t* out, size_t out_max) {
+    sol_encoder_t enc;
+    sol_encoder_init(&enc, out, out_max);
+
+    /* Message header: 1 signer, 0 readonly signed, 1 readonly unsigned */
+    if (sol_encode_u8(&enc, 1) != SOL_OK) return 0;
+    if (sol_encode_u8(&enc, 0) != SOL_OK) return 0;
+    if (sol_encode_u8(&enc, 1) != SOL_OK) return 0;
+
+    /* Account keys: 2 accounts */
+    if (sol_encode_compact_u16(&enc, 2) != SOL_OK) return 0;
+
+    /* Account 0: fee payer (deterministic, not a real key) */
+    uint8_t fee_payer[32];
+    for (int i = 0; i < 32; i++) fee_payer[i] = (uint8_t)(i + 1);
+    if (sol_encode_bytes(&enc, fee_payer, 32) != SOL_OK) return 0;
+
+    /* Account 1: system program */
+    if (sol_encode_bytes(&enc, SOL_SYSTEM_PROGRAM_ID.bytes, 32) != SOL_OK) return 0;
+
+    /* Recent blockhash (32 bytes) */
+    uint8_t blockhash[32];
+    for (int i = 0; i < 32; i++) blockhash[i] = (uint8_t)(255 - i);
+    if (sol_encode_bytes(&enc, blockhash, 32) != SOL_OK) return 0;
+
+    /* Instructions: 1 instruction */
+    if (sol_encode_compact_u16(&enc, 1) != SOL_OK) return 0;
+
+    /* Instruction 0 */
+    if (sol_encode_u8(&enc, 1) != SOL_OK) return 0;          /* program_id_index = 1 (system program) */
+    if (sol_encode_compact_u16(&enc, 1) != SOL_OK) return 0; /* 1 account */
+    if (sol_encode_u8(&enc, 0) != SOL_OK) return 0;          /* account index 0 */
+    if (sol_encode_compact_u16(&enc, 4) != SOL_OK) return 0; /* 4 bytes of data */
+    uint8_t instr_data[] = {0x02, 0x00, 0x00, 0x00};
+    if (sol_encode_bytes(&enc, instr_data, sizeof(instr_data)) != SOL_OK) return 0;
+
+    return sol_encoder_len(&enc);
+}
+
+static size_t
+build_minimal_legacy_tx(uint8_t* out, size_t out_max) {
+    sol_encoder_t enc;
+    sol_encoder_init(&enc, out, out_max);
+
+    /* Signature count: 1 */
+    if (sol_encode_compact_u16(&enc, 1) != SOL_OK) return 0;
+
+    /* Signature (64 bytes of zeros for testing - won't verify) */
+    uint8_t fake_sig[64] = {0};
+    if (sol_encode_bytes(&enc, fake_sig, 64) != SOL_OK) return 0;
+
+    uint8_t msg[512];
+    size_t msg_len = build_minimal_legacy_message(msg, sizeof(msg));
+    if (msg_len == 0) return 0;
+
+    if (sol_encode_bytes(&enc, msg, msg_len) != SOL_OK) return 0;
+    return sol_encoder_len(&enc);
+}
+
 static char*
 http_post_json(const char* host, uint16_t port, const char* body, size_t body_len) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return NULL;
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+    union {
+        struct sockaddr    sa;
+        struct sockaddr_in in;
+    } addr;
+    memset(&addr, 0, sizeof(addr));
+
+    addr.in.sin_family = AF_INET;
+    addr.in.sin_port = htons(port);
+    if (inet_pton(AF_INET, host, &addr.in.sin_addr) != 1) {
         close(fd);
         return NULL;
     }
 
-    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    if (connect(fd, &addr.sa, sizeof(addr.in)) < 0) {
         close(fd);
         return NULL;
     }
@@ -255,6 +357,28 @@ teardown_rpc_fixture(void) {
     g_port = 0;
 }
 
+static void
+rpc_smoke_call(const char* method, const char* req) {
+    char* resp = http_post_json("127.0.0.1", g_port, req, strlen(req));
+    TEST_ASSERT_MSG(resp != NULL, "RPC smoke: no response");
+
+    char msg[256];
+
+    snprintf(msg, sizeof(msg), "%s: missing jsonrpc", method);
+    TEST_ASSERT_MSG(strstr(resp, "\"jsonrpc\":\"2.0\"") != NULL, msg);
+
+    snprintf(msg, sizeof(msg), "%s: missing id", method);
+    TEST_ASSERT_MSG(strstr(resp, "\"id\":") != NULL, msg);
+
+    snprintf(msg, sizeof(msg), "%s: method not found", method);
+    TEST_ASSERT_MSG(strstr(resp, "\"code\":-32601") == NULL, msg);
+
+    snprintf(msg, sizeof(msg), "%s: missing result/error", method);
+    TEST_ASSERT_MSG(strstr(resp, "\"result\"") != NULL || strstr(resp, "\"error\"") != NULL, msg);
+
+    free(resp);
+}
+
 TEST(rpc_id_echo_number) {
     const char* req = "{\"jsonrpc\":\"2.0\",\"id\":12345,\"method\":\"getVersion\"}";
     char* resp = http_post_json("127.0.0.1", g_port, req, strlen(req));
@@ -396,7 +520,7 @@ TEST(rpc_get_block_height_returns_tick_height) {
 
 TEST(rpc_get_genesis_hash_matches_fixture) {
     char expected[64];
-    sol_pubkey_to_base58((const sol_pubkey_t*)&g_genesis_hash, expected, sizeof(expected));
+    hash_to_base58(&g_genesis_hash, expected, sizeof(expected));
 
     const char* req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getGenesisHash\"}";
     char* resp = http_post_json("127.0.0.1", g_port, req, strlen(req));
@@ -418,7 +542,7 @@ TEST(rpc_get_identity_matches_fixture) {
 
 TEST(rpc_get_latest_blockhash_contains_fixture) {
     char expected[64];
-    sol_pubkey_to_base58((const sol_pubkey_t*)&g_blockhash, expected, sizeof(expected));
+    hash_to_base58(&g_blockhash, expected, sizeof(expected));
 
     const char* req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLatestBlockhash\"}";
     char* resp = http_post_json("127.0.0.1", g_port, req, strlen(req));
@@ -436,6 +560,176 @@ TEST(rpc_get_balance_missing_params_is_error) {
     TEST_ASSERT(strstr(resp, "\"code\":-32602") != NULL);
     TEST_ASSERT(strstr(resp, "Expected array") != NULL);
     free(resp);
+}
+
+TEST(rpc_all_methods_smoke) {
+    /* Precompute commonly-used addresses */
+    char system_pk[64];
+    char token_mint_pk[64];
+    char token_owner_pk[64];
+    char token_account_pk[64];
+    char token_program_pk[64];
+    char blockhash_str[64];
+
+    sol_pubkey_to_base58(&g_system_account, system_pk, sizeof(system_pk));
+    sol_pubkey_to_base58(&g_token_mint, token_mint_pk, sizeof(token_mint_pk));
+    sol_pubkey_to_base58(&g_token_owner, token_owner_pk, sizeof(token_owner_pk));
+    sol_pubkey_to_base58(&g_token_account, token_account_pk, sizeof(token_account_pk));
+    sol_pubkey_to_base58(&SOL_TOKEN_PROGRAM_ID, token_program_pk, sizeof(token_program_pk));
+    hash_to_base58(&g_blockhash, blockhash_str, sizeof(blockhash_str));
+
+    /* A syntactically-valid signature: 64 zero bytes -> base58 "111...." (64 chars). */
+    const char* zero_sig = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /* Build a minimal, decodable legacy transaction and message */
+    uint8_t tx_bytes[256];
+    size_t tx_len = build_minimal_legacy_tx(tx_bytes, sizeof(tx_bytes));
+    TEST_ASSERT_MSG(tx_len > 0, "Failed to build minimal tx");
+
+    char tx_b64[512];
+    TEST_ASSERT_MSG(test_base64_encode(tx_bytes, tx_len, tx_b64, sizeof(tx_b64)) > 0, "Failed to base64-encode tx");
+
+    uint8_t msg_bytes[256];
+    size_t msg_len = build_minimal_legacy_message(msg_bytes, sizeof(msg_bytes));
+    TEST_ASSERT_MSG(msg_len > 0, "Failed to build minimal message");
+
+    char msg_b64[512];
+    TEST_ASSERT_MSG(test_base64_encode(msg_bytes, msg_len, msg_b64, sizeof(msg_b64)) > 0, "Failed to base64-encode message");
+
+    char req[2048];
+
+    /* Core/info */
+    rpc_smoke_call("getVersion", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getVersion\"}");
+    rpc_smoke_call("getHealth", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}");
+    rpc_smoke_call("getSlot", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSlot\"}");
+    rpc_smoke_call("getBlockHeight", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlockHeight\"}");
+    rpc_smoke_call("getEpochInfo", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getEpochInfo\"}");
+    rpc_smoke_call("getEpochSchedule", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getEpochSchedule\"}");
+    rpc_smoke_call("getGenesisHash", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getGenesisHash\"}");
+    rpc_smoke_call("getIdentity", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getIdentity\"}");
+
+    /* Accounts */
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBalance\",\"params\":[\"%s\"]}",
+             system_pk);
+    rpc_smoke_call("getBalance", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"%s\"]}",
+             system_pk);
+    rpc_smoke_call("getAccountInfo", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getMultipleAccounts\",\"params\":[[\"%s\",\"%s\"]]}",
+             system_pk, token_account_pk);
+    rpc_smoke_call("getMultipleAccounts", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getProgramAccounts\",\"params\":[\"%s\"]}",
+             token_program_pk);
+    rpc_smoke_call("getProgramAccounts", req);
+
+    /* Token */
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTokenAccountBalance\",\"params\":[\"%s\"]}",
+             token_account_pk);
+    rpc_smoke_call("getTokenAccountBalance", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTokenSupply\",\"params\":[\"%s\"]}",
+             token_mint_pk);
+    rpc_smoke_call("getTokenSupply", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTokenLargestAccounts\",\"params\":[\"%s\"]}",
+             token_mint_pk);
+    rpc_smoke_call("getTokenLargestAccounts", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTokenAccountsByOwner\",\"params\":[\"%s\",{\"mint\":\"%s\"}]}",
+             token_owner_pk, token_mint_pk);
+    rpc_smoke_call("getTokenAccountsByOwner", req);
+
+    /* Blockstore */
+    rpc_smoke_call("getLatestBlockhash", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLatestBlockhash\"}");
+    rpc_smoke_call("getFirstAvailableBlock", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getFirstAvailableBlock\"}");
+    rpc_smoke_call("getBlocksWithLimit", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlocksWithLimit\",\"params\":[5,2]}");
+    rpc_smoke_call("getBlocks", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlocks\",\"params\":[5,7]}");
+    rpc_smoke_call("getBlock", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlock\",\"params\":[5]}");
+    rpc_smoke_call("getBlockTime", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlockTime\",\"params\":[5]}");
+    rpc_smoke_call("getBlockCommitment", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlockCommitment\",\"params\":[5]}");
+
+    /* Cluster/consensus-ish */
+    rpc_smoke_call("getSlotLeader", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSlotLeader\"}");
+    rpc_smoke_call("getLeaderSchedule", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getLeaderSchedule\",\"params\":[123]}");
+    rpc_smoke_call("getVoteAccounts", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getVoteAccounts\"}");
+    rpc_smoke_call("getClusterNodes", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getClusterNodes\"}");
+
+    /* Inflation/supply */
+    rpc_smoke_call("getInflationGovernor", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getInflationGovernor\"}");
+    rpc_smoke_call("getInflationRate", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getInflationRate\"}");
+    rpc_smoke_call("getSupply", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSupply\"}");
+
+    /* Fees, rent, status */
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getMinimumBalanceForRentExemption\",\"params\":[0]}");
+    rpc_smoke_call("getMinimumBalanceForRentExemption", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getFeeForMessage\",\"params\":[\"%s\"]}",
+             msg_b64);
+    rpc_smoke_call("getFeeForMessage", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"isBlockhashValid\",\"params\":[\"%s\"]}",
+             blockhash_str);
+    rpc_smoke_call("isBlockhashValid", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getStakeActivation\",\"params\":[\"%s\"]}",
+             system_pk);
+    rpc_smoke_call("getStakeActivation", req);
+
+    rpc_smoke_call("getTransactionCount", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTransactionCount\"}");
+    rpc_smoke_call("getRecentPrioritizationFees", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getRecentPrioritizationFees\"}");
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSignaturesForAddress\",\"params\":[\"%s\"]}",
+             system_pk);
+    rpc_smoke_call("getSignaturesForAddress", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSignatureStatuses\",\"params\":[[\"%s\"]]}",
+             zero_sig);
+    rpc_smoke_call("getSignatureStatuses", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getTransaction\",\"params\":[\"%s\"]}",
+             zero_sig);
+    rpc_smoke_call("getTransaction", req);
+
+    /* TX submit/sim */
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"sendTransaction\",\"params\":[\"%s\"]}",
+             tx_b64);
+    rpc_smoke_call("sendTransaction", req);
+
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"simulateTransaction\",\"params\":[\"%s\"]}",
+             tx_b64);
+    rpc_smoke_call("simulateTransaction", req);
+
+    /* Misc */
+    snprintf(req, sizeof(req),
+             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"requestAirdrop\",\"params\":[\"%s\",1]}",
+             system_pk);
+    rpc_smoke_call("requestAirdrop", req);
+
+    rpc_smoke_call("getBlockProduction", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getBlockProduction\"}");
+    rpc_smoke_call("getHighestSnapshotSlot", "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHighestSnapshotSlot\"}");
+
+    /* Subscription methods (accountSubscribe/logsSubscribe/...) are websocket-only in practice and
+     * intentionally not covered by this HTTP smoke test. */
 }
 
 int
@@ -459,6 +753,7 @@ main(void) {
         TEST_CASE(rpc_get_identity_matches_fixture),
         TEST_CASE(rpc_get_latest_blockhash_contains_fixture),
         TEST_CASE(rpc_get_balance_missing_params_is_error),
+        TEST_CASE(rpc_all_methods_smoke),
     };
 
     int failed = RUN_TESTS("RPC Conformance (HTTP)", tests);

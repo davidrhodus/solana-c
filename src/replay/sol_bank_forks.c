@@ -113,6 +113,23 @@ find_entry_hash(sol_bank_forks_t* forks, sol_slot_t slot, const sol_hash_t* bank
     return NULL;
 }
 
+static sol_slot_t
+recompute_highest_slot(sol_bank_forks_t* forks) {
+    if (!forks) return 0;
+
+    sol_slot_t highest = forks->root_slot;
+    for (size_t i = 0; i < forks->bucket_count; i++) {
+        sol_bank_entry_t* entry = forks->buckets[i];
+        while (entry) {
+            if (!entry->is_dead && entry->slot > highest) {
+                highest = entry->slot;
+            }
+            entry = entry->next;
+        }
+    }
+    return highest;
+}
+
 sol_bank_forks_t*
 sol_bank_forks_new(sol_bank_t* root_bank,
                    const sol_bank_forks_config_t* config) {
@@ -562,7 +579,9 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
                          (unsigned long)forks->root_slot, (unsigned long)slot, chain_len);
             for (size_t i = chain_len - 1; i-- > 0;) {
                 sol_accounts_db_t* bank_db = sol_bank_get_accounts_db(chain[i]->bank);
-                sol_err_t err = sol_accounts_db_apply_delta(forks->accounts_db, bank_db);
+                sol_err_t err = sol_accounts_db_apply_delta_default_slot(forks->accounts_db,
+                                                                        bank_db,
+                                                                        chain[i]->slot);
                 if (err != SOL_OK) {
                     sol_free(chain);
                     pthread_rwlock_unlock(&forks->lock);
@@ -575,6 +594,13 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
             if (new_root_db && new_root_db != forks->accounts_db) {
                 sol_accounts_db_set_parent(new_root_db, forks->accounts_db);
                 sol_accounts_db_clear_local(new_root_db);
+            }
+
+            /* Mark the newly-rooted slots' AppendVec immutable so they can be mmap'd.
+             * Do this only after all deltas apply successfully to avoid leaving the
+             * rooted DB in a partially-sealed state on error. */
+            for (size_t i = chain_len - 1; i-- > 0;) {
+                (void)sol_accounts_db_appendvec_seal_slot(forks->accounts_db, chain[i]->slot);
             }
         }
 
@@ -609,6 +635,8 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
 
     forks->root_slot = slot;
     forks->stats.root_slot = slot;
+    forks->highest_slot = recompute_highest_slot(forks);
+    forks->stats.highest_slot = forks->highest_slot;
 
     pthread_rwlock_unlock(&forks->lock);
     return SOL_OK;
@@ -704,7 +732,9 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
         if (chain_len > 1) {
             for (size_t i = chain_len - 1; i-- > 0;) {
                 sol_accounts_db_t* bank_db = sol_bank_get_accounts_db(chain[i]->bank);
-                sol_err_t err = sol_accounts_db_apply_delta(forks->accounts_db, bank_db);
+                sol_err_t err = sol_accounts_db_apply_delta_default_slot(forks->accounts_db,
+                                                                        bank_db,
+                                                                        chain[i]->slot);
                 if (err != SOL_OK) {
                     sol_free(chain);
                     pthread_rwlock_unlock(&forks->lock);
@@ -716,6 +746,13 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
             if (new_root_db && new_root_db != forks->accounts_db) {
                 sol_accounts_db_set_parent(new_root_db, forks->accounts_db);
                 sol_accounts_db_clear_local(new_root_db);
+            }
+
+            /* Mark the newly-rooted slots' AppendVec immutable so they can be mmap'd.
+             * Do this only after all deltas apply successfully to avoid leaving the
+             * rooted DB in a partially-sealed state on error. */
+            for (size_t i = chain_len - 1; i-- > 0;) {
+                (void)sol_accounts_db_appendvec_seal_slot(forks->accounts_db, chain[i]->slot);
             }
         }
 
@@ -782,6 +819,8 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
 
     forks->root_slot = slot;
     forks->stats.root_slot = slot;
+    forks->highest_slot = recompute_highest_slot(forks);
+    forks->stats.highest_slot = forks->highest_slot;
 
     pthread_rwlock_unlock(&forks->lock);
     return SOL_OK;

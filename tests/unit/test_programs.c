@@ -253,14 +253,14 @@ TEST(ed25519_precompile_cross_instruction_offsets) {
 
     uint8_t scratch[1];
     size_t sysvar_len = sizeof(scratch);
-    sol_err_t err = sol_instructions_sysvar_serialize(&tx, 1, scratch, &sysvar_len);
+    sol_err_t err = sol_instructions_sysvar_serialize(&tx, 1, NULL, 0, scratch, &sysvar_len);
     TEST_ASSERT_EQ(err, SOL_ERR_INVAL);
     TEST_ASSERT_GT(sysvar_len, 0);
 
     uint8_t* sysvar_data = sol_alloc(sysvar_len);
     TEST_ASSERT_NOT_NULL(sysvar_data);
     size_t written = sysvar_len;
-    TEST_ASSERT_EQ(sol_instructions_sysvar_serialize(&tx, 1, sysvar_data, &written), SOL_OK);
+    TEST_ASSERT_EQ(sol_instructions_sysvar_serialize(&tx, 1, NULL, 0, sysvar_data, &written), SOL_OK);
 
     sol_account_t* sysvar_account = sol_account_new(1, written, &SOL_SYSVAR_PROGRAM_ID);
     TEST_ASSERT_NOT_NULL(sysvar_account);
@@ -382,14 +382,14 @@ TEST(secp256k1_precompile_cross_instruction_offsets) {
 
     uint8_t scratch[1];
     size_t sysvar_len = sizeof(scratch);
-    sol_err_t err = sol_instructions_sysvar_serialize(&tx, 1, scratch, &sysvar_len);
+    sol_err_t err = sol_instructions_sysvar_serialize(&tx, 1, NULL, 0, scratch, &sysvar_len);
     TEST_ASSERT_EQ(err, SOL_ERR_INVAL);
     TEST_ASSERT_GT(sysvar_len, 0);
 
     uint8_t* sysvar_data = sol_alloc(sysvar_len);
     TEST_ASSERT_NOT_NULL(sysvar_data);
     size_t written = sysvar_len;
-    TEST_ASSERT_EQ(sol_instructions_sysvar_serialize(&tx, 1, sysvar_data, &written), SOL_OK);
+    TEST_ASSERT_EQ(sol_instructions_sysvar_serialize(&tx, 1, NULL, 0, sysvar_data, &written), SOL_OK);
 
     sol_account_t* sysvar_account = sol_account_new(1, written, &SOL_SYSVAR_PROGRAM_ID);
     TEST_ASSERT_NOT_NULL(sysvar_account);
@@ -624,8 +624,8 @@ TEST(bpf_upgradeable_extend_program_reallocates_and_funds_rent) {
     memcpy(pd->data, &typ, 4);
     uint64_t deployed_slot = 0;
     memcpy(pd->data + 4, &deployed_slot, 8);
-    memcpy(pd->data + 12, authority.bytes, 32);
-    pd->data[12 + 32] = 1; /* has_upgrade_authority */
+    pd->data[12] = 1; /* has_upgrade_authority (Option tag) */
+    memcpy(pd->data + 13, authority.bytes, 32);
     TEST_ASSERT_EQ(sol_bank_store_account(bank, &program_data, pd), SOL_OK);
     sol_account_destroy(pd);
 

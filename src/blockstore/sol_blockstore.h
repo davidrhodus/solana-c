@@ -409,6 +409,28 @@ sol_err_t sol_blockstore_index_transaction(
 );
 
 /*
+ * Batch-write address signature index entries.
+ *
+ * This is a lower-level helper to avoid per-transaction RocksDB write overhead
+ * in replay/catchup. Each op in `batch` must be a `SOL_BATCH_OP_PUT` where:
+ * - key: [32 bytes address][8 bytes inv_slot_be][64 bytes signature]
+ * - value: 4 bytes int32 error code (host endian)
+ *
+ * Returns SOL_ERR_NOT_IMPLEMENTED if the address signature index is disabled or
+ * the backend does not support batch writes.
+ */
+sol_err_t sol_blockstore_address_sig_batch_write(
+    sol_blockstore_t*     bs,
+    sol_storage_batch_t*  batch
+);
+
+/*
+ * Returns true if the address signature index is available and supports
+ * `batch_write`.
+ */
+bool sol_blockstore_address_sig_batch_supported(const sol_blockstore_t* bs);
+
+/*
  * Query recent signatures for an address.
  *
  * Results are returned in descending slot order (best-effort).

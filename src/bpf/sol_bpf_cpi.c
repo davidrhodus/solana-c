@@ -11,6 +11,7 @@
 #include "../crypto/sol_ed25519.h"
 #include "../runtime/sol_compute_budget.h"
 #include "../util/sol_alloc.h"
+#include "../util/sol_hash_fn.h"
 #include "../util/sol_log.h"
 #include "../txn/sol_pubkey.h"
 #include <string.h>
@@ -96,7 +97,7 @@ typedef struct {
 /*
  * Read account info from VM memory
  */
-static sol_err_t
+static SOL_UNUSED sol_err_t
 read_account_info(
     sol_bpf_vm_t* vm,
     uint64_t account_info_ptr,
@@ -169,6 +170,9 @@ read_instruction_rust(
      *   offset 32: data.cap      (u64)
      *   offset 40: data.len      (u64)
      *   offset 48: program_id    (32 bytes)
+     *
+     * This is the only ABI used by all current programs, so do it first and
+     * avoid probing the legacy ABI unless stable validation fails.
      */
     sol_pubkey_t pid_stable = {0};
     uint64_t acc_ptr_stable = 0, acc_len_stable = 0;
@@ -193,6 +197,15 @@ read_instruction_rust(
         if (sol_bpf_memory_translate(&vm->memory, acc_ptr_stable, acc_len_stable * 34, false) == NULL) {
             stable_ok = false;
         }
+    }
+
+    if (stable_ok) {
+        *program_id   = pid_stable;
+        *accounts_ptr = acc_ptr_stable;
+        *accounts_len = acc_len_stable;
+        *data_ptr     = dat_ptr_stable;
+        *data_len     = dat_len_stable;
+        return SOL_OK;
     }
 
     /*
@@ -229,17 +242,7 @@ read_instruction_rust(
         }
     }
 
-    /* Prefer StableInstruction (all current BPF programs use this) */
-    if (stable_ok && !legacy_ok) {
-        *program_id   = pid_stable;
-        *accounts_ptr = acc_ptr_stable;
-        *accounts_len = acc_len_stable;
-        *data_ptr     = dat_ptr_stable;
-        *data_len     = dat_len_stable;
-        return SOL_OK;
-    }
-
-    if (legacy_ok && !stable_ok) {
+    if (legacy_ok) {
         sol_log_debug("CPI: rust instruction ABI=legacy (program_id,accounts,data) instr_ptr=0x%lx",
                       (unsigned long)instruction_ptr);
         *program_id   = pid_legacy;
@@ -247,18 +250,6 @@ read_instruction_rust(
         *accounts_len = acc_len_legacy;
         *data_ptr     = dat_ptr_legacy;
         *data_len     = dat_len_legacy;
-        return SOL_OK;
-    }
-
-    if (stable_ok && legacy_ok) {
-        /* Both match — prefer stable (current ABI) */
-        sol_log_debug("CPI: rust instruction ABI ambiguous (stable+legacy ok); using stable instr_ptr=0x%lx",
-                      (unsigned long)instruction_ptr);
-        *program_id   = pid_stable;
-        *accounts_ptr = acc_ptr_stable;
-        *accounts_len = acc_len_stable;
-        *data_ptr     = dat_ptr_stable;
-        *data_len     = dat_len_stable;
         return SOL_OK;
     }
 
@@ -329,7 +320,7 @@ read_instruction_c(
  *   - is_signer: bool (1 byte)
  *   - is_writable: bool (1 byte)
  */
-static sol_err_t
+static SOL_UNUSED sol_err_t
 read_account_meta_rust(
     sol_bpf_vm_t* vm,
     uint64_t meta_ptr,
@@ -360,7 +351,7 @@ read_account_meta_rust(
  *   - is_signer: bool (1 byte)
  *   - padding
  */
-static sol_err_t
+static SOL_UNUSED sol_err_t
 read_account_meta_c(
     sol_bpf_vm_t* vm,
     uint64_t meta_ptr,
@@ -392,20 +383,82 @@ read_account_meta_c(
     return SOL_OK;
 }
 
-static int
-find_account_info_index(const sol_pubkey_t* infos, size_t count, const sol_pubkey_t* pubkey) {
-    if (infos == NULL || pubkey == NULL) {
-        return -1;
-    }
+#define CPI_INFO_MAP_SZ (256u)
+#define CPI_INFO_MAP_MASK (CPI_INFO_MAP_SZ - 1u)
 
-    for (size_t i = 0; i < count; i++) {
-        if (sol_pubkey_eq(&infos[i], pubkey)) {
-            return (int)i;
+static inline void
+cpi_info_map_init(int16_t map[static CPI_INFO_MAP_SZ]) {
+    memset(map, 0xff, CPI_INFO_MAP_SZ * sizeof(map[0])); /* -1 */
+}
+
+static inline void
+cpi_info_map_insert(
+    int16_t map[static CPI_INFO_MAP_SZ],
+    const sol_pubkey_t* info_pubkeys,
+    size_t idx
+) {
+    uint64_t h = sol_xxhash64(info_pubkeys[idx].bytes, 32, 0);
+    size_t pos = (size_t)h & (size_t)CPI_INFO_MAP_MASK;
+    for (size_t probe = 0; probe < CPI_INFO_MAP_SZ; probe++) {
+        int16_t cur = map[pos];
+        if (cur < 0) {
+            map[pos] = (int16_t)idx;
+            return;
         }
+        /* Keep the first occurrence to match the legacy linear scan. */
+        if (sol_pubkey_eq(&info_pubkeys[(size_t)cur], &info_pubkeys[idx])) {
+            return;
+        }
+        pos = (pos + 1u) & (size_t)CPI_INFO_MAP_MASK;
     }
+}
 
+static inline int
+cpi_info_map_lookup(
+    const int16_t map[static CPI_INFO_MAP_SZ],
+    const sol_pubkey_t* info_pubkeys,
+    const sol_pubkey_t* pubkey
+) {
+    if (pubkey == NULL) return -1;
+    uint64_t h = sol_xxhash64(pubkey->bytes, 32, 0);
+    size_t pos = (size_t)h & (size_t)CPI_INFO_MAP_MASK;
+    for (size_t probe = 0; probe < CPI_INFO_MAP_SZ; probe++) {
+        int16_t cur = map[pos];
+        if (cur < 0) return -1;
+        if (sol_pubkey_eq(&info_pubkeys[(size_t)cur], pubkey)) {
+            return (int)cur;
+        }
+        pos = (pos + 1u) & (size_t)CPI_INFO_MAP_MASK;
+    }
     return -1;
 }
+
+/* Cache decoded AccountInfo pubkeys/privilege flags for CPI syscalls.
+ *
+ * Programs often perform many CPIs with the same `account_infos` slice.
+ * Decoding that slice from VM memory (and building the pubkey->index map)
+ * dominates syscall overhead when CPI-heavy workloads are present.
+ *
+ * Safety: VMs are reused via sol_bpf_vm_reset(). Key the cache by
+ * (vm*, vm->invocation_id, account_infos_ptr, account_infos_len, abi). */
+typedef struct {
+    sol_bpf_vm_t* vm;
+    uint64_t      vm_invocation_id;
+    uint64_t      account_infos_ptr;
+    uint64_t      account_infos_len;
+    bool          account_infos_are_rust;
+    bool          valid;
+
+    sol_pubkey_t  info_pubkeys[SOL_BPF_MAX_CPI_ACCOUNTS];
+    bool          info_is_signer[SOL_BPF_MAX_CPI_ACCOUNTS];
+    bool          info_is_writable[SOL_BPF_MAX_CPI_ACCOUNTS];
+    int16_t       info_map[CPI_INFO_MAP_SZ];
+} cpi_info_cache_t;
+
+/* CPI depth is tiny (<=5). Keep a small per-thread cache per stack_height so
+ * nested CPIs don't overwrite the outer CPI's decoded AccountInfo slice. */
+#define CPI_INFO_CACHE_SLOTS 8u
+static __thread cpi_info_cache_t g_tls_cpi_info_cache[CPI_INFO_CACHE_SLOTS];
 
 static sol_err_t
 derive_program_address(
@@ -522,6 +575,110 @@ is_pda_signer(
     return false;
 }
 
+/* Precompute derived signer pubkeys for invoke_signed.
+ *
+ * Programs often perform CPIs where multiple account metas require signer
+ * privileges. Deriving PDAs is relatively expensive (SHA256 + curve check).
+ * Precompute once per invoke and then do cheap pubkey compares in the meta
+ * loop.
+ *
+ * Returns true on success (including when signers_seeds_len==0). Returns false
+ * on invalid pointers/lengths. */
+static bool
+precompute_pda_signers(sol_bpf_vm_t* vm,
+                       const sol_pubkey_t* program_id,
+                       uint64_t signers_seeds_ptr,
+                       uint64_t signers_seeds_len,
+                       sol_pubkey_t out_signers[static SOL_BPF_MAX_SIGNER_SEEDS],
+                       size_t* out_len) {
+    if (!out_len) return false;
+    *out_len = 0;
+    if (!vm || !program_id || !out_signers) return false;
+    if (signers_seeds_len == 0) return true;
+
+    if (signers_seeds_len > SOL_BPF_MAX_SIGNER_SEEDS) {
+        sol_log_error("CPI: Too many signer seed sets");
+        return false;
+    }
+
+    uint64_t seed_set_total = 0;
+    if (__builtin_mul_overflow(signers_seeds_len, 16u, &seed_set_total)) {
+        return false;
+    }
+
+    uint8_t* seed_sets_raw = sol_bpf_memory_translate(&vm->memory,
+                                                      signers_seeds_ptr,
+                                                      (size_t)seed_set_total,
+                                                      false);
+    if (seed_sets_raw == NULL) {
+        return false;
+    }
+
+    for (uint64_t i = 0; i < signers_seeds_len; i++) {
+        uint8_t* seed_set = seed_sets_raw + (size_t)i * 16u;
+
+        uint64_t seeds_ptr = 0;
+        uint64_t seeds_len = 0;
+        memcpy(&seeds_ptr, seed_set + 0, 8);
+        memcpy(&seeds_len, seed_set + 8, 8);
+
+        if (seeds_len > SOL_BPF_MAX_SIGNER_SEEDS) {
+            sol_log_error("CPI: Too many seeds in signer set");
+            return false;
+        }
+
+        uint64_t seeds_total = 0;
+        if (__builtin_mul_overflow(seeds_len, 16u, &seeds_total)) {
+            return false;
+        }
+
+        uint8_t* seeds_raw = sol_bpf_memory_translate(&vm->memory,
+                                                      seeds_ptr,
+                                                      (size_t)seeds_total,
+                                                      false);
+        if (seeds_raw == NULL) {
+            return false;
+        }
+
+        const uint8_t* seed_ptrs[SOL_BPF_MAX_SIGNER_SEEDS];
+        size_t seed_lens[SOL_BPF_MAX_SIGNER_SEEDS];
+
+        for (uint64_t j = 0; j < seeds_len; j++) {
+            uint8_t* seed = seeds_raw + (size_t)j * 16u;
+
+            uint64_t data_ptr = 0;
+            uint64_t data_len = 0;
+            memcpy(&data_ptr, seed + 0, 8);
+            memcpy(&data_len, seed + 8, 8);
+
+            if (data_len > SOL_BPF_MAX_SEED_LEN) {
+                sol_log_error("CPI: Seed length too long");
+                return false;
+            }
+
+            seed_lens[j] = (size_t)data_len;
+            if (data_len > 0) {
+                seed_ptrs[j] = sol_bpf_memory_translate(&vm->memory, data_ptr, (size_t)data_len, false);
+                if (seed_ptrs[j] == NULL) {
+                    return false;
+                }
+            } else {
+                seed_ptrs[j] = NULL;
+            }
+        }
+
+        sol_pubkey_t derived;
+        if (derive_program_address(program_id, seed_ptrs, seed_lens, (size_t)seeds_len, &derived) == SOL_OK) {
+            if (*out_len < SOL_BPF_MAX_SIGNER_SEEDS) {
+                out_signers[*out_len] = derived;
+                (*out_len)++;
+            }
+        }
+    }
+
+    return true;
+}
+
 /*
  * Syscall: sol_invoke_signed_c
  *
@@ -565,13 +722,6 @@ sol_bpf_syscall_invoke_signed_impl(
         uint64_t*,
         uint64_t*,
         uint64_t*) = instruction_is_c ? read_instruction_c : read_instruction_rust;
-
-    sol_err_t (*read_meta_fn)(
-        sol_bpf_vm_t*,
-        uint64_t,
-        sol_pubkey_t*,
-        bool*,
-        bool*) = instruction_is_c ? read_account_meta_c : read_account_meta_rust;
 
     const uint64_t meta_stride = instruction_is_c ? 16u : 34u;
 
@@ -661,80 +811,149 @@ sol_bpf_syscall_invoke_signed_impl(
     }
 
     /* Read account infos for privilege validation */
-    sol_pubkey_t info_pubkeys[SOL_BPF_MAX_CPI_ACCOUNTS];
-    bool info_is_signer[SOL_BPF_MAX_CPI_ACCOUNTS];
-    bool info_is_writable[SOL_BPF_MAX_CPI_ACCOUNTS];
+    size_t cache_slot = 0;
+    if (ctx && ctx->stack_height < CPI_INFO_CACHE_SLOTS) {
+        cache_slot = (size_t)ctx->stack_height;
+    }
+    cpi_info_cache_t* info_cache = &g_tls_cpi_info_cache[cache_slot];
+    sol_pubkey_t* info_pubkeys = info_cache->info_pubkeys;
+    bool* info_is_signer = info_cache->info_is_signer;
+    bool* info_is_writable = info_cache->info_is_writable;
+    const int16_t* info_map = NULL;
+    int16_t empty_info_map[CPI_INFO_MAP_SZ];
 
-    if (instruction_is_c) {
-        for (uint64_t i = 0; i < account_infos_len; i++) {
-            sol_bpf_account_info_t info;
-            uint64_t info_addr = account_infos_ptr + i * (uint64_t)sizeof(sol_bpf_account_info_t);
-            err = read_account_info(vm, info_addr, &info);
-            if (err != SOL_OK) {
-                sol_log_error("CPI: Failed to read account info %lu", (unsigned long)i);
-                sol_log_debug("CPI: account_infos_ptr=0x%lx len=%lu stride=%zu failed_addr=0x%lx",
-                              (unsigned long)account_infos_ptr,
-                              (unsigned long)account_infos_len,
-                              sizeof(sol_bpf_account_info_t),
-                              (unsigned long)info_addr);
+    bool account_infos_are_rust = !instruction_is_c;
 
-                size_t dump_len = 192u;
-                uint8_t* base = sol_bpf_memory_translate(&vm->memory, account_infos_ptr, dump_len, false);
-                if (base == NULL) {
-                    dump_len = 64u;
-                    base = sol_bpf_memory_translate(&vm->memory, account_infos_ptr, dump_len, false);
-                }
-                if (base != NULL) {
-                    sol_log_hexdump(SOL_LOG_DEBUG, "CPI account_infos bytes", base, dump_len);
-                }
-
-                uint8_t* near = sol_bpf_memory_translate(&vm->memory, info_addr, 16, false);
-                if (near != NULL) {
-                    sol_log_hexdump(SOL_LOG_DEBUG, "CPI account_info bytes", near, 16);
-                }
-                return 1;
+    /* Only cache when the AccountInfo slice lives in the read-only input
+     * region. Programs may pass temporary AccountInfo arrays built on the
+     * stack/heap; those can reuse the same pointer with different contents. */
+    bool can_cache = false;
+    if (vm->caller_input_buf != NULL && vm->caller_input_len > 0) {
+        uint64_t input_end = 0;
+        if (!__builtin_add_overflow((uint64_t)SOL_BPF_MM_INPUT_START,
+                                    (uint64_t)vm->caller_input_len,
+                                    &input_end)) {
+            uint64_t stride = instruction_is_c
+                ? (uint64_t)sizeof(sol_bpf_account_info_t)
+                : (uint64_t)SOL_BPF_RUST_ACCOUNT_INFO_SIZE;
+            uint64_t total = 0;
+            uint64_t slice_end = 0;
+            if (!__builtin_mul_overflow(account_infos_len, stride, &total) &&
+                !__builtin_add_overflow(account_infos_ptr, total, &slice_end) &&
+                account_infos_ptr >= (uint64_t)SOL_BPF_MM_INPUT_START &&
+                slice_end <= input_end) {
+                can_cache = true;
             }
-
-            uint8_t* pubkey = sol_bpf_memory_translate(&vm->memory, info.pubkey_ptr, 32, false);
-            if (pubkey == NULL) {
-                sol_log_error("CPI: Failed to read account pubkey");
-                return 1;
-            }
-
-            memcpy(&info_pubkeys[i], pubkey, 32);
-            info_is_signer[i] = info.is_signer != 0;
-            info_is_writable[i] = info.is_writable != 0;
         }
+    }
+
+    bool cache_hit =
+        can_cache &&
+        (account_infos_len > 0) &&
+        info_cache->valid &&
+        info_cache->vm == vm &&
+        info_cache->vm_invocation_id == vm->invocation_id &&
+        info_cache->account_infos_ptr == account_infos_ptr &&
+        info_cache->account_infos_len == account_infos_len &&
+        info_cache->account_infos_are_rust == account_infos_are_rust;
+
+    if (account_infos_len == 0) {
+        cpi_info_map_init(empty_info_map);
+        info_map = empty_info_map;
+    } else if (cache_hit) {
+        info_map = info_cache->info_map;
     } else {
-        for (uint64_t i = 0; i < account_infos_len; i++) {
-            uint64_t info_addr = account_infos_ptr + i * (uint64_t)SOL_BPF_RUST_ACCOUNT_INFO_SIZE;
-            uint8_t* raw = sol_bpf_memory_translate(&vm->memory, info_addr, SOL_BPF_RUST_ACCOUNT_INFO_SIZE, false);
-            if (raw == NULL) {
-                sol_log_error("CPI: Failed to read rust account info %lu", (unsigned long)i);
-                sol_log_debug("CPI: rust account_infos_ptr=0x%lx len=%lu stride=%u failed_addr=0x%lx",
+        /* Cache miss: decode the account_infos slice into the TLS cache. */
+        info_cache->valid = false;
+        info_cache->vm = vm;
+        info_cache->vm_invocation_id = vm->invocation_id;
+        info_cache->account_infos_ptr = account_infos_ptr;
+        info_cache->account_infos_len = account_infos_len;
+        info_cache->account_infos_are_rust = account_infos_are_rust;
+
+        if (instruction_is_c) {
+            /* Translate the account_infos array once to avoid per-element translations. */
+            size_t stride = sizeof(sol_bpf_account_info_t);
+            if (account_infos_len > (uint64_t)(SIZE_MAX / stride)) {
+                sol_log_error("CPI: account_infos_len overflow");
+                return 1;
+            }
+            size_t total = (size_t)account_infos_len * stride;
+            uint8_t* infos_raw = sol_bpf_memory_translate(&vm->memory, account_infos_ptr, total, false);
+            if (infos_raw == NULL) {
+                sol_log_error("CPI: Failed to read account_infos array");
+                sol_log_debug("CPI: account_infos_ptr=0x%lx len=%lu stride=%zu total=%zu",
                               (unsigned long)account_infos_ptr,
                               (unsigned long)account_infos_len,
-                              (unsigned)SOL_BPF_RUST_ACCOUNT_INFO_SIZE,
-                              (unsigned long)info_addr);
+                              stride,
+                              total);
                 return 1;
             }
 
-            uint64_t key_ptr = 0;
-            memcpy(&key_ptr, raw, 8);
+            for (uint64_t i = 0; i < account_infos_len; i++) {
+                const uint8_t* raw = infos_raw + (size_t)i * stride;
+                uint64_t key_ptr = 0;
+                memcpy(&key_ptr, raw + 0, 8);
 
-            const uint8_t is_signer = raw[40];
-            const uint8_t is_writable = raw[41];
+                const uint8_t is_signer = raw[48];
+                const uint8_t is_writable = raw[49];
 
-            uint8_t* pubkey = sol_bpf_memory_translate(&vm->memory, key_ptr, 32, false);
-            if (pubkey == NULL) {
-                sol_log_error("CPI: Failed to read rust account pubkey");
+                uint8_t* pubkey = sol_bpf_memory_translate(&vm->memory, key_ptr, 32, false);
+                if (pubkey == NULL) {
+                    sol_log_error("CPI: Failed to read account pubkey");
+                    return 1;
+                }
+
+                memcpy(&info_pubkeys[i], pubkey, 32);
+                info_is_signer[i] = is_signer != 0;
+                info_is_writable[i] = is_writable != 0;
+            }
+        } else {
+            size_t stride = (size_t)SOL_BPF_RUST_ACCOUNT_INFO_SIZE;
+            if (account_infos_len > (uint64_t)(SIZE_MAX / stride)) {
+                sol_log_error("CPI: account_infos_len overflow");
+                return 1;
+            }
+            size_t total = (size_t)account_infos_len * stride;
+            uint8_t* infos_raw = sol_bpf_memory_translate(&vm->memory, account_infos_ptr, total, false);
+            if (infos_raw == NULL) {
+                sol_log_error("CPI: Failed to read rust account_infos array");
+                sol_log_debug("CPI: rust account_infos_ptr=0x%lx len=%lu stride=%zu total=%zu",
+                              (unsigned long)account_infos_ptr,
+                              (unsigned long)account_infos_len,
+                              stride,
+                              total);
                 return 1;
             }
 
-            memcpy(&info_pubkeys[i], pubkey, 32);
-            info_is_signer[i] = is_signer != 0;
-            info_is_writable[i] = is_writable != 0;
+            for (uint64_t i = 0; i < account_infos_len; i++) {
+                const uint8_t* raw = infos_raw + (size_t)i * stride;
+                uint64_t key_ptr = 0;
+                memcpy(&key_ptr, raw, 8);
+
+                const uint8_t is_signer = raw[40];
+                const uint8_t is_writable = raw[41];
+
+                uint8_t* pubkey = sol_bpf_memory_translate(&vm->memory, key_ptr, 32, false);
+                if (pubkey == NULL) {
+                    sol_log_error("CPI: Failed to read rust account pubkey");
+                    return 1;
+                }
+
+                memcpy(&info_pubkeys[i], pubkey, 32);
+                info_is_signer[i] = is_signer != 0;
+                info_is_writable[i] = is_writable != 0;
+            }
         }
+
+        /* Build a fast lookup table for account_infos pubkeys. CPI meta privilege
+         * validation does N lookups; avoid O(N^2) linear scans. */
+        cpi_info_map_init(info_cache->info_map);
+        for (size_t i = 0; i < (size_t)account_infos_len; i++) {
+            cpi_info_map_insert(info_cache->info_map, info_pubkeys, i);
+        }
+        info_cache->valid = can_cache;
+        info_map = info_cache->info_map;
     }
 
     /* Account info batch translation cost.
@@ -743,51 +962,69 @@ sol_bpf_syscall_invoke_signed_impl(
 
     sol_bpf_cpi_account_meta_t metas[SOL_BPF_MAX_CPI_ACCOUNTS];
 
+    /* Translate account meta array once; individual pubkey pointers (C ABI) are
+     * translated per-meta below. */
+    uint8_t* metas_raw = NULL;
+    if (accounts_len > 0) {
+        if (accounts_len > (uint64_t)(SIZE_MAX / meta_stride)) {
+            sol_log_error("CPI: accounts_len overflow");
+            return 1;
+        }
+        size_t total = (size_t)accounts_len * (size_t)meta_stride;
+        metas_raw = sol_bpf_memory_translate(&vm->memory, accounts_ptr, total, false);
+        if (metas_raw == NULL) {
+            sol_log_error("CPI: Failed to read account metas array");
+            sol_log_debug("CPI: accounts_ptr=0x%lx len=%lu stride=%lu total=%zu abi=%s",
+                          (unsigned long)accounts_ptr,
+                          (unsigned long)accounts_len,
+                          (unsigned long)meta_stride,
+                          total,
+                          instruction_is_c ? "c" : "rust");
+            return 1;
+        }
+    }
+
     /* Read account metas and verify privileges */
+    sol_pubkey_t derived_signers[SOL_BPF_MAX_SIGNER_SEEDS];
+    size_t derived_signers_len = 0;
+    bool derived_signers_inited = false;
+    bool derived_signers_ok = false;
     for (uint64_t i = 0; i < accounts_len; i++) {
         sol_pubkey_t meta_pubkey;
         bool meta_is_signer, meta_is_writable;
 
-        err = read_meta_fn(vm, accounts_ptr + i * meta_stride,
-                           &meta_pubkey, &meta_is_signer, &meta_is_writable);
-        if (err != SOL_OK) {
-            sol_log_error("CPI: Failed to read account meta %lu accounts_ptr=0x%lx stride=%lu target=0x%lx abi=%s accounts_len=%lu data_ptr=0x%lx data_len=%lu",
-                          (unsigned long)i,
-                          (unsigned long)accounts_ptr,
-                          (unsigned long)meta_stride,
-                          (unsigned long)(accounts_ptr + i * meta_stride),
-                          instruction_is_c ? "c" : "rust",
-                          (unsigned long)accounts_len,
-                          (unsigned long)data_ptr,
-                          (unsigned long)data_len);
-            /* Dump the raw instruction struct for ABI debugging */
-            {
-                uint8_t* raw80 = sol_bpf_memory_translate(&vm->memory, instruction_ptr, 80, false);
-                if (raw80 != NULL) {
-                    sol_log_hexdump(SOL_LOG_ERROR, "CPI instr raw 80B", raw80, 80);
-                }
-                /* Also try to dump what's at accounts_ptr */
-                uint8_t* acc_raw = sol_bpf_memory_translate(&vm->memory, accounts_ptr, 64, false);
-                if (acc_raw != NULL) {
-                    sol_log_hexdump(SOL_LOG_ERROR, "CPI accounts_ptr 64B", acc_raw, 64);
-                } else {
-                    sol_log_error("CPI: accounts_ptr 0x%lx NOT translatable", (unsigned long)accounts_ptr);
-                }
+        const uint8_t* meta_raw = metas_raw + (size_t)i * (size_t)meta_stride;
+        if (instruction_is_c) {
+            /* SolAccountMeta: pubkey_addr u64, is_writable u8, is_signer u8 */
+            uint64_t pubkey_addr = 0;
+            memcpy(&pubkey_addr, meta_raw, 8);
+            meta_is_writable = meta_raw[8] != 0;
+            meta_is_signer = meta_raw[9] != 0;
+
+            uint8_t* pk = sol_bpf_memory_translate(&vm->memory, pubkey_addr, 32, false);
+            if (pk == NULL) {
+                sol_log_error("CPI: Failed to read account meta pubkey");
+                return 1;
             }
-            return 1;
+            memcpy(&meta_pubkey, pk, 32);
+        } else {
+            /* Rust AccountMeta: inline pubkey + flags. */
+            memcpy(&meta_pubkey, meta_raw, 32);
+            meta_is_signer = meta_raw[32] != 0;
+            meta_is_writable = meta_raw[33] != 0;
         }
 
         metas[i].pubkey = meta_pubkey;
         metas[i].is_signer = meta_is_signer;
         metas[i].is_writable = meta_is_writable;
 
-        int info_idx = find_account_info_index(info_pubkeys, account_infos_len, &meta_pubkey);
+        int info_idx = cpi_info_map_lookup(info_map, info_pubkeys, &meta_pubkey);
         if (info_idx < 0) {
             /* Agave allows executable accounts (programs) to be absent from
              * account_infos.  In translate_accounts_common, if an account is
              * executable it just charges CU for the program data size and
              * skips the account_info lookup entirely. */
-            sol_account_t* acct = sol_bank_load_account(ctx->bank, &meta_pubkey);
+            sol_account_t* acct = sol_bank_load_account_view(ctx->bank, &meta_pubkey);
             if (acct != NULL && acct->meta.executable) {
                 /* CU charge for executable accounts is handled in
                  * sol_bpf_loader_cpi_dispatch (translate_accounts loop).
@@ -798,12 +1035,31 @@ sol_bpf_syscall_invoke_signed_impl(
             if (acct != NULL) {
                 sol_account_destroy(acct);
             }
-            sol_log_error("CPI: Missing account info for meta %lu", (unsigned long)i);
+            if (__builtin_expect(sol_log_get_level() <= SOL_LOG_DEBUG, 0)) {
+                char meta_b58[45];
+                char prog_b58[45];
+                sol_pubkey_to_base58(&meta_pubkey, meta_b58, sizeof(meta_b58));
+                sol_pubkey_to_base58(&program_id, prog_b58, sizeof(prog_b58));
+                sol_log_debug("CPI: Missing account info for meta %lu (%s) in invoke %s (account_infos_len=%lu metas_len=%lu)",
+                              (unsigned long)i,
+                              meta_b58,
+                              prog_b58,
+                              (unsigned long)account_infos_len,
+                              (unsigned long)accounts_len);
+            }
             return 1;
         }
 
         if (meta_is_writable && !info_is_writable[info_idx]) {
-            sol_log_error("CPI: Writable privilege escalated");
+            if (__builtin_expect(sol_log_get_level() <= SOL_LOG_DEBUG, 0)) {
+                char meta_b58[45];
+                char prog_b58[45];
+                sol_pubkey_to_base58(&meta_pubkey, meta_b58, sizeof(meta_b58));
+                sol_pubkey_to_base58(&program_id, prog_b58, sizeof(prog_b58));
+                sol_log_debug("CPI: Writable privilege escalated for %s in invoke %s",
+                              meta_b58,
+                              prog_b58);
+            }
             return 1;
         }
 
@@ -813,25 +1069,57 @@ sol_bpf_syscall_invoke_signed_impl(
 
             /* Check if it's the calling program's PDA (signed via signers_seeds) */
             if (!authorized && signers_seeds_len > 0) {
-                authorized = is_pda_signer(vm, &ctx->program_id,
-                                           signers_seeds_ptr, signers_seeds_len,
-                                           &meta_pubkey);
+                if (!derived_signers_inited) {
+                    derived_signers_inited = true;
+                    derived_signers_ok =
+                        precompute_pda_signers(vm,
+                                               &ctx->program_id,
+                                               signers_seeds_ptr,
+                                               signers_seeds_len,
+                                               derived_signers,
+                                               &derived_signers_len);
+                }
+
+                if (derived_signers_ok) {
+                    for (size_t si = 0; si < derived_signers_len; si++) {
+                        if (sol_pubkey_eq(&derived_signers[si], &meta_pubkey)) {
+                            authorized = true;
+                            break;
+                        }
+                    }
+                } else {
+                    /* Preserve legacy behaviour on precompute failure: retry the
+                     * per-meta derivation path (which will typically fail too). */
+                    authorized = is_pda_signer(vm,
+                                               &ctx->program_id,
+                                               signers_seeds_ptr,
+                                               signers_seeds_len,
+                                               &meta_pubkey);
+                }
             }
 
             if (!authorized) {
-                char b58[45];
-                sol_pubkey_to_base58(&meta_pubkey, b58, sizeof(b58));
-                sol_log_error("CPI: Missing signer privilege for %s", b58);
+                if (__builtin_expect(sol_log_get_level() <= SOL_LOG_DEBUG, 0)) {
+                    char meta_b58[45];
+                    char prog_b58[45];
+                    sol_pubkey_to_base58(&meta_pubkey, meta_b58, sizeof(meta_b58));
+                    sol_pubkey_to_base58(&program_id, prog_b58, sizeof(prog_b58));
+                    sol_log_debug("CPI: Missing signer privilege for %s in invoke %s",
+                                  meta_b58,
+                                  prog_b58);
+                }
                 return 1;
             }
         }
     }
 
-    /* Log the CPI */
-    {
+    /* Log the CPI (avoid unconditional base58 work when debug logging is off). */
+    if (__builtin_expect(sol_log_get_level() <= SOL_LOG_DEBUG, 0)) {
         char prog_b58[45];
         sol_pubkey_to_base58(&program_id, prog_b58, sizeof(prog_b58));
-        sol_log_debug("CPI: Invoking %s at stack_height %lu", prog_b58, (unsigned long)ctx->stack_height);
+        sol_log_debug("CPI: Invoking %s at stack_height %lu",
+                      prog_b58,
+                      (unsigned long)ctx->stack_height);
     }
 
     if (vm->cpi_handler != NULL) {
@@ -844,6 +1132,7 @@ sol_bpf_syscall_invoke_signed_impl(
             .account_infos_ptr = account_infos_ptr,
             .account_infos_len = account_infos_len,
             .account_infos_are_rust = !instruction_is_c,
+            .account_infos_pubkeys = (account_infos_len > 0) ? info_pubkeys : NULL,
         };
 
         sol_err_t cpi_err = vm->cpi_handler(vm, &call);

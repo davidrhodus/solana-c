@@ -16,6 +16,7 @@
 
 #include "../util/sol_types.h"
 #include "../util/sol_err.h"
+#include "../util/sol_io.h"
 #include "sol_snapshot.h"
 
 #ifdef __cplusplus
@@ -70,15 +71,15 @@ typedef struct {
     uint32_t                timeout_secs;       /* Download timeout (0=default) */
     uint32_t                parallel_connections; /* Max in-flight HTTP range requests (>=2 enables) */
     uint64_t                parallel_min_size;  /* Only parallelize when size >= this (0=always if known) */
+    sol_io_ctx_t*           io_ctx;             /* Optional disk IO context (NULL => POSIX) */
     bool                    allow_incremental;  /* Allow incremental snapshots */
     bool                    verify_after;       /* Verify after download */
     bool                    resume;             /* Resume partial downloads */
 } sol_snapshot_download_opts_t;
 
-/* Hard upper bound on parallel range downloads. This is intentionally kept
- * conservative because the current implementation spawns one `curl` process per
- * in-flight range request. The downloader may split large files into more parts
- * and schedule them across these connections. */
+/* Hard upper bound on parallel connections. When aria2c is available this
+ * maps to -x/-s; otherwise the curl-based range downloader spawns one process
+ * per in-flight range request. */
 #define SOL_SNAPSHOT_DOWNLOAD_MAX_PARALLEL_CONNECTIONS (128U)
 
 #define SOL_SNAPSHOT_DOWNLOAD_OPTS_DEFAULT {    \
@@ -87,8 +88,9 @@ typedef struct {
     .progress_ctx = NULL,                       \
     .max_size = 0,                              \
     .timeout_secs = 0,                          \
-    .parallel_connections = 64,                 \
+    .parallel_connections = 32,                 \
     .parallel_min_size = 256ULL * 1024ULL * 1024ULL, \
+    .io_ctx = NULL,                             \
     .allow_incremental = true,                  \
     .verify_after = true,                       \
     .resume = true,                             \

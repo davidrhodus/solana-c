@@ -451,7 +451,7 @@ TEST(instructions_sysvar) {
 
     uint8_t buf[256] = {0};
     size_t out_len = sizeof(buf);
-    sol_err_t err = sol_instructions_sysvar_serialize(&tx, 1, buf, &out_len);
+    sol_err_t err = sol_instructions_sysvar_serialize(&tx, 1, NULL, 0, buf, &out_len);
     ASSERT(err == SOL_OK);
 
     ASSERT(sol_instructions_sysvar_get_count(buf, out_len) == 2);

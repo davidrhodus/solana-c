@@ -99,6 +99,10 @@ struct sol_fork_choice {
     /* Cache validity */
     bool                        subtree_cache_valid;
     size_t                      cached_bank_count;
+    uint64_t                    cached_banks_created;
+    uint64_t                    cached_banks_pruned;
+    sol_slot_t                  cached_highest_slot;
+    sol_slot_t                  cached_root_slot;
     sol_slot_t                  cached_best_slot;
     sol_hash_t                  cached_best_hash;
 
@@ -249,6 +253,12 @@ sol_fork_choice_new(sol_bank_forks_t* bank_forks,
             memset(&fc->root_hash, 0, sizeof(fc->root_hash));
         }
         fc->cached_bank_count = sol_bank_forks_count(bank_forks);
+        sol_bank_forks_stats_t stats = {0};
+        sol_bank_forks_stats(bank_forks, &stats);
+        fc->cached_banks_created = stats.banks_created;
+        fc->cached_banks_pruned = stats.banks_pruned;
+        fc->cached_highest_slot = stats.highest_slot;
+        fc->cached_root_slot = stats.root_slot;
     }
 
     fc->cached_best_slot = fc->root_slot;
@@ -562,8 +572,18 @@ static void
 ensure_subtree_cache(sol_fork_choice_t* fc) {
     if (fc->bank_forks) {
         size_t count = sol_bank_forks_count(fc->bank_forks);
-        if (count != fc->cached_bank_count) {
+        sol_bank_forks_stats_t stats = {0};
+        sol_bank_forks_stats(fc->bank_forks, &stats);
+        if (count != fc->cached_bank_count ||
+            stats.banks_created != fc->cached_banks_created ||
+            stats.banks_pruned != fc->cached_banks_pruned ||
+            stats.highest_slot != fc->cached_highest_slot ||
+            stats.root_slot != fc->cached_root_slot) {
             fc->cached_bank_count = count;
+            fc->cached_banks_created = stats.banks_created;
+            fc->cached_banks_pruned = stats.banks_pruned;
+            fc->cached_highest_slot = stats.highest_slot;
+            fc->cached_root_slot = stats.root_slot;
             fc->subtree_cache_valid = false;
         }
     }

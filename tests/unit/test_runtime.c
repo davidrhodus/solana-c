@@ -11,6 +11,7 @@
 #include "sol_address_lookup_table_program.h"
 #include "sol_ed25519_program.h"
 #include "sol_secp256k1_program.h"
+#include "sol_compute_budget.h"
 #include "sol_vote_program.h"
 #include "sol_stake_program.h"
 #include "sol_alloc.h"
@@ -19,6 +20,7 @@
 #include "sol_lt_hash.h"
 #include "sol_bits.h"
 #include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -599,13 +601,13 @@ TEST(bank_initializes_sysvar_accounts) {
     sol_account_t* rent = sol_bank_load_account(bank, &SOL_SYSVAR_RENT_ID);
     TEST_ASSERT(rent != NULL);
     TEST_ASSERT(rent->meta.lamports > 0);
-    TEST_ASSERT_EQ(rent->meta.data_len, SOL_RENT_SIZE);
+    TEST_ASSERT_EQ(rent->meta.data_len, SOL_RENT_SERIALIZED_SIZE);
     sol_account_destroy(rent);
 
     sol_account_t* epoch_schedule = sol_bank_load_account(bank, &SOL_SYSVAR_EPOCH_SCHEDULE_ID);
     TEST_ASSERT(epoch_schedule != NULL);
     TEST_ASSERT(epoch_schedule->meta.lamports > 0);
-    TEST_ASSERT_EQ(epoch_schedule->meta.data_len, SOL_EPOCH_SCHEDULE_SIZE);
+    TEST_ASSERT_EQ(epoch_schedule->meta.data_len, SOL_EPOCH_SCHEDULE_SERIALIZED_SIZE);
     sol_account_destroy(epoch_schedule);
 
     sol_account_t* fees = sol_bank_load_account(bank, &SOL_SYSVAR_FEES_ID);
@@ -674,15 +676,11 @@ TEST(bank_clock_timestamp_from_snapshot_sysvar) {
     TEST_ASSERT_EQ(sol_accounts_db_store(db, &SOL_SYSVAR_CLOCK_ID, clock_acct), SOL_OK);
     sol_account_destroy(clock_acct);
 
-    /* Create a bank for the next slot and advance it to the end of slot. */
-    sol_bank_t* bank = sol_bank_new(51, NULL, db, &config);
+    /* Create a parent bank at the snapshot slot, then derive the next slot. */
+    sol_bank_t* parent = sol_bank_new(50, NULL, db, &config);
+    TEST_ASSERT(parent != NULL);
+    sol_bank_t* bank = sol_bank_new_from_parent(parent, 51);
     TEST_ASSERT(bank != NULL);
-
-    sol_hash_t tick_hash = {0};
-    for (uint64_t i = 0; i < config.ticks_per_slot; i++) {
-        tick_hash.bytes[0] = (uint8_t)i;
-        TEST_ASSERT_EQ(sol_bank_register_tick(bank, &tick_hash), SOL_OK);
-    }
 
     sol_account_t* updated = sol_bank_load_account(bank, &SOL_SYSVAR_CLOCK_ID);
     TEST_ASSERT(updated != NULL);
@@ -698,6 +696,7 @@ TEST(bank_clock_timestamp_from_snapshot_sysvar) {
     TEST_ASSERT_EQ(out.epoch_start_timestamp, (ulong)980);
 
     sol_bank_destroy(bank);
+    sol_bank_destroy(parent);
     sol_accounts_db_destroy(db);
 }
 
@@ -769,8 +768,10 @@ TEST(bank_clock_timestamp_stake_weighted_median) {
     sol_stake_state_t st2;
     sol_stake_state_init(&st1, NULL, NULL, 0);
     sol_stake_state_init(&st2, NULL, NULL, 0);
-    TEST_ASSERT_EQ(sol_stake_delegate(&st1, &vote1, SOL_MIN_STAKE_DELEGATION, 0), SOL_OK);
-    TEST_ASSERT_EQ(sol_stake_delegate(&st2, &vote2, SOL_MIN_STAKE_DELEGATION * 2, 0), SOL_OK);
+    /* Use non-trivial stake amounts so warmup math produces non-zero effective stake. */
+    uint64_t stake_base = 100;
+    TEST_ASSERT_EQ(sol_stake_delegate(&st1, &vote1, stake_base, 0), SOL_OK);
+    TEST_ASSERT_EQ(sol_stake_delegate(&st2, &vote2, stake_base * 2, 0), SOL_OK);
 
     sol_account_t* stake1_acct =
         sol_account_new(1, SOL_STAKE_STATE_SIZE, &SOL_STAKE_PROGRAM_ID);
@@ -786,15 +787,12 @@ TEST(bank_clock_timestamp_stake_weighted_median) {
     sol_account_destroy(stake1_acct);
     sol_account_destroy(stake2_acct);
 
-    /* Create bank for slot 151 and advance it to end-of-slot so sysvars refresh. */
-    sol_bank_t* bank = sol_bank_new(151, NULL, db, &config);
+    /* Create parent bank at slot 150 and derive child bank at slot 151 so the
+     * Clock sysvar is updated using the stake-weighted median timestamp. */
+    sol_bank_t* parent = sol_bank_new(150, NULL, db, &config);
+    TEST_ASSERT(parent != NULL);
+    sol_bank_t* bank = sol_bank_new_from_parent(parent, 151);
     TEST_ASSERT(bank != NULL);
-
-    sol_hash_t tick_hash = {0};
-    for (uint64_t i = 0; i < config.ticks_per_slot; i++) {
-        tick_hash.bytes[0] = (uint8_t)i;
-        TEST_ASSERT_EQ(sol_bank_register_tick(bank, &tick_hash), SOL_OK);
-    }
 
     sol_account_t* updated = sol_bank_load_account(bank, &SOL_SYSVAR_CLOCK_ID);
     TEST_ASSERT(updated != NULL);
@@ -810,6 +808,7 @@ TEST(bank_clock_timestamp_stake_weighted_median) {
     TEST_ASSERT_EQ(out.epoch_start_timestamp, (sol_unix_timestamp_t)1000);
 
     sol_bank_destroy(bank);
+    sol_bank_destroy(parent);
     sol_accounts_db_destroy(db);
 }
 
@@ -843,14 +842,10 @@ TEST(bank_sysvar_meta_preserved_on_refresh) {
     TEST_ASSERT_EQ(sol_accounts_db_store(db, &SOL_SYSVAR_CLOCK_ID, clock_acct), SOL_OK);
     sol_account_destroy(clock_acct);
 
-    sol_bank_t* bank = sol_bank_new(1, NULL, db, &config);
+    sol_bank_t* parent = sol_bank_new(0, NULL, db, &config);
+    TEST_ASSERT(parent != NULL);
+    sol_bank_t* bank = sol_bank_new_from_parent(parent, 1);
     TEST_ASSERT(bank != NULL);
-
-    sol_hash_t tick_hash = {0};
-    for (uint64_t i = 0; i < config.ticks_per_slot; i++) {
-        tick_hash.bytes[0] = (uint8_t)i;
-        TEST_ASSERT_EQ(sol_bank_register_tick(bank, &tick_hash), SOL_OK);
-    }
 
     sol_account_t* updated = sol_bank_load_account(bank, &SOL_SYSVAR_CLOCK_ID);
     TEST_ASSERT(updated != NULL);
@@ -860,6 +855,7 @@ TEST(bank_sysvar_meta_preserved_on_refresh) {
     sol_account_destroy(updated);
 
     sol_bank_destroy(bank);
+    sol_bank_destroy(parent);
     sol_accounts_db_destroy(db);
 }
 
@@ -1103,9 +1099,11 @@ TEST(bank_process_v0_transaction_with_alt_writable_account) {
     sol_account_destroy(alt_account);
     sol_alt_state_free(&alt_state);
 
-    uint64_t transfer_lamports = 1234;
+    uint64_t rent_exempt_min = sol_bank_rent_exempt_minimum(bank, 0);
+    uint64_t transfer_lamports = rent_exempt_min;
     uint64_t expected_fee = sol_bank_lamports_per_signature(bank);
-    uint64_t initial_lamports = expected_fee + transfer_lamports + 100;
+    /* Ensure the fee payer remains rent-exempt after fee + transfer. */
+    uint64_t initial_lamports = expected_fee + transfer_lamports + rent_exempt_min + 100;
 
     sol_account_t* payer_account = sol_account_new(initial_lamports, 0, &SOL_SYSTEM_PROGRAM_ID);
     TEST_ASSERT_NOT_NULL(payer_account);
@@ -1398,6 +1396,65 @@ TEST(bank_register_tick) {
     sol_bank_destroy(bank);
 }
 
+TEST(bank_ticks_across_slot_gap_updates_blockhash_on_final_tick) {
+    /* Reproduce the mainnet "skipped slot catchup ticks" pattern:
+     * a child slot may contain (slot - parent_slot) * ticks_per_slot ticks.
+     * The bank must start tick accounting from the parent's tick_height,
+     * otherwise it will overflow ticks, freeze early, and produce a wrong
+     * blockhash (breaking PoH start hash validation in the next slot). */
+
+    sol_bank_config_t config = SOL_BANK_CONFIG_DEFAULT;
+    config.ticks_per_slot = 4;
+
+    sol_hash_t genesis_hash;
+    memset(genesis_hash.bytes, 0xA5, sizeof(genesis_hash.bytes));
+
+    sol_bank_t* parent = sol_bank_new(0, &genesis_hash, NULL, &config);
+    TEST_ASSERT(parent != NULL);
+
+    /* Make the parent bank full (slot 0 => 4 ticks). */
+    sol_hash_t parent_tick_hash;
+    memset(parent_tick_hash.bytes, 0x11, sizeof(parent_tick_hash.bytes));
+    for (uint64_t i = 0; i < config.ticks_per_slot; i++) {
+        TEST_ASSERT_EQ(sol_bank_register_tick(parent, &parent_tick_hash), SOL_OK);
+    }
+    TEST_ASSERT(sol_bank_has_full_ticks(parent));
+    sol_bank_freeze(parent);
+
+    /* Create a child bank with a slot gap: parent slot 0 -> child slot 2. */
+    sol_bank_t* child = sol_bank_new_from_parent(parent, 2);
+    TEST_ASSERT(child != NULL);
+
+    /* With a 2-slot jump and ticks_per_slot=4, we need 8 ticks to complete. */
+    TEST_ASSERT_EQ(sol_bank_tick_height(child), sol_bank_tick_height(parent));
+    TEST_ASSERT_EQ(sol_bank_max_tick_height(child),
+                   sol_bank_tick_height(parent) + (2u * config.ticks_per_slot));
+    TEST_ASSERT(!sol_bank_has_full_ticks(child));
+
+    sol_hash_t tick_hash;
+    memset(tick_hash.bytes, 0x22, sizeof(tick_hash.bytes));
+
+    /* Register the first 7 ticks (should not update blockhash to tick_hash). */
+    for (uint64_t i = 0; i < (2u * config.ticks_per_slot - 1u); i++) {
+        TEST_ASSERT_EQ(sol_bank_register_tick(child, &tick_hash), SOL_OK);
+    }
+    TEST_ASSERT(!sol_bank_has_full_ticks(child));
+
+    /* Final tick: should complete and update blockhash. */
+    sol_hash_t last_tick_hash;
+    memset(last_tick_hash.bytes, 0x33, sizeof(last_tick_hash.bytes));
+    TEST_ASSERT_EQ(sol_bank_register_tick(child, &last_tick_hash), SOL_OK);
+    TEST_ASSERT(sol_bank_has_full_ticks(child));
+    TEST_ASSERT_EQ(sol_bank_tick_height(child), sol_bank_max_tick_height(child));
+
+    const sol_hash_t* bh = sol_bank_blockhash(child);
+    TEST_ASSERT(bh != NULL);
+    TEST_ASSERT_EQ(memcmp(bh->bytes, last_tick_hash.bytes, SOL_HASH_SIZE), 0);
+
+    sol_bank_destroy(child);
+    sol_bank_destroy(parent);
+}
+
 TEST(bank_fee_distribution_credits_collector) {
     sol_hash_t parent_hash;
     memset(parent_hash.bytes, 0xA5, sizeof(parent_hash.bytes));
@@ -1427,8 +1484,10 @@ TEST(bank_fee_distribution_credits_collector) {
     memset(recipient.bytes, 0x02, sizeof(recipient.bytes));
 
     uint64_t fee = sol_bank_lamports_per_signature(bank);
-    uint64_t transfer_lamports = 1234;
-    uint64_t initial_lamports = fee + transfer_lamports + 100;
+    uint64_t rent_exempt_min = sol_bank_rent_exempt_minimum(bank, 0);
+    uint64_t transfer_lamports = rent_exempt_min;
+    /* Ensure the fee payer remains rent-exempt after fee + transfer. */
+    uint64_t initial_lamports = fee + transfer_lamports + rent_exempt_min + 100;
 
     sol_account_t* payer_account = sol_account_new(initial_lamports, 0, &SOL_SYSTEM_PROGRAM_ID);
     TEST_ASSERT_NOT_NULL(payer_account);
@@ -1496,6 +1555,7 @@ TEST(bank_fee_distribution_credits_collector) {
     sol_hash_t tick_hash;
     memset(tick_hash.bytes, 0xEE, sizeof(tick_hash.bytes));
     TEST_ASSERT_EQ(sol_bank_register_tick(bank, &tick_hash), SOL_OK);
+    sol_bank_freeze(bank);
 
     uint64_t burned = (fee * 50ULL) / 100ULL;
     uint64_t expected_credit = fee - burned;
@@ -1537,13 +1597,13 @@ TEST(bank_priority_fee_not_burned) {
     memset(recipient.bytes, 0x04, sizeof(recipient.bytes));
 
     uint64_t base_fee = sol_bank_lamports_per_signature(bank);
-    uint64_t transfer_lamports = 1234;
+    uint64_t rent_exempt_min = sol_bank_rent_exempt_minimum(bank, 0);
+    uint64_t transfer_lamports = rent_exempt_min;
 
     /* Priority fee: default CU limit is 200k. Use 1000 micro-lamports/CU => 200 lamports. */
     uint64_t compute_unit_price = 1000ULL; /* micro-lamports per CU */
-    uint64_t priority_fee = (200000ULL * compute_unit_price) / 1000000ULL;
-
-    uint64_t initial_lamports = base_fee + priority_fee + transfer_lamports + 100;
+    /* Ensure the fee payer remains rent-exempt after fee + transfer. */
+    uint64_t initial_lamports = base_fee + 1000 + transfer_lamports + rent_exempt_min + 100;
 
     sol_account_t* payer_account = sol_account_new(initial_lamports, 0, &SOL_SYSTEM_PROGRAM_ID);
     TEST_ASSERT_NOT_NULL(payer_account);
@@ -1614,11 +1674,15 @@ TEST(bank_priority_fee_not_burned) {
 
     sol_tx_result_t result = sol_bank_process_transaction(bank, &tx);
     TEST_ASSERT_EQ(result.status, SOL_OK);
+    sol_compute_budget_t parsed_budget;
+    TEST_ASSERT_EQ(sol_compute_budget_parse(&parsed_budget, &tx), SOL_OK);
+    uint64_t priority_fee = sol_compute_budget_priority_fee(&parsed_budget);
     TEST_ASSERT_EQ(result.fee, base_fee + priority_fee);
 
     sol_hash_t tick_hash;
     memset(tick_hash.bytes, 0xEE, sizeof(tick_hash.bytes));
     TEST_ASSERT_EQ(sol_bank_register_tick(bank, &tick_hash), SOL_OK);
+    sol_bank_freeze(bank);
 
     uint64_t burned = (base_fee * 50ULL) / 100ULL;
     uint64_t expected_credit = (base_fee - burned) + priority_fee;
@@ -1688,6 +1752,18 @@ TEST(bank_transaction_rollback) {
     sol_pubkey_t to2;
     memset(to1.bytes, 0x33, sizeof(to1.bytes));
     memset(to2.bytes, 0x44, sizeof(to2.bytes));
+
+    uint64_t rent_exempt_min = sol_bank_rent_exempt_minimum(bank, 0);
+    sol_account_t* to1_account =
+        sol_account_new(rent_exempt_min, 0, &SOL_SYSTEM_PROGRAM_ID);
+    sol_account_t* to2_account =
+        sol_account_new(rent_exempt_min, 0, &SOL_SYSTEM_PROGRAM_ID);
+    TEST_ASSERT_NOT_NULL(to1_account);
+    TEST_ASSERT_NOT_NULL(to2_account);
+    TEST_ASSERT_EQ(sol_bank_store_account(bank, &to1, to1_account), SOL_OK);
+    TEST_ASSERT_EQ(sol_bank_store_account(bank, &to2, to2_account), SOL_OK);
+    sol_account_destroy(to1_account);
+    sol_account_destroy(to2_account);
 
     uint64_t fee = sol_bank_lamports_per_signature(bank);
     uint64_t initial_lamports = fee + 5;
@@ -1770,13 +1846,15 @@ TEST(bank_transaction_rollback) {
     TEST_ASSERT_EQ(loaded_payer->meta.lamports, initial_lamports - fee);
     sol_account_destroy(loaded_payer);
 
-    /* Both transfers should be rolled back (recipients not created). */
+    /* Both transfers should be rolled back. */
     sol_account_t* loaded_to1 = sol_bank_load_account(bank, &to1);
-    TEST_ASSERT(loaded_to1 == NULL);
+    TEST_ASSERT_NOT_NULL(loaded_to1);
+    TEST_ASSERT_EQ(loaded_to1->meta.lamports, rent_exempt_min);
     sol_account_destroy(loaded_to1);
 
     sol_account_t* loaded_to2 = sol_bank_load_account(bank, &to2);
-    TEST_ASSERT(loaded_to2 == NULL);
+    TEST_ASSERT_NOT_NULL(loaded_to2);
+    TEST_ASSERT_EQ(loaded_to2->meta.lamports, rent_exempt_min);
     sol_account_destroy(loaded_to2);
 
     sol_bank_destroy(bank);
@@ -1788,9 +1866,6 @@ TEST(bank_transaction_rollback_overlay_clears_overrides) {
 
     sol_bank_t* parent = sol_bank_new(0, &parent_hash, NULL, NULL);
     TEST_ASSERT_NOT_NULL(parent);
-
-    sol_bank_t* bank = sol_bank_new_from_parent(parent, 1);
-    TEST_ASSERT_NOT_NULL(bank);
 
     /* Fee payer keypair */
     uint8_t seed[SOL_ED25519_SEED_SIZE];
@@ -1806,6 +1881,21 @@ TEST(bank_transaction_rollback_overlay_clears_overrides) {
     sol_pubkey_t to2;
     memset(to1.bytes, 0x33, sizeof(to1.bytes));
     memset(to2.bytes, 0x44, sizeof(to2.bytes));
+
+    uint64_t rent_exempt_min = sol_bank_rent_exempt_minimum(parent, 0);
+    sol_account_t* to1_account =
+        sol_account_new(rent_exempt_min, 0, &SOL_SYSTEM_PROGRAM_ID);
+    sol_account_t* to2_account =
+        sol_account_new(rent_exempt_min, 0, &SOL_SYSTEM_PROGRAM_ID);
+    TEST_ASSERT_NOT_NULL(to1_account);
+    TEST_ASSERT_NOT_NULL(to2_account);
+    TEST_ASSERT_EQ(sol_bank_store_account(parent, &to1, to1_account), SOL_OK);
+    TEST_ASSERT_EQ(sol_bank_store_account(parent, &to2, to2_account), SOL_OK);
+    sol_account_destroy(to1_account);
+    sol_account_destroy(to2_account);
+
+    sol_bank_t* bank = sol_bank_new_from_parent(parent, 1);
+    TEST_ASSERT_NOT_NULL(bank);
 
     uint64_t fee = sol_bank_lamports_per_signature(bank);
     uint64_t initial_lamports = fee + 5;
@@ -1882,13 +1972,15 @@ TEST(bank_transaction_rollback_overlay_clears_overrides) {
     TEST_ASSERT_EQ(result.fee, fee);
     TEST_ASSERT_EQ(result.status, SOL_ERR_TX_INSUFFICIENT_FUNDS);
 
-    /* Both transfers should be rolled back (recipients not created). */
+    /* Both transfers should be rolled back. */
     sol_account_t* loaded_to1 = sol_bank_load_account(bank, &to1);
-    TEST_ASSERT(loaded_to1 == NULL);
+    TEST_ASSERT_NOT_NULL(loaded_to1);
+    TEST_ASSERT_EQ(loaded_to1->meta.lamports, rent_exempt_min);
     sol_account_destroy(loaded_to1);
 
     sol_account_t* loaded_to2 = sol_bank_load_account(bank, &to2);
-    TEST_ASSERT(loaded_to2 == NULL);
+    TEST_ASSERT_NOT_NULL(loaded_to2);
+    TEST_ASSERT_EQ(loaded_to2->meta.lamports, rent_exempt_min);
     sol_account_destroy(loaded_to2);
 
     /* In an overlay bank, rollback should clear local overrides rather than
@@ -1931,8 +2023,10 @@ TEST(bank_process_decoded_transaction) {
     memset(recipient.bytes, 0x77, sizeof(recipient.bytes));
 
     uint64_t fee = sol_bank_lamports_per_signature(bank);
-    uint64_t transfer_lamports = 1234;
-    uint64_t initial_lamports = fee + transfer_lamports + 100;
+    uint64_t rent_exempt_min = sol_bank_rent_exempt_minimum(bank, 0);
+    uint64_t transfer_lamports = rent_exempt_min;
+    /* Ensure the fee payer remains rent-exempt after fee + transfer. */
+    uint64_t initial_lamports = fee + transfer_lamports + rent_exempt_min + 100;
 
     sol_account_t* payer_account = sol_account_new(initial_lamports, 0, &SOL_SYSTEM_PROGRAM_ID);
     TEST_ASSERT_NOT_NULL(payer_account);
@@ -2021,7 +2115,10 @@ TEST(bank_hash_matches_solana_formula) {
     sol_hash_t parent_blockhash;
     memset(parent_blockhash.bytes, 0xAA, sizeof(parent_blockhash.bytes));
 
-    sol_bank_t* parent = sol_bank_new(0, &parent_blockhash, NULL, NULL);
+    sol_bank_config_t cfg = SOL_BANK_CONFIG_DEFAULT;
+    cfg.ticks_per_slot = 1;
+
+    sol_bank_t* parent = sol_bank_new(0, &parent_blockhash, NULL, &cfg);
     TEST_ASSERT_NOT_NULL(parent);
 
     sol_bank_t* bank = sol_bank_new_from_parent(parent, 1);
@@ -2041,8 +2138,10 @@ TEST(bank_hash_matches_solana_formula) {
     memset(recipient.bytes, 0x20, sizeof(recipient.bytes));
 
     uint64_t fee = sol_bank_lamports_per_signature(bank);
-    uint64_t transfer_lamports = 1234;
-    uint64_t initial_lamports = fee + transfer_lamports + 100;
+    uint64_t rent_exempt_min = sol_bank_rent_exempt_minimum(bank, 0);
+    uint64_t transfer_lamports = rent_exempt_min;
+    /* Ensure the fee payer remains rent-exempt after fee + transfer. */
+    uint64_t initial_lamports = fee + transfer_lamports + rent_exempt_min + 100;
 
     sol_account_t* payer_account = sol_account_new(initial_lamports, 0, &SOL_SYSTEM_PROGRAM_ID);
     TEST_ASSERT_NOT_NULL(payer_account);
@@ -2111,22 +2210,27 @@ TEST(bank_hash_matches_solana_formula) {
     sol_hash_t computed = {0};
     sol_bank_compute_hash(bank, &computed);
 
-    sol_hash_t accounts_delta_hash = {0};
-    sol_accounts_db_hash_delta(sol_bank_get_accounts_db(bank), &accounts_delta_hash);
-
     const sol_hash_t* parent_bank_hash = sol_bank_parent_hash(bank);
     TEST_ASSERT_NOT_NULL(parent_bank_hash);
 
     uint8_t sig_count_le[8];
     sol_store_u64_le(sig_count_le, 1);
 
+    sol_lt_hash_t accounts_lt_hash = {0};
+    TEST_ASSERT(sol_bank_get_accounts_lt_hash(bank, &accounts_lt_hash));
+
+    sol_hash_t hash1 = {0};
     sol_sha256_ctx_t ctx;
     sol_sha256_init(&ctx);
     sol_sha256_update(&ctx, parent_bank_hash->bytes, SOL_HASH_SIZE);
-    sol_sha256_update(&ctx, accounts_delta_hash.bytes, SOL_HASH_SIZE);
     sol_sha256_update(&ctx, sig_count_le, sizeof(sig_count_le));
     sol_sha256_update(&ctx, last_blockhash.bytes, SOL_HASH_SIZE);
+    sol_sha256_final_bytes(&ctx, hash1.bytes);
+
     sol_hash_t expected = {0};
+    sol_sha256_init(&ctx);
+    sol_sha256_update(&ctx, hash1.bytes, SOL_HASH_SIZE);
+    sol_sha256_update(&ctx, (const uint8_t*)accounts_lt_hash.v, SOL_LT_HASH_SIZE_BYTES);
     sol_sha256_final_bytes(&ctx, expected.bytes);
 
     TEST_ASSERT(sol_hash_eq(&computed, &expected));
@@ -2139,7 +2243,10 @@ TEST(bank_hash_signature_count_resets_in_child_bank) {
     sol_hash_t parent_blockhash;
     memset(parent_blockhash.bytes, 0xAA, sizeof(parent_blockhash.bytes));
 
-    sol_bank_t* parent = sol_bank_new(0, &parent_blockhash, NULL, NULL);
+    sol_bank_config_t cfg = SOL_BANK_CONFIG_DEFAULT;
+    cfg.ticks_per_slot = 1;
+
+    sol_bank_t* parent = sol_bank_new(0, &parent_blockhash, NULL, &cfg);
     TEST_ASSERT_NOT_NULL(parent);
 
     /* Fee payer keypair */
@@ -2156,9 +2263,11 @@ TEST(bank_hash_signature_count_resets_in_child_bank) {
     memset(recipient.bytes, 0x20, sizeof(recipient.bytes));
 
     uint64_t fee = sol_bank_lamports_per_signature(parent);
-    uint64_t transfer1 = 1234;
+    uint64_t rent_exempt_min = sol_bank_rent_exempt_minimum(parent, 0);
+    uint64_t transfer1 = rent_exempt_min;
     uint64_t transfer2 = 5678;
-    uint64_t initial_lamports = (fee * 2) + transfer1 + transfer2 + 100;
+    /* Ensure the fee payer remains rent-exempt after both fee + transfer txs. */
+    uint64_t initial_lamports = (fee * 2) + transfer1 + transfer2 + rent_exempt_min + 100;
 
     sol_account_t* payer_account = sol_account_new(initial_lamports, 0, &SOL_SYSTEM_PROGRAM_ID);
     TEST_ASSERT_NOT_NULL(payer_account);
@@ -2263,9 +2372,6 @@ TEST(bank_hash_signature_count_resets_in_child_bank) {
     sol_hash_t computed = {0};
     sol_bank_compute_hash(bank, &computed);
 
-    sol_hash_t accounts_delta_hash = {0};
-    sol_accounts_db_hash_delta(sol_bank_get_accounts_db(bank), &accounts_delta_hash);
-
     const sol_hash_t* parent_bank_hash = sol_bank_parent_hash(bank);
     TEST_ASSERT_NOT_NULL(parent_bank_hash);
 
@@ -2273,13 +2379,21 @@ TEST(bank_hash_signature_count_resets_in_child_bank) {
     uint8_t sig_count_le[8];
     sol_store_u64_le(sig_count_le, 1);
 
+    sol_lt_hash_t accounts_lt_hash = {0};
+    TEST_ASSERT(sol_bank_get_accounts_lt_hash(bank, &accounts_lt_hash));
+
+    sol_hash_t hash1 = {0};
     sol_sha256_ctx_t ctx;
     sol_sha256_init(&ctx);
     sol_sha256_update(&ctx, parent_bank_hash->bytes, SOL_HASH_SIZE);
-    sol_sha256_update(&ctx, accounts_delta_hash.bytes, SOL_HASH_SIZE);
     sol_sha256_update(&ctx, sig_count_le, sizeof(sig_count_le));
     sol_sha256_update(&ctx, last_blockhash.bytes, SOL_HASH_SIZE);
+    sol_sha256_final_bytes(&ctx, hash1.bytes);
+
     sol_hash_t expected = {0};
+    sol_sha256_init(&ctx);
+    sol_sha256_update(&ctx, hash1.bytes, SOL_HASH_SIZE);
+    sol_sha256_update(&ctx, (const uint8_t*)accounts_lt_hash.v, SOL_LT_HASH_SIZE_BYTES);
     sol_sha256_final_bytes(&ctx, expected.bytes);
 
     TEST_ASSERT(sol_hash_eq(&computed, &expected));
@@ -2290,6 +2404,7 @@ TEST(bank_hash_signature_count_resets_in_child_bank) {
 
 TEST(bank_hash_ignores_obsolete_epoch_accounts_hash) {
     sol_bank_config_t cfg = SOL_BANK_CONFIG_DEFAULT;
+    cfg.ticks_per_slot = 1;
     cfg.slots_per_epoch = 100;
 
     sol_hash_t parent_blockhash;
@@ -2324,8 +2439,10 @@ TEST(bank_hash_ignores_obsolete_epoch_accounts_hash) {
     memset(recipient.bytes, 0x20, sizeof(recipient.bytes));
 
     uint64_t fee = sol_bank_lamports_per_signature(bank);
-    uint64_t transfer_lamports = 1234;
-    uint64_t initial_lamports = fee + transfer_lamports + 100;
+    uint64_t rent_exempt_min = sol_bank_rent_exempt_minimum(bank, 0);
+    uint64_t transfer_lamports = rent_exempt_min;
+    /* Ensure the fee payer remains rent-exempt after fee + transfer. */
+    uint64_t initial_lamports = fee + transfer_lamports + rent_exempt_min + 100;
 
     sol_account_t* payer_account = sol_account_new(initial_lamports, 0, &SOL_SYSTEM_PROGRAM_ID);
     TEST_ASSERT_NOT_NULL(payer_account);
@@ -2394,28 +2511,105 @@ TEST(bank_hash_ignores_obsolete_epoch_accounts_hash) {
     sol_hash_t computed = {0};
     sol_bank_compute_hash(bank, &computed);
 
-    sol_hash_t accounts_delta_hash = {0};
-    sol_accounts_db_hash_delta(sol_bank_get_accounts_db(bank), &accounts_delta_hash);
-
     const sol_hash_t* parent_bank_hash = sol_bank_parent_hash(bank);
     TEST_ASSERT_NOT_NULL(parent_bank_hash);
 
     uint8_t sig_count_le[8];
     sol_store_u64_le(sig_count_le, 1);
 
+    sol_lt_hash_t accounts_lt_hash = {0};
+    TEST_ASSERT(sol_bank_get_accounts_lt_hash(bank, &accounts_lt_hash));
+
+    sol_hash_t hash1 = {0};
     sol_sha256_ctx_t ctx;
     sol_sha256_init(&ctx);
     sol_sha256_update(&ctx, parent_bank_hash->bytes, SOL_HASH_SIZE);
-    sol_sha256_update(&ctx, accounts_delta_hash.bytes, SOL_HASH_SIZE);
     sol_sha256_update(&ctx, sig_count_le, sizeof(sig_count_le));
     sol_sha256_update(&ctx, last_blockhash.bytes, SOL_HASH_SIZE);
+    sol_sha256_final_bytes(&ctx, hash1.bytes);
+
     sol_hash_t expected = {0};
+    sol_sha256_init(&ctx);
+    sol_sha256_update(&ctx, hash1.bytes, SOL_HASH_SIZE);
+    sol_sha256_update(&ctx, (const uint8_t*)accounts_lt_hash.v, SOL_LT_HASH_SIZE_BYTES);
     sol_sha256_final_bytes(&ctx, expected.bytes);
 
     TEST_ASSERT(sol_hash_eq(&computed, &expected));
 
     sol_bank_destroy(bank);
     sol_bank_destroy(parent);
+}
+
+TEST(bank_accounts_lt_hash_parallel_matches_sequential) {
+    const char* env_key = "SOL_LT_HASH_PARALLEL";
+    const char* prev_env = getenv(env_key);
+    char* prev_copy = prev_env ? strdup(prev_env) : NULL;
+
+    sol_hash_t genesis;
+    memset(genesis.bytes, 0xAB, sizeof(genesis.bytes));
+
+    sol_bank_config_t cfg = SOL_BANK_CONFIG_DEFAULT;
+    cfg.ticks_per_slot = 1;
+
+    sol_bank_t* parent = sol_bank_new(0, &genesis, NULL, &cfg);
+    TEST_ASSERT_NOT_NULL(parent);
+
+    enum { N = 64 };
+    sol_pubkey_t keys[N];
+    for (size_t i = 0; i < N; i++) {
+        memset(keys[i].bytes, (int)(i + 1u), sizeof(keys[i].bytes));
+        sol_account_t* a = sol_account_new(1000u + (uint64_t)i, 0, &SOL_SYSTEM_PROGRAM_ID);
+        TEST_ASSERT_NOT_NULL(a);
+        TEST_ASSERT_EQ(sol_bank_store_account(parent, &keys[i], a), SOL_OK);
+        sol_account_destroy(a);
+    }
+
+    /* Ensure parent has a computed LtHash so child banks can seed their base. */
+    sol_lt_hash_t parent_lt = {0};
+    TEST_ASSERT(sol_bank_get_accounts_lt_hash(parent, &parent_lt));
+
+    setenv(env_key, "0", 1);
+    sol_bank_t* child_seq = sol_bank_new_from_parent(parent, 1);
+    TEST_ASSERT_NOT_NULL(child_seq);
+    for (size_t i = 0; i < N; i++) {
+        sol_account_t* a = sol_account_new(2000u + (uint64_t)i, 0, &SOL_SYSTEM_PROGRAM_ID);
+        TEST_ASSERT_NOT_NULL(a);
+        TEST_ASSERT_EQ(sol_bank_store_account(child_seq, &keys[i], a), SOL_OK);
+        sol_account_destroy(a);
+    }
+    sol_lt_hash_t lt_seq = {0};
+    TEST_ASSERT(sol_bank_get_accounts_lt_hash(child_seq, &lt_seq));
+
+    setenv(env_key, "1", 1);
+    sol_bank_t* child_par = sol_bank_new_from_parent(parent, 1);
+    TEST_ASSERT_NOT_NULL(child_par);
+    for (size_t i = 0; i < N; i++) {
+        sol_account_t* a = sol_account_new(2000u + (uint64_t)i, 0, &SOL_SYSTEM_PROGRAM_ID);
+        TEST_ASSERT_NOT_NULL(a);
+        TEST_ASSERT_EQ(sol_bank_store_account(child_par, &keys[i], a), SOL_OK);
+        sol_account_destroy(a);
+    }
+    sol_lt_hash_t lt_par = {0};
+    TEST_ASSERT(sol_bank_get_accounts_lt_hash(child_par, &lt_par));
+
+    TEST_ASSERT_MEM_EQ(lt_seq.v, lt_par.v, sizeof(lt_seq.v));
+
+    sol_hash_t h_seq = {0};
+    sol_hash_t h_par = {0};
+    sol_bank_compute_hash(child_seq, &h_seq);
+    sol_bank_compute_hash(child_par, &h_par);
+    TEST_ASSERT(sol_hash_eq(&h_seq, &h_par));
+
+    sol_bank_destroy(child_seq);
+    sol_bank_destroy(child_par);
+    sol_bank_destroy(parent);
+
+    if (prev_copy) {
+        setenv(env_key, prev_copy, 1);
+        free(prev_copy);
+    } else {
+        unsetenv(env_key);
+    }
 }
 
 /*
@@ -2472,6 +2666,7 @@ static test_case_t runtime_tests[] = {
     TEST_CASE(bank_resolve_v0_transaction_accounts_alt_loaded_order),
     TEST_CASE(bank_freeze),
     TEST_CASE(bank_register_tick),
+    TEST_CASE(bank_ticks_across_slot_gap_updates_blockhash_on_final_tick),
     TEST_CASE(bank_fee_distribution_credits_collector),
     TEST_CASE(bank_priority_fee_not_burned),
     TEST_CASE(bank_stats),
@@ -2481,6 +2676,7 @@ static test_case_t runtime_tests[] = {
     TEST_CASE(bank_process_decoded_transaction),
     TEST_CASE(bank_hash_matches_solana_formula),
     TEST_CASE(bank_hash_signature_count_resets_in_child_bank),
+    TEST_CASE(bank_accounts_lt_hash_parallel_matches_sequential),
     TEST_CASE(bank_hash_ignores_obsolete_epoch_accounts_hash),
     /* Null handling */
     TEST_CASE(runtime_null_handling),

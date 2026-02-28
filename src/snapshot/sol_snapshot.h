@@ -23,6 +23,8 @@
 #include "../runtime/sol_bank.h"
 #include "../runtime/sol_accounts_db.h"
 
+typedef struct sol_io_ctx sol_io_ctx_t;
+
 /*
  * Snapshot archive version
  */
@@ -84,6 +86,7 @@ typedef struct {
     uint64_t                    max_archive_count;  /* Max archives to keep */
     bool                        enable_incremental; /* Enable incremental snapshots */
     bool                        verify_accounts_hash; /* Verify snapshot accounts hash at load time (very expensive) */
+    sol_io_ctx_t*               io_ctx;             /* Optional IO context (io_uring/posix) */
 } sol_snapshot_config_t;
 
 #define SOL_SNAPSHOT_CONFIG_DEFAULT {                   \

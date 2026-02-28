@@ -11,7 +11,13 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
+#include <ctype.h>
+#include <arpa/inet.h>
+#include <sys/wait.h>
+#include <sys/time.h>
+#include <stdint.h>
 
 #ifdef __APPLE__
 #include <mach/mach_time.h>
@@ -67,6 +73,7 @@ struct sol_gossip {
     uint64_t            last_push_time;
     uint64_t            last_ping_time;
     uint64_t            last_prune_time;
+    uint64_t            last_self_update_time;
 
     /* Callbacks */
     sol_gossip_value_cb value_callback;
@@ -78,6 +85,146 @@ struct sol_gossip {
     /* Receive buffer */
     uint8_t             recv_buf[SOL_NET_MTU];
 };
+
+static bool
+ipv4_is_global(uint32_t addr_be) {
+    uint32_t a = ntohl(addr_be);
+
+    /* 0.0.0.0/8 */
+    if ((a & 0xFF000000u) == 0x00000000u) return false;
+    /* 10.0.0.0/8 */
+    if ((a & 0xFF000000u) == 0x0A000000u) return false;
+    /* 100.64.0.0/10 (CGNAT) */
+    if ((a & 0xFFC00000u) == 0x64400000u) return false;
+    /* 127.0.0.0/8 (loopback) */
+    if ((a & 0xFF000000u) == 0x7F000000u) return false;
+    /* 169.254.0.0/16 (link-local) */
+    if ((a & 0xFFFF0000u) == 0xA9FE0000u) return false;
+    /* 172.16.0.0/12 */
+    if ((a & 0xFFF00000u) == 0xAC100000u) return false;
+    /* 192.168.0.0/16 */
+    if ((a & 0xFFFF0000u) == 0xC0A80000u) return false;
+    /* 224.0.0.0/4 (multicast) */
+    if ((a & 0xF0000000u) == 0xE0000000u) return false;
+    /* 240.0.0.0/4 (reserved) */
+    if ((a & 0xF0000000u) == 0xF0000000u) return false;
+
+    return true;
+}
+
+static bool
+ip_str_is_non_global(const char* ip) {
+    if (!ip || ip[0] == '\0') return true;
+    struct in_addr a4;
+    if (inet_pton(AF_INET, ip, &a4) == 1) {
+        return !ipv4_is_global(a4.s_addr);
+    }
+    /* If it's not a valid IPv4 literal, we don't attempt to classify it here. */
+    return false;
+}
+
+static bool
+run_process_capture_stdout(const char* const* argv, char* out, size_t out_len) {
+    if (!argv || !argv[0] || !out || out_len == 0) return false;
+    out[0] = '\0';
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        return false;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return false;
+    }
+    if (pid == 0) {
+        /* Child */
+        (void)dup2(pipefd[1], STDOUT_FILENO);
+        (void)dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        execvp(argv[0], (char* const*)(uintptr_t)argv);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+
+    size_t total = 0;
+    while (total + 1 < out_len) {
+        ssize_t n = read(pipefd[0], out + total, out_len - 1 - total);
+        if (n > 0) {
+            total += (size_t)n;
+            continue;
+        }
+        break;
+    }
+    out[total] = '\0';
+    close(pipefd[0]);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR) continue;
+        break;
+    }
+
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        return false;
+    }
+    return true;
+}
+
+static bool
+fetch_public_ipv4_best_effort(char* out_ip, size_t out_ip_len) {
+    if (!out_ip || out_ip_len == 0) return false;
+    out_ip[0] = '\0';
+
+    const char* disable = getenv("SOL_GOSSIP_DISABLE_PUBLIC_IP_ECHO");
+    if (disable && disable[0] != '\0' && strcmp(disable, "0") != 0) {
+        return false;
+    }
+
+    const char* url = getenv("SOL_GOSSIP_PUBLIC_IP_ECHO_URL");
+    if (!url || url[0] == '\0') {
+        url = "https://api.ipify.org";
+    }
+
+    const char* argv[] = {
+        "curl",
+        "-4",
+        "--connect-timeout",
+        "2",
+        "-m",
+        "5",
+        "-fsSL",
+        url,
+        NULL,
+    };
+
+    char buf[256] = {0};
+    if (!run_process_capture_stdout(argv, buf, sizeof(buf))) {
+        return false;
+    }
+
+    /* Trim whitespace. */
+    char* s = buf;
+    while (*s && isspace((unsigned char)*s)) s++;
+    char* e = s + strlen(s);
+    while (e > s && isspace((unsigned char)e[-1])) e--;
+    *e = '\0';
+
+    struct in_addr a4;
+    if (inet_pton(AF_INET, s, &a4) != 1) {
+        return false;
+    }
+    if (!ipv4_is_global(a4.s_addr)) {
+        return false;
+    }
+
+    snprintf(out_ip, out_ip_len, "%s", s);
+    return true;
+}
 
 /*
  * Get current time in milliseconds
@@ -109,6 +256,50 @@ peer_hash(const sol_pubkey_t* pk, size_t table_size) {
         hash *= 1099511628211ULL;
     }
     return hash % table_size;
+}
+
+static uint64_t
+sol_gossip_wallclock_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + (uint64_t)tv.tv_usec / 1000;
+}
+
+static sol_err_t
+add_peer(sol_gossip_t* gossip, const sol_pubkey_t* pk, const sol_sockaddr_t* addr);
+
+static bool
+sockaddr_is_any(const sol_sockaddr_t* addr) {
+    if (!addr) return true;
+
+    if (addr->addr.sa.sa_family == AF_INET) {
+        return addr->addr.sin.sin_addr.s_addr == htonl(INADDR_ANY);
+    }
+
+    if (addr->addr.sa.sa_family == AF_INET6) {
+        static const struct in6_addr any = IN6ADDR_ANY_INIT;
+        return memcmp(&addr->addr.sin6.sin6_addr, &any, sizeof(any)) == 0;
+    }
+
+    return true;
+}
+
+static void
+maybe_add_peer_from_contact_info(sol_gossip_t* gossip, const sol_contact_info_t* ci) {
+    if (!gossip || !ci) return;
+    if (sol_pubkey_eq(&ci->pubkey, &gossip->self_pubkey)) return;
+
+    if (gossip->config.shred_version != 0 && ci->shred_version != 0 &&
+        ci->shred_version != gossip->config.shred_version) {
+        return;
+    }
+
+    const sol_sockaddr_t* gossip_addr = sol_contact_info_socket(ci, SOL_SOCKET_TAG_GOSSIP);
+    if (!gossip_addr) return;
+    if (sockaddr_is_any(gossip_addr)) return;
+    if (sol_sockaddr_port(gossip_addr) == 0) return;
+
+    add_peer(gossip, &ci->pubkey, gossip_addr);
 }
 
 /*
@@ -279,6 +470,7 @@ send_pull_request(sol_gossip_t* gossip, const sol_sockaddr_t* addr) {
     req.filter.mask_bits = 0;
     req.self_value.type = SOL_CRDS_CONTACT_INFO;
     req.self_value.data.contact_info = gossip->self_info;
+    (void)sol_gossip_crds_value_sign(&req.self_value, &gossip->config.identity);
 
     /* Encode message */
     uint8_t buf[1024];
@@ -467,9 +659,13 @@ handle_push(sol_gossip_t* gossip, const sol_push_msg_t* push, const sol_sockaddr
     gossip->stats.pushes_received++;
 
     /* Insert values into CRDS */
-    uint64_t now = sol_gossip_now_ms();
+    uint64_t now = sol_gossip_wallclock_ms();
     for (uint16_t i = 0; i < push->values_len && push->values; i++) {
         sol_crds_insert(gossip->crds, &push->values[i], &push->pubkey, now);
+
+        if (push->values[i].type == SOL_CRDS_CONTACT_INFO) {
+            maybe_add_peer_from_contact_info(gossip, &push->values[i].data.contact_info);
+        }
 
         /* Notify callback */
         if (gossip->value_callback) {
@@ -495,7 +691,8 @@ handle_pull_request(sol_gossip_t* gossip, const sol_pull_request_t* req,
     if (req->self_value.type == SOL_CRDS_CONTACT_INFO) {
         sol_crds_insert(gossip->crds, &req->self_value,
                         &req->self_value.data.contact_info.pubkey,
-                        sol_gossip_now_ms());
+                        sol_gossip_wallclock_ms());
+        maybe_add_peer_from_contact_info(gossip, &req->self_value.data.contact_info);
     }
 
     /* Send pull response filtered by bloom */
@@ -548,12 +745,18 @@ process_message(sol_gossip_t* gossip, const uint8_t* data, size_t len,
         add_peer(gossip, &msg.data.pull_response.pubkey, src);
 
         /* Insert values into CRDS */
-        uint64_t now = sol_gossip_now_ms();
+        uint64_t now = sol_gossip_wallclock_ms();
         for (uint16_t i = 0; i < msg.data.pull_response.values_len; i++) {
             if (msg.data.pull_response.values) {
                 sol_crds_insert(gossip->crds,
                                &msg.data.pull_response.values[i],
                                &msg.data.pull_response.pubkey, now);
+
+                if (msg.data.pull_response.values[i].type == SOL_CRDS_CONTACT_INFO) {
+                    maybe_add_peer_from_contact_info(
+                        gossip,
+                        &msg.data.pull_response.values[i].data.contact_info);
+                }
 
                 /* Notify callback */
                 if (gossip->value_callback) {
@@ -647,6 +850,29 @@ do_pings(sol_gossip_t* gossip) {
     pthread_rwlock_unlock(&gossip->peer_lock);
 }
 
+static void
+do_self_update(sol_gossip_t* gossip) {
+    if (!gossip) return;
+
+    uint64_t now_mono = sol_gossip_now_ms();
+    if (now_mono - gossip->last_self_update_time < 5000) {
+        return;
+    }
+    gossip->last_self_update_time = now_mono;
+
+    uint64_t now_wall = sol_gossip_wallclock_ms();
+    gossip->self_info.wallclock = now_wall;
+    gossip->self_info.outset = now_wall / (1000ULL * 60ULL);
+
+    sol_crds_value_t self_value = {
+        .type = SOL_CRDS_CONTACT_INFO,
+        .data.contact_info = gossip->self_info
+    };
+
+    (void)sol_gossip_crds_value_sign(&self_value, &gossip->config.identity);
+    sol_crds_insert(gossip->crds, &self_value, &gossip->self_pubkey, now_wall);
+}
+
 /*
  * Send periodic pull requests
  */
@@ -706,11 +932,17 @@ do_pushes(sol_gossip_t* gossip) {
     }
     gossip->last_push_time = now;
 
+    uint64_t now_wall = sol_gossip_wallclock_ms();
+    uint64_t since = 0;
+    if (now_wall > (uint64_t)gossip->config.push_interval_ms * 2) {
+        since = now_wall - (uint64_t)gossip->config.push_interval_ms * 2;
+    }
+
     /* Get recent CRDS values to push */
     const sol_crds_entry_t* entries[32];
     size_t count = sol_crds_get_entries_since(
         gossip->crds,
-        gossip->last_push_time - gossip->config.push_interval_ms * 2,
+        since,
         entries, 32
     );
 
@@ -811,7 +1043,7 @@ sol_gossip_new(const sol_gossip_config_t* config) {
     sol_contact_info_init(&gossip->self_info);
     sol_pubkey_copy(&gossip->self_info.pubkey, &gossip->self_pubkey);
     gossip->self_info.shred_version = gossip->config.shred_version;
-    gossip->self_info.wallclock = sol_gossip_now_ms();
+    gossip->self_info.wallclock = sol_gossip_wallclock_ms();
     gossip->self_info.outset = gossip->self_info.wallclock / (1000ULL * 60ULL);
     gossip->self_info.version = (sol_version_t){0};
 
@@ -867,6 +1099,10 @@ sol_gossip_start(sol_gossip_t* gossip) {
     udp_cfg.bind_ip = gossip->config.bind_ip;
     udp_cfg.bind_port = gossip->config.gossip_port;
     udp_cfg.nonblocking = true;
+    /* Gossip can be extremely bursty on mainnet; keep buffers large to reduce
+     * packet drops while the node is busy with catchup/replay. */
+    udp_cfg.recv_buf = 128u * 1024u * 1024u;
+    udp_cfg.send_buf = 128u * 1024u * 1024u;
 
     uint16_t requested_port = udp_cfg.bind_port;
     gossip->sock = sol_udp_new(&udp_cfg);
@@ -931,12 +1167,20 @@ sol_gossip_start(sol_gossip_t* gossip) {
 
     /* Determine advertise IP. */
     char adv_ip[INET6_ADDRSTRLEN] = {0};
-    if (gossip->config.advertise_ip && gossip->config.advertise_ip[0] != '\0') {
+    bool advertise_ip_configured =
+        (gossip->config.advertise_ip && gossip->config.advertise_ip[0] != '\0');
+    if (advertise_ip_configured) {
         snprintf(adv_ip, sizeof(adv_ip), "%s", gossip->config.advertise_ip);
     } else if (gossip->config.entrypoints && gossip->config.entrypoints_len > 0) {
         const sol_sockaddr_t* remote = &gossip->config.entrypoints[0];
         int fd = socket(sol_sockaddr_family(remote), SOCK_DGRAM, 0);
         if (fd >= 0) {
+            /* Best-effort: avoid leaking this temp socket across fork/exec helpers. */
+            int fd_flags = fcntl(fd, F_GETFD, 0);
+            if (fd_flags >= 0) {
+                (void)fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+            }
+
             if (connect(fd, &remote->addr.sa, remote->len) == 0) {
                 sol_sockaddr_t guessed = {0};
                 socklen_t guessed_len = sizeof(guessed.addr);
@@ -967,6 +1211,27 @@ sol_gossip_start(sol_gossip_t* gossip) {
     if (adv_ip[0] == '\0') {
         snprintf(adv_ip, sizeof(adv_ip), "127.0.0.1");
     }
+
+    /* Many hosts infer a private RFC1918 address via getsockname(). That
+     * address is not reachable by other validators on the public internet, so
+     * turbine shreds and repair requests to our advertised sockets will never
+     * arrive. As a best-effort fallback, query a public IP echo service once at
+     * startup and advertise that address instead. */
+    if (!advertise_ip_configured && ip_str_is_non_global(adv_ip)) {
+        char public_ip[INET6_ADDRSTRLEN] = {0};
+        if (fetch_public_ipv4_best_effort(public_ip, sizeof(public_ip))) {
+            sol_log_info("Gossip advertise IP inferred as %s (non-public); using public IP %s",
+                         adv_ip,
+                         public_ip);
+            snprintf(adv_ip, sizeof(adv_ip), "%s", public_ip);
+        } else {
+            sol_log_warn("Gossip advertise IP inferred as %s (may be unreachable from the cluster). "
+                         "Set --advertise-ip to override.",
+                         adv_ip);
+        }
+    }
+
+    sol_log_info("Gossip advertise IP: %s", adv_ip);
 
     /* Advertise sockets for contact-info. */
     sol_sockaddr_t adv;
@@ -1003,12 +1268,16 @@ sol_gossip_start(sol_gossip_t* gossip) {
     }
 
     /* Add self to CRDS */
+    uint64_t now_wall = sol_gossip_wallclock_ms();
+    gossip->self_info.wallclock = now_wall;
+    gossip->self_info.outset = now_wall / (1000ULL * 60ULL);
+
     sol_crds_value_t self_value = {
         .type = SOL_CRDS_CONTACT_INFO,
         .data.contact_info = gossip->self_info
     };
-    sol_crds_insert(gossip->crds, &self_value, &gossip->self_pubkey,
-                    sol_gossip_now_ms());
+    (void)sol_gossip_crds_value_sign(&self_value, &gossip->config.identity);
+    sol_crds_insert(gossip->crds, &self_value, &gossip->self_pubkey, now_wall);
 
     gossip->running = true;
 
@@ -1038,25 +1307,28 @@ sol_gossip_run_once(sol_gossip_t* gossip, uint32_t timeout_ms) {
     }
 
     /* Receive messages (drain socket to keep up with mainnet rates). */
-    enum { SOL_GOSSIP_RECV_BUDGET = 64 };
-    for (size_t i = 0; i < SOL_GOSSIP_RECV_BUDGET; i++) {
-        sol_sockaddr_t src;
-        size_t len = sizeof(gossip->recv_buf);
-
-        sol_err_t err = sol_udp_recv(gossip->sock, gossip->recv_buf, &len, &src);
-        if (err == SOL_OK) {
-            process_message(gossip, gossip->recv_buf, len, &src);
-            continue;
+    enum { SOL_GOSSIP_RECV_BUDGET = 4096 };
+    size_t processed = 0;
+    sol_udp_pkt_t pkts[SOL_NET_BATCH_SIZE];
+    while (processed < SOL_GOSSIP_RECV_BUDGET) {
+        int n = sol_udp_recv_batch(gossip->sock, pkts, SOL_NET_BATCH_SIZE);
+        if (n < 0) {
+            sol_log_warn("UDP recv error");
+            break;
         }
-        if (err != SOL_ERR_AGAIN) {
-            sol_log_warn("UDP recv error: %d", err);
+        if (n == 0) {
+            break;
         }
-        break;
+        processed += (size_t)n;
+        for (int i = 0; i < n; i++) {
+            process_message(gossip, pkts[i].data, pkts[i].len, &pkts[i].addr);
+        }
     }
 
     /* Periodic tasks */
     do_pings(gossip);
     do_pulls(gossip);
+    do_self_update(gossip);
     do_pushes(gossip);
     do_prune(gossip);
 
@@ -1095,9 +1367,15 @@ sol_err_t
 sol_gossip_push_value(sol_gossip_t* gossip, const sol_crds_value_t* value) {
     if (!gossip || !value) return SOL_ERR_INVAL;
 
+    sol_crds_value_t signed_value = *value;
+    const sol_pubkey_t* origin = sol_crds_value_pubkey(value);
+    if (origin && sol_pubkey_eq(origin, &gossip->self_pubkey)) {
+        (void)sol_gossip_crds_value_sign(&signed_value, &gossip->config.identity);
+    }
+
     /* Insert into local CRDS */
-    sol_crds_insert(gossip->crds, value, &gossip->self_pubkey,
-                    sol_gossip_now_ms());
+    sol_crds_insert(gossip->crds, &signed_value, &gossip->self_pubkey,
+                    sol_gossip_wallclock_ms());
 
     /* Track the push request (value will be sent during next push cycle
      * or immediately if peers are available) */
@@ -1112,7 +1390,7 @@ sol_gossip_push_value(sol_gossip_t* gossip, const sol_crds_value_t* value) {
         sol_peer_entry_t* entry = gossip->peer_table[i];
         while (entry && push_count < gossip->config.push_fanout) {
             if (entry->peer.state == SOL_PEER_STATE_ACTIVE) {
-                send_push_message(gossip, value, 1, &entry->peer.gossip_addr);
+                send_push_message(gossip, &signed_value, 1, &entry->peer.gossip_addr);
                 push_count++;
             }
             entry = entry->next;

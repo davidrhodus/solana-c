@@ -574,20 +574,33 @@ fetch_thread_func(void* arg) {
             continue;
         }
 
-        sol_tx_packet_t packet;
-        sol_sockaddr_t src_addr;
-        size_t recv_len = sizeof(packet.data);
+        sol_udp_pkt_t pkts[SOL_NET_BATCH_SIZE];
+        int n = sol_udp_recv_batch(tpu->udp_socket, pkts, SOL_NET_BATCH_SIZE);
+        if (n <= 0) {
+            continue;
+        }
 
-        sol_err_t err = sol_udp_recv(tpu->udp_socket, packet.data, &recv_len, &src_addr);
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t recv_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 
-        if (err == SOL_OK && recv_len > 0) {
-            packet.len = recv_len;
-            packet.src_ip = src_addr.addr.sin.sin_addr.s_addr;
-            packet.src_port = ntohs(src_addr.addr.sin.sin_port);
+        for (int i = 0; i < n; i++) {
+            sol_tx_packet_t packet;
+            if (pkts[i].len > sizeof(packet.data)) {
+                continue;
+            }
 
-            struct timespec ts;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            packet.received_ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+            memcpy(packet.data, pkts[i].data, pkts[i].len);
+            packet.len = pkts[i].len;
+            packet.received_ns = recv_ns;
+
+            if (pkts[i].addr.addr.sa.sa_family == AF_INET) {
+                packet.src_ip = pkts[i].addr.addr.sin.sin_addr.s_addr;
+                packet.src_port = ntohs(pkts[i].addr.addr.sin.sin_port);
+            } else {
+                packet.src_ip = 0;
+                packet.src_port = 0;
+            }
 
             if (!packet_queue_push(&tpu->packet_queue, &packet)) {
                 __atomic_fetch_add(&tpu->stats.packets_dropped, 1, __ATOMIC_RELAXED);

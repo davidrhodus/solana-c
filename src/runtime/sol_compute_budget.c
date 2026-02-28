@@ -210,8 +210,16 @@ sol_compute_budget_parse(sol_compute_budget_t* budget,
         uint8_t instruction_type = ix->data[0];
 
         switch (instruction_type) {
-            case 0: /* RequestUnitsDeprecated - rejected on modern mainnet */
-                return SOL_ERR_PROGRAM_INVALID_INSTR;
+            case 0: /* RequestUnitsDeprecated */
+                /* Deprecated but still accepted for backwards-compatibility.
+                   This instruction sets BOTH the CU limit and CU price. */
+                if (seen_compute_unit_limit || seen_compute_unit_price) {
+                    return SOL_ERR_TX_DUPLICATE_INSTR;
+                }
+                seen_compute_unit_limit = true;
+                seen_compute_unit_price = true;
+                has_explicit_limit = true;
+                break;
 
             case 1: /* RequestHeapFrame */
                 if (seen_heap_frame) {

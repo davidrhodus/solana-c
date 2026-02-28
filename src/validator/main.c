@@ -30,6 +30,7 @@
 #include "util/sol_config.h"
 #include "util/sol_json.h"
 #include "util/sol_rpc_client.h"
+#include "util/sol_io.h"
 #include "crypto/sol_ed25519.h"
 #include "txn/sol_pubkey.h"
 #include "gossip/sol_gossip.h"
@@ -54,6 +55,41 @@
 #include "rpc/sol_rpc.h"
 #include "snapshot/sol_snapshot.h"
 #include "snapshot/sol_snapshot_download.h"
+
+static uint64_t
+validator_phys_mem_bytes(void) {
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page_size <= 0) return 0;
+    return (uint64_t)pages * (uint64_t)page_size;
+}
+
+static size_t
+validator_default_accountsdb_rocksdb_cache_mb(void) {
+    /* AccountsDB index lookups are extremely latency sensitive during replay.
+     * On validator-grade hosts we can safely spend tens of GiB on RocksDB's
+     * block cache to avoid disk-bound random reads. */
+    uint64_t mem_bytes = validator_phys_mem_bytes();
+    uint64_t mem_gib = mem_bytes / (1024ull * 1024ull * 1024ull);
+    if (mem_gib >= 1024ull) return 65536u; /* 64 GiB */
+    if (mem_gib >= 512ull) return 32768u;  /* 32 GiB */
+    if (mem_gib >= 256ull) return 16384u;  /* 16 GiB */
+    if (mem_gib >= 128ull) return 8192u;   /* 8 GiB */
+    if (mem_gib >= 64ull) return 4096u;    /* 4 GiB */
+    return 512u;
+}
+
+static size_t
+validator_default_blockstore_rocksdb_cache_mb(void) {
+    uint64_t mem_bytes = validator_phys_mem_bytes();
+    uint64_t mem_gib = mem_bytes / (1024ull * 1024ull * 1024ull);
+    if (mem_gib >= 1024ull) return 16384u; /* 16 GiB */
+    if (mem_gib >= 512ull) return 8192u;   /* 8 GiB */
+    if (mem_gib >= 256ull) return 4096u;   /* 4 GiB */
+    if (mem_gib >= 128ull) return 2048u;   /* 2 GiB */
+    if (mem_gib >= 64ull) return 1024u;    /* 1 GiB */
+    return 512u;
+}
 
 static sol_err_t
 rm_dir_recursive(const char* path) {
@@ -136,6 +172,13 @@ snapshot_effective_slot_from_paths(const char* full_snapshot_path,
 #define OPT_DEV_HALT_AT_SLOT 1001
 #define OPT_FULL_OWNER_INDEX 1002
 #define OPT_AUTO_SNAPSHOT_MAX_LAG_SLOTS 1003
+#define OPT_IO_BACKEND 1004
+#define OPT_IO_QUEUE_DEPTH 1005
+#define OPT_IO_SQPOLL 1006
+#define OPT_NO_IO_URING 1007
+#define OPT_FAST_REPLAY 1008
+#define OPT_TX_INDEX 1009
+#define OPT_NO_TX_INDEX 1010
 
 /*
  * Validator configuration
@@ -167,6 +210,8 @@ typedef struct {
     bool            enable_rpc;         /* Enable RPC server */
     bool            full_owner_index;   /* Build full accounts owner index (slow) */
     bool            no_voting;          /* Disable voting */
+    bool            fast_replay;        /* Skip instruction exec/signature verify during replay (unsafe) */
+    bool            enable_tx_index;    /* Enable address-signature transaction index (expensive) */
     bool            no_wait_for_vote;   /* Don't wait for vote account */
     sol_log_level_t log_level;          /* Log level */
     sol_log_format_t log_format;        /* Log format (text/json) */
@@ -174,7 +219,23 @@ typedef struct {
     bool            enable_metrics;     /* Enable Prometheus metrics */
     uint16_t        metrics_port;       /* Prometheus metrics port */
     sol_slot_t      dev_halt_at_slot;   /* Halt once this slot is replayed (dev/test) */
+    sol_io_backend_t io_backend;        /* IO backend selection */
+    uint32_t        io_queue_depth;     /* io_uring queue depth (if enabled) */
+    bool            io_sqpoll;          /* io_uring SQPOLL submit thread */
 } validator_config_t;
+
+typedef struct {
+    pthread_t              thread;
+    pthread_mutex_t        lock;
+    pthread_cond_t         cond;
+    bool                   started;
+    bool                   shutdown;
+    bool                   request_pending;
+    sol_slot_t             requested_start;
+    uint64_t               last_request_ns;
+    sol_leader_schedule_t* ready_schedule;
+    char                   ready_rpc_url[256];
+} validator_leader_schedule_refresh_t;
 
 /*
  * Validator state
@@ -202,6 +263,10 @@ typedef struct {
     sol_tpu_t*          tpu;
     sol_tvu_t*          tvu;
 
+    /* Service pump threads */
+    pthread_t           repair_pump_thread;
+    bool                repair_pump_started;
+
     /* Block production */
     sol_poh_recorder_t*   poh;
     sol_block_producer_t* block_producer;
@@ -214,6 +279,8 @@ typedef struct {
     sol_prometheus_t*     prometheus;
     sol_health_server_t*  health;
     sol_rpc_t*            rpc;
+    sol_io_ctx_t*         io_ctx;
+    validator_leader_schedule_refresh_t leader_schedule_refresh;
 
     /* Metrics handles */
     sol_metric_t*         metric_slot_height;
@@ -255,7 +322,7 @@ static validator_config_t g_config = {
     .snapshot_rpc_urls = NULL,
     .snapshot_rpc_urls_count = 0,
     .snapshot_verify_accounts_hash = false,
-    .snapshot_max_bootstrap_lag_slots = 50000,
+    .snapshot_max_bootstrap_lag_slots = 1,
     .entrypoints = NULL,
     .entrypoints_count = 0,
     .advertise_ip = NULL,
@@ -270,6 +337,8 @@ static validator_config_t g_config = {
     .enable_rpc = true,
     .full_owner_index = false,
     .no_voting = false,
+    .fast_replay = false,
+    .enable_tx_index = false,
     .no_wait_for_vote = false,
     .log_level = SOL_LOG_INFO,
     .log_format = SOL_LOG_FORMAT_TEXT,
@@ -277,10 +346,24 @@ static validator_config_t g_config = {
     .enable_metrics = true,
     .metrics_port = SOL_DEFAULT_METRICS_PORT,
     .dev_halt_at_slot = 0,
+#ifdef __linux__
+    .io_backend = SOL_IO_BACKEND_URING,
+#else
+    .io_backend = SOL_IO_BACKEND_POSIX,
+#endif
+    .io_queue_depth = 256,
+    .io_sqpoll = false,
 };
 
 static bool g_snapshot_max_lag_cli_overridden = false;
 static bool g_entrypoints_cli_overridden = false;
+static bool g_io_backend_cli_overridden = false;
+static bool g_tx_index_cli_overridden = false;
+static bool g_rpc_port_is_bound = false;
+
+/* Default snapshot RPC fallback (owned for process lifetime). */
+static char* g_default_snapshot_rpc_url_owned = NULL;
+static char* g_default_snapshot_rpc_urls[1] = {NULL};
 
 /* Global validator pointer for health callback */
 static validator_t* g_validator = NULL;
@@ -512,7 +595,7 @@ validator_autoselect_default_ports(void) {
     }
 
     /* RPC (TCP) */
-    if (g_config.enable_rpc &&
+    if (g_config.enable_rpc && !g_rpc_port_is_bound &&
         (g_config.rpc_port == 0 ||
          (g_config.rpc_port >= SOL_DEFAULT_RPC_PORT &&
           g_config.rpc_port < (uint16_t)(SOL_DEFAULT_RPC_PORT + auto_span)))) {
@@ -676,13 +759,65 @@ find_best_incremental_snapshot_archive(const char* archive_dir,
     return SOL_OK;
 }
 
+/* Infer the base slot for a persisted bootstrap slot by locating the incremental
+ * snapshot archive that produced it.
+ *
+ * This is intentionally conservative: we only trust an exact filename match
+ * (incremental-snapshot-<base>-<slot>-...). Without knowing the true base slot
+ * of the AccountsDB contents, applying an arbitrary incremental snapshot risks
+ * corrupting or rewinding state. */
+static sol_err_t
+find_incremental_base_for_bootstrap_slot(const char* archive_dir,
+                                        sol_slot_t bootstrap_slot,
+                                        sol_slot_t* out_base_slot,
+                                        char* out_path,
+                                        size_t out_path_len) {
+    if (!archive_dir || bootstrap_slot == 0 || !out_base_slot) return SOL_ERR_INVAL;
+    if (out_path && out_path_len > 0) out_path[0] = '\0';
+
+    DIR* dir = opendir(archive_dir);
+    if (!dir) return SOL_ERR_NOTFOUND;
+
+    sol_err_t rc = SOL_ERR_NOTFOUND;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+
+        char full_path[PATH_MAX];
+        int n = snprintf(full_path, sizeof(full_path), "%s/%s", archive_dir, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(full_path)) continue;
+
+        struct stat st;
+        if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+
+        if (!snapshot_archive_has_known_ext(entry->d_name)) continue;
+
+        sol_snapshot_info_t info = {0};
+        if (sol_snapshot_get_info(entry->d_name, &info) != SOL_OK) continue;
+        if (info.type != SOL_SNAPSHOT_INCREMENTAL) continue;
+        if (info.slot != bootstrap_slot) continue;
+        if (info.base_slot == 0) continue;
+
+        *out_base_slot = info.base_slot;
+        if (out_path && out_path_len > 0) {
+            (void)snprintf(out_path, out_path_len, "%s/%s", archive_dir, entry->d_name);
+        }
+        rc = SOL_OK;
+        break;
+    }
+
+    closedir(dir);
+    return rc;
+}
+
 static sol_err_t
 auto_download_snapshot_archives(const char* manifest_url,
                                 const char* archive_dir,
                                 char* out_full_path,
                                 size_t out_full_path_len,
                                 char* out_incremental_path,
-                                size_t out_incremental_path_len) {
+                                size_t out_incremental_path_len,
+                                sol_io_ctx_t* io_ctx) {
     if (!manifest_url || !archive_dir || !out_full_path || out_full_path_len == 0) return SOL_ERR_INVAL;
     if (out_incremental_path && out_incremental_path_len > 0) {
         out_incremental_path[0] = '\0';
@@ -695,6 +830,7 @@ auto_download_snapshot_archives(const char* manifest_url,
     opts.verify_after = true;
     opts.resume = true;
     opts.output_dir = archive_dir;
+    opts.io_ctx = io_ctx;
 
     sol_err_t err = sol_snapshot_service_find_best_download(manifest_url, &opts, &full, &incr);
     if (err != SOL_OK) {
@@ -723,7 +859,8 @@ auto_download_snapshot_archives_from_rpc_urls(char* const* rpc_urls,
                                               char* out_full_path,
                                               size_t out_full_path_len,
                                               char* out_incremental_path,
-                                              size_t out_incremental_path_len) {
+                                              size_t out_incremental_path_len,
+                                              sol_io_ctx_t* io_ctx) {
     if (!rpc_urls || rpc_url_count == 0 || !archive_dir || !out_full_path || out_full_path_len == 0) {
         return SOL_ERR_INVAL;
     }
@@ -800,6 +937,7 @@ auto_download_snapshot_archives_from_rpc_urls(char* const* rpc_urls,
     opts.verify_after = true;
     opts.resume = true;
     opts.output_dir = archive_dir;
+    opts.io_ctx = io_ctx;
 
     sol_err_t err = sol_snapshot_download(&best_full, &opts, out_full_path, out_full_path_len);
     if (err == SOL_OK && best_incr.url && out_incremental_path && out_incremental_path_len > 0) {
@@ -890,6 +1028,17 @@ query_rpc_best_slot(char* const* rpc_urls,
 }
 
 static sol_err_t
+auto_download_incremental_snapshot_for_base_best_effort(const char* manifest_url,
+                                                        char* const* rpc_urls,
+                                                        size_t rpc_url_count,
+                                                        const char* archive_dir,
+                                                        sol_slot_t base_slot,
+                                                        char* out_incremental_path,
+                                                        size_t out_incremental_path_len,
+                                                        sol_slot_t* out_incremental_slot,
+                                                        sol_io_ctx_t* io_ctx);
+
+static sol_err_t
 auto_download_snapshot_archives_best_effort(const char* manifest_url,
                                             char* const* rpc_urls,
                                             size_t rpc_url_count,
@@ -897,7 +1046,8 @@ auto_download_snapshot_archives_best_effort(const char* manifest_url,
                                             char* out_full_path,
                                             size_t out_full_path_len,
                                             char* out_incremental_path,
-                                            size_t out_incremental_path_len) {
+                                            size_t out_incremental_path_len,
+                                            sol_io_ctx_t* io_ctx) {
     const bool have_manifest = manifest_url && manifest_url[0] != '\0';
     const bool have_rpc = rpc_urls && rpc_url_count > 0;
     if (!have_manifest && !have_rpc) return SOL_ERR_INVAL;
@@ -912,17 +1062,57 @@ auto_download_snapshot_archives_best_effort(const char* manifest_url,
         (void)query_rpc_best_slot(rpc_urls, rpc_url_count, &rpc_best_slot);
     }
 
+    /* Default: prefer the snapshot service when configured.
+     *
+     * Snapshot services are typically tuned for high-throughput archive
+     * delivery (range requests), while RPC endpoints are primarily for
+     * JSON-RPC and may rate-limit large archive downloads. */
     bool prefer_rpc = (!have_manifest && have_rpc);
-    if (have_manifest && have_rpc && manifest_best_slot != 0 && rpc_best_slot != 0) {
-        const sol_slot_t max_manifest_lag = 50000; /* ~5.5 hours @ ~400ms/slot */
-        if (rpc_best_slot > manifest_best_slot &&
-            (rpc_best_slot - manifest_best_slot) > max_manifest_lag) {
-            sol_log_warn("Snapshot service manifest lags RPC by %lu slots (manifest=%lu rpc=%lu); preferring RPC",
-                         (unsigned long)(rpc_best_slot - manifest_best_slot),
-                         (unsigned long)manifest_best_slot,
-                         (unsigned long)rpc_best_slot);
+    /* Allow operators to opt into preferring fresher RPC snapshots (at the cost
+     * of slower/more fragile large archive downloads). */
+    const char* prefer_rpc_env = getenv("SOL_SNAPSHOT_PREFER_RPC_IF_FRESHER");
+    bool prefer_rpc_if_fresher =
+        (prefer_rpc_env && prefer_rpc_env[0] != '\0' && strcmp(prefer_rpc_env, "0") != 0);
+    if (prefer_rpc_if_fresher && have_manifest && have_rpc && rpc_best_slot != 0) {
+        /* Prefer the source that is actually fresher. Snapshot services can lag
+         * RPC-reported highest snapshots by many minutes/hours if uploads stall. */
+        if (manifest_best_slot == 0 || rpc_best_slot > manifest_best_slot) {
             prefer_rpc = true;
         }
+    }
+
+    /* Optional behavior: prefer RPC snapshots when the manifest is stale.
+     *
+     * This is disabled by default because large archive downloads from public
+     * JSON-RPC endpoints are often rate-limited or do not support byte-range
+     * requests. Operators can opt into this behavior via
+     * SOL_SNAPSHOT_AUTO_PREFER_RPC_LAG_SLOTS (set to a positive slot lag). */
+    sol_slot_t auto_prefer_rpc_lag = 0;
+    const char* auto_prefer_rpc_env = getenv("SOL_SNAPSHOT_AUTO_PREFER_RPC_LAG_SLOTS");
+    if (auto_prefer_rpc_env && auto_prefer_rpc_env[0] != '\0') {
+        errno = 0;
+        char* end = NULL;
+        unsigned long long lag = strtoull(auto_prefer_rpc_env, &end, 10);
+        if (errno == 0 && end && end != auto_prefer_rpc_env) {
+            while (*end && isspace((unsigned char)*end)) end++;
+            if (*end == '\0') {
+                auto_prefer_rpc_lag = (sol_slot_t)lag;
+            }
+        }
+    }
+
+    if (!prefer_rpc &&
+        have_manifest &&
+        have_rpc &&
+        auto_prefer_rpc_lag != 0 &&
+        manifest_best_slot != 0 &&
+        rpc_best_slot > manifest_best_slot &&
+        (rpc_best_slot - manifest_best_slot) > auto_prefer_rpc_lag) {
+        sol_log_warn("Snapshot manifest best slot %lu lags RPC best slot %lu by %lu slots; preferring RPC download",
+                     (unsigned long)manifest_best_slot,
+                     (unsigned long)rpc_best_slot,
+                     (unsigned long)(rpc_best_slot - manifest_best_slot));
+        prefer_rpc = true;
     }
 
     sol_err_t dl_err = SOL_ERR_NOTFOUND;
@@ -942,7 +1132,8 @@ auto_download_snapshot_archives_best_effort(const char* manifest_url,
             out_full_path,
             out_full_path_len,
             out_incremental_path,
-            out_incremental_path_len);
+            out_incremental_path_len,
+            io_ctx);
 
         if (dl_err == SOL_ERR_SHUTDOWN) {
             return dl_err;
@@ -957,7 +1148,8 @@ auto_download_snapshot_archives_best_effort(const char* manifest_url,
                 out_full_path,
                 out_full_path_len,
                 out_incremental_path,
-                out_incremental_path_len);
+                out_incremental_path_len,
+                io_ctx);
         }
     } else {
         if (have_manifest) {
@@ -975,11 +1167,65 @@ auto_download_snapshot_archives_best_effort(const char* manifest_url,
                 out_full_path,
                 out_full_path_len,
                 out_incremental_path,
-                out_incremental_path_len);
+                out_incremental_path_len,
+                io_ctx);
         }
 
         if (dl_err == SOL_ERR_SHUTDOWN) {
             return dl_err;
+        }
+
+        if (dl_err != SOL_OK && have_rpc) {
+            sol_log_warn("Snapshot service download failed (%s); falling back to RPC sources",
+                         sol_err_str(dl_err));
+            dl_err = auto_download_snapshot_archives_from_rpc_urls(
+                (char* const*)rpc_urls,
+                rpc_url_count,
+                archive_dir,
+                out_full_path,
+                out_full_path_len,
+                out_incremental_path,
+                out_incremental_path_len,
+                io_ctx);
+        }
+
+        /* If the manifest doesn't advertise incremental snapshots, opportunistically
+         * fetch the newest incremental snapshot for the downloaded full snapshot
+         * base slot from RPC sources. This significantly reduces catchup time on
+         * networks where only full snapshots are published via the manifest. */
+        if (dl_err == SOL_OK &&
+            have_rpc &&
+            out_full_path && out_full_path[0] != '\0' &&
+            out_incremental_path && out_incremental_path_len > 0 &&
+            out_incremental_path[0] == '\0') {
+            sol_snapshot_info_t full_info = {0};
+            sol_slot_t base_slot = 0;
+            if (sol_snapshot_get_info(out_full_path, &full_info) == SOL_OK && full_info.slot != 0) {
+                base_slot = full_info.slot;
+            }
+            if (base_slot != 0) {
+                sol_slot_t incr_slot = 0;
+                sol_err_t ierr = auto_download_incremental_snapshot_for_base_best_effort(
+                    NULL,
+                    (char* const*)rpc_urls,
+                    rpc_url_count,
+                    archive_dir,
+                    base_slot,
+                    out_incremental_path,
+                    out_incremental_path_len,
+                    &incr_slot,
+                    io_ctx);
+                if (ierr == SOL_OK && out_incremental_path[0] != '\0') {
+                    sol_log_info("Auto-downloaded incremental snapshot from RPC (base=%lu slot=%lu): %s",
+                                 (unsigned long)base_slot,
+                                 (unsigned long)(incr_slot ? incr_slot : base_slot),
+                                 out_incremental_path);
+                } else if (ierr != SOL_OK && ierr != SOL_ERR_NOTFOUND) {
+                    sol_log_warn("Incremental snapshot RPC fetch failed (base=%lu): %s",
+                                 (unsigned long)base_slot,
+                                 sol_err_str(ierr));
+                }
+            }
         }
 
         if (dl_err != SOL_OK && have_rpc) {
@@ -992,7 +1238,8 @@ auto_download_snapshot_archives_best_effort(const char* manifest_url,
                 out_full_path,
                 out_full_path_len,
                 out_incremental_path,
-                out_incremental_path_len);
+                out_incremental_path_len,
+                io_ctx);
         }
     }
 
@@ -1007,7 +1254,8 @@ auto_download_incremental_snapshot_for_base_best_effort(const char* manifest_url
                                                         sol_slot_t base_slot,
                                                         char* out_incremental_path,
                                                         size_t out_incremental_path_len,
-                                                        sol_slot_t* out_incremental_slot) {
+                                                        sol_slot_t* out_incremental_slot,
+                                                        sol_io_ctx_t* io_ctx) {
     if (!archive_dir || !out_incremental_path || out_incremental_path_len == 0) return SOL_ERR_INVAL;
     out_incremental_path[0] = '\0';
     if (out_incremental_slot) *out_incremental_slot = 0;
@@ -1017,6 +1265,7 @@ auto_download_incremental_snapshot_for_base_best_effort(const char* manifest_url
     opts.verify_after = true;
     opts.resume = true;
     opts.output_dir = archive_dir;
+    opts.io_ctx = io_ctx;
 
     if (manifest_url && manifest_url[0] != '\0') {
         sol_available_snapshot_t full = {0};
@@ -1098,6 +1347,152 @@ auto_download_incremental_snapshot_for_base_best_effort(const char* manifest_url
     return SOL_ERR_NOTFOUND;
 }
 
+/* Forward declaration (defined below). */
+static volatile sig_atomic_t g_shutdown;
+
+/* After loading a snapshot (full + optional incremental) we may still be far
+ * behind cluster head if the configured snapshot service is stale.  Opportunistically
+ * fetch and apply a follow-up incremental snapshot whose base slot matches the
+ * current bank slot. This avoids downloading a huge newer full snapshot when an
+ * incremental-on-top exists via RPC. */
+static sol_err_t
+validator_maybe_apply_followup_incremental_snapshot(validator_t* v,
+                                                    sol_bank_t** io_root_bank,
+                                                    sol_slot_t expected_base_slot,
+                                                    const char* manifest_url,
+                                                    char* const* rpc_urls,
+                                                    size_t rpc_url_count,
+                                                    const char* archive_dir) {
+    if (!v || !io_root_bank || !*io_root_bank || !v->accounts_db || !archive_dir) {
+        return SOL_OK;
+    }
+
+    const sol_slot_t base_slot = expected_base_slot;
+    const sol_slot_t cur_slot = sol_bank_slot(*io_root_bank);
+    if (base_slot == 0 || cur_slot == 0) {
+        return SOL_OK;
+    }
+    if (cur_slot < base_slot) {
+        return SOL_OK;
+    }
+
+    /* Prefer an existing local incremental for this base slot, but try to
+     * download a newer one when possible. */
+    char local_incr_path[PATH_MAX] = {0};
+    sol_slot_t local_incr_slot = 0;
+    if (find_best_incremental_snapshot_archive(archive_dir,
+                                               base_slot,
+                                               local_incr_path,
+                                               sizeof(local_incr_path),
+                                               &local_incr_slot) != SOL_OK) {
+        local_incr_path[0] = '\0';
+        local_incr_slot = 0;
+    }
+
+    char dl_incr_path[PATH_MAX] = {0};
+    sol_slot_t dl_incr_slot = 0;
+    if ((manifest_url && manifest_url[0] != '\0') ||
+        (rpc_urls && rpc_url_count > 0)) {
+        sol_err_t dl_err = auto_download_incremental_snapshot_for_base_best_effort(
+            manifest_url,
+            rpc_urls,
+            rpc_url_count,
+            archive_dir,
+            base_slot,
+            dl_incr_path,
+            sizeof(dl_incr_path),
+            &dl_incr_slot,
+            v->io_ctx);
+        if (dl_err == SOL_ERR_SHUTDOWN || g_shutdown) {
+            return SOL_ERR_SHUTDOWN;
+        }
+        if (dl_err != SOL_OK && dl_err != SOL_ERR_NOTFOUND) {
+            sol_log_warn("Follow-up incremental snapshot download failed (base=%lu current=%lu): %s",
+                         (unsigned long)base_slot,
+                         (unsigned long)cur_slot,
+                         sol_err_str(dl_err));
+            dl_incr_path[0] = '\0';
+            dl_incr_slot = 0;
+        }
+    }
+
+    const char* apply_path = NULL;
+    sol_slot_t apply_slot = 0;
+
+    if (dl_incr_path[0] != '\0' && dl_incr_slot > apply_slot) {
+        apply_path = dl_incr_path;
+        apply_slot = dl_incr_slot;
+    }
+    if (local_incr_path[0] != '\0' && local_incr_slot > apply_slot) {
+        apply_path = local_incr_path;
+        apply_slot = local_incr_slot;
+    }
+
+    if (!apply_path || apply_slot <= cur_slot) {
+        return SOL_OK;
+    }
+
+    sol_snapshot_config_t snapshot_cfg = SOL_SNAPSHOT_CONFIG_DEFAULT;
+    snapshot_cfg.verify_accounts_hash = g_config.snapshot_verify_accounts_hash;
+    snapshot_cfg.io_ctx = v->io_ctx;
+
+    sol_snapshot_mgr_t* snapshot_mgr = sol_snapshot_mgr_new(&snapshot_cfg);
+    if (!snapshot_mgr) {
+        sol_log_warn("Failed to create snapshot manager for follow-up incremental apply");
+        return SOL_OK;
+    }
+
+    /* Prefer extracting temp files under the ledger path (large disk). */
+    if (g_config.ledger_path) {
+        if (mkdir(g_config.ledger_path, 0755) != 0 && errno != EEXIST) {
+            sol_log_warn("Failed to create ledger dir %s: %s",
+                         g_config.ledger_path, strerror(errno));
+        } else {
+            struct stat st = {0};
+            if (stat(g_config.ledger_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                sol_err_t serr = sol_snapshot_mgr_set_dirs(snapshot_mgr, g_config.ledger_path, NULL);
+                if (serr != SOL_OK) {
+                    sol_log_warn("Failed to set snapshot dirs: %s", sol_err_str(serr));
+                }
+            }
+        }
+    }
+
+    sol_bank_t* new_bank = NULL;
+    sol_err_t err = sol_snapshot_apply_incremental_to_accounts_db(snapshot_mgr,
+                                                                  apply_path,
+                                                                  base_slot,
+                                                                  v->accounts_db,
+                                                                  &new_bank);
+    sol_snapshot_mgr_destroy(snapshot_mgr);
+
+    if (err == SOL_ERR_SHUTDOWN || g_shutdown) {
+        return SOL_ERR_SHUTDOWN;
+    }
+
+    if (err != SOL_OK || !new_bank) {
+        sol_log_warn("Follow-up incremental apply failed (base=%lu current=%lu path=%s): %s",
+                     (unsigned long)base_slot,
+                     (unsigned long)cur_slot,
+                     apply_path,
+                     sol_err_str(err));
+        if (new_bank) {
+            sol_bank_destroy(new_bank);
+        }
+        return SOL_OK;
+    }
+
+    sol_log_info("Follow-up incremental snapshot applied (slot=%lu -> %lu, base=%lu): %s",
+                 (unsigned long)cur_slot,
+                 (unsigned long)sol_bank_slot(new_bank),
+                 (unsigned long)base_slot,
+                 apply_path);
+
+    sol_bank_destroy(*io_root_bank);
+    *io_root_bank = new_bank;
+    return SOL_OK;
+}
+
 static int
 mkdir_recursive(const char* path) {
     if (!path || *path == '\0') return -1;
@@ -1149,10 +1544,37 @@ turbine_shred_callback(void* ctx,
 }
 
 static void
+turbine_shred_batch_callback(void* ctx,
+                             const sol_udp_pkt_t* pkts,
+                             int count) {
+    sol_tvu_t* tvu = (sol_tvu_t*)ctx;
+    if (!tvu || !pkts || count <= 0) return;
+    (void)sol_tvu_process_shreds_batch(tvu, pkts, count);
+}
+
+static void
 repair_shred_callback(const sol_shred_t* shred, void* ctx) {
     sol_tvu_t* tvu = (sol_tvu_t*)ctx;
     if (!tvu || !shred || !shred->raw_data || shred->raw_len == 0) return;
     sol_tvu_process_shred(tvu, shred->raw_data, shred->raw_len);
+}
+
+static void*
+repair_pump_thread_main(void* arg) {
+    validator_t* v = (validator_t*)arg;
+    if (!v || !v->repair) return NULL;
+
+    while (!g_shutdown && sol_repair_is_running(v->repair)) {
+        sol_err_t err = sol_repair_run_once(v->repair, 0);
+        if (err == SOL_ERR_SHUTDOWN) {
+            break;
+        }
+        /* Keep the thread cooperative when there is no work; under load,
+         * recvmmsg loops dominate and sched_yield is effectively free. */
+        sched_yield();
+    }
+
+    return NULL;
 }
 
 static void
@@ -1286,8 +1708,8 @@ block_producer_block_data_callback(void* ctx,
  * Print usage
  */
 static void
-print_usage(const char* progname) {
-    fprintf(stderr,
+	print_usage(const char* progname) {
+	    fprintf(stderr,
         "Usage: %s [OPTIONS]\n"
         "\n"
         "Solana validator written in pure C\n"
@@ -1301,7 +1723,7 @@ print_usage(const char* progname) {
         "  --tower-path PATH         Path to tower persistence file (defaults to <ledger>/tower.bin)\n"
         "  -s, --snapshot PATH       Path to snapshot to load (optional)\n"
         "  --verify-snapshot-accounts-hash Verify snapshot accounts hash at load time (very expensive)\n"
-        "  --auto-snapshot-max-lag-slots N  Force fresh snapshot load when persisted AccountsDB lags by >N slots (0=disable; default: 50000)\n"
+        "  --auto-snapshot-max-lag-slots N  Force fresh snapshot load when persisted AccountsDB lags by >N slots (0=disable; default: 1)\n"
         "  -e, --entrypoint HOST:PORT  Gossip entrypoint (repeatable; defaults to entrypoint.<cluster>.solana.com:8001)\n"
         "  --advertise-ip IP         Public IP to advertise in gossip contact-info (optional)\n"
         "  --shred-version N         Cluster shred version (optional; 0 = auto-discover)\n"
@@ -1311,10 +1733,23 @@ print_usage(const char* progname) {
         "  --gossip-port PORT        Gossip port (default: 8001)\n"
         "  --tpu-port PORT           TPU port (default: 8003)\n"
         "  --tvu-port PORT           TVU port (default: 8004)\n"
-        "  --no-quic                 Disable TPU QUIC receiver\n"
-        "  --no-rpc                  Disable RPC server\n"
+	        "  --no-quic                 Disable TPU QUIC receiver\n"
+	        "  --no-rpc                  Disable RPC server\n"
+#ifdef __linux__
+	        "  --io-backend BACKEND      IO backend: uring|posix (default: uring; falls back to posix if unavailable)\n"
+#else
+	        "  --io-backend BACKEND      IO backend: posix|uring (default: posix)\n"
+#endif
+	        "  --io-queue-depth N        io_uring queue depth (default: 256)\n"
+	        "  --io-sqpoll               Enable io_uring SQPOLL submit thread\n"
+#ifdef __linux__
+	        "  --no-io-uring             Disable io_uring (force POSIX IO)\n"
+#endif
         "  --full-owner-index        Build full accounts owner index (slow; improves getProgramAccounts)\n"
         "  --no-voting               Disable voting\n"
+        "  --fast-replay             Skip tx processing/exec/signature verify + tx index (unsafe; fastest)\n"
+        "  --tx-index                Enable address/signature tx index (enables getSignaturesForAddress; expensive)\n"
+        "  --no-tx-index             Disable tx index (default)\n"
         "  --log-level LEVEL         Log level: trace, debug, info, warn, error\n"
         "  --log-format FORMAT       Log format: text, json (default: text)\n"
         "  --log-file PATH           Log to file instead of stderr\n"
@@ -1475,6 +1910,10 @@ parse_args(int argc, char* argv[]) {
         {"snapshot",     required_argument, 0, 's'},
         {"verify-snapshot-accounts-hash", no_argument, 0, OPT_VERIFY_SNAPSHOT_ACCOUNTS_HASH},
         {"auto-snapshot-max-lag-slots", required_argument, 0, OPT_AUTO_SNAPSHOT_MAX_LAG_SLOTS},
+        {"io-backend",   required_argument, 0, OPT_IO_BACKEND},
+        {"io-queue-depth", required_argument, 0, OPT_IO_QUEUE_DEPTH},
+        {"io-sqpoll",    no_argument,       0, OPT_IO_SQPOLL},
+        {"no-io-uring",  no_argument,       0, OPT_NO_IO_URING},
         {"entrypoint",   required_argument, 0, 'e'},
         {"advertise-ip", required_argument, 0, 'A'},
         {"shred-version", required_argument, 0, 'S'},
@@ -1488,6 +1927,9 @@ parse_args(int argc, char* argv[]) {
         {"no-rpc",      no_argument,       0, 'R'},
         {"full-owner-index", no_argument,  0, OPT_FULL_OWNER_INDEX},
         {"no-voting",   no_argument,       0, 'N'},
+        {"fast-replay", no_argument,       0, OPT_FAST_REPLAY},
+        {"tx-index",    no_argument,       0, OPT_TX_INDEX},
+        {"no-tx-index", no_argument,       0, OPT_NO_TX_INDEX},
         {"log-level",   required_argument, 0, 'L'},
         {"log-format",  required_argument, 0, 'F'},
         {"log-file",    required_argument, 0, 'f'},
@@ -1560,6 +2002,40 @@ parse_args(int argc, char* argv[]) {
             g_snapshot_max_lag_cli_overridden = true;
             break;
         }
+        case OPT_IO_BACKEND:
+            if (strcmp(optarg, "posix") == 0) {
+                g_config.io_backend = SOL_IO_BACKEND_POSIX;
+            } else if (strcmp(optarg, "uring") == 0) {
+                g_config.io_backend = SOL_IO_BACKEND_URING;
+            } else {
+                sol_log_error("Invalid --io-backend value: %s", optarg);
+                return -1;
+            }
+            g_io_backend_cli_overridden = true;
+            break;
+        case OPT_NO_IO_URING:
+            g_config.io_backend = SOL_IO_BACKEND_POSIX;
+            g_io_backend_cli_overridden = true;
+            break;
+        case OPT_IO_QUEUE_DEPTH: {
+            errno = 0;
+            char* end = NULL;
+            unsigned long long v = strtoull(optarg, &end, 10);
+            if (errno != 0 || !end || end == optarg) {
+                sol_log_error("Invalid --io-queue-depth value: %s", optarg);
+                return -1;
+            }
+            while (*end && isspace((unsigned char)*end)) end++;
+            if (*end != '\0' || v == 0 || v > UINT32_MAX) {
+                sol_log_error("Invalid --io-queue-depth value: %s", optarg);
+                return -1;
+            }
+            g_config.io_queue_depth = (uint32_t)v;
+            break;
+        }
+        case OPT_IO_SQPOLL:
+            g_config.io_sqpoll = true;
+            break;
         case 'e':
             if (!g_entrypoints_cli_overridden) {
                 /* CLI overrides any config-file entrypoints. */
@@ -1606,6 +2082,17 @@ parse_args(int argc, char* argv[]) {
             break;
         case 'N':
             g_config.no_voting = true;
+            break;
+        case OPT_FAST_REPLAY:
+            g_config.fast_replay = true;
+            break;
+        case OPT_TX_INDEX:
+            g_config.enable_tx_index = true;
+            g_tx_index_cli_overridden = true;
+            break;
+        case OPT_NO_TX_INDEX:
+            g_config.enable_tx_index = false;
+            g_tx_index_cli_overridden = true;
             break;
         case 'L':
             g_config.log_level = sol_log_level_from_name(optarg);
@@ -1664,6 +2151,7 @@ get_time_sec(void) {
 }
 
 static uint64_t monotonic_time_ns(void);
+static bool leader_schedule_is_usable(const sol_leader_schedule_t* schedule);
 
 static void
 validator_replay_slot_callback(sol_slot_t slot, sol_replay_result_t result, void* ctx) {
@@ -1729,7 +2217,33 @@ validator_apply_implicit_defaults(void) {
         }
     }
 
-    /* Snapshot RPC fallbacks are opt-in via config (snapshots.rpc_urls). */
+    /* Snapshot bootstrap defaults:
+     *
+     * - Prefer snapshot service manifests by default (configured via
+     *   snapshots.manifest_url).
+     * - Do not implicitly add snapshot RPC URLs when a manifest is present.
+     *   Public RPC endpoints are often not optimized for (or may outright
+     *   block) large archive downloads, while the snapshot service is tuned
+     *   for high-throughput ranged downloads.
+     *
+     * Operators can still configure snapshots.rpc_urls explicitly for fallback
+     * / incremental fetches. */
+    if ((!g_config.snapshot_rpc_urls || g_config.snapshot_rpc_urls_count == 0) &&
+        (!g_config.snapshot_manifest_url || g_config.snapshot_manifest_url[0] == '\0')) {
+        const char* network = infer_cluster_network_name();
+        sol_snapshot_source_t src = {0};
+        size_t n = sol_snapshot_get_default_sources(network ? network : "mainnet-beta", &src, 1);
+        if (n > 0 && src.url && src.url[0] != '\0') {
+            g_default_snapshot_rpc_url_owned = src.url;
+            g_default_snapshot_rpc_urls[0] = g_default_snapshot_rpc_url_owned;
+            g_config.snapshot_rpc_urls = g_default_snapshot_rpc_urls;
+            g_config.snapshot_rpc_urls_count = 1;
+            sol_log_info("No snapshot manifest configured; defaulting snapshot RPC source to %s",
+                         g_default_snapshot_rpc_url_owned);
+        } else {
+            sol_free(src.url);
+        }
+    }
 
     /* Allow tuning the bootstrap refresh threshold via env without needing a flag. */
     if (!g_snapshot_max_lag_cli_overridden) {
@@ -1760,6 +2274,95 @@ validator_apply_implicit_defaults(void) {
         }
     }
 #endif
+}
+
+static void
+validator_apply_fast_replay(void) {
+    if (!g_config.fast_replay) {
+        return;
+    }
+
+    /* Fast replay is unsafe: it preserves block layout/ticks but skips exec/verification. */
+    setenv("SOL_SKIP_TX_PROCESSING", "1", 1);
+    setenv("SOL_SKIP_INSTRUCTION_EXEC", "1", 1);
+    setenv("SOL_SKIP_SIGNATURE_VERIFY", "1", 1);
+    setenv("SOL_SKIP_TX_INDEX", "1", 1);
+    setenv("SOL_FAST_REPLAY_FORCE_ADVANCE", "1", 1);
+
+    sol_log_warn("Fast replay enabled: skipping transaction processing, instruction execution, shred/transaction signature verification, and tx index; state will be incorrect");
+}
+
+static void
+validator_apply_tx_index_defaults(void) {
+    if (g_config.fast_replay) {
+        /* Fast replay forcibly disables tx indexing; let that code path drive
+         * the env var so logs remain consistent. */
+        return;
+    }
+
+    const char* env = getenv("SOL_SKIP_TX_INDEX");
+    if (g_tx_index_cli_overridden) {
+        (void)setenv("SOL_SKIP_TX_INDEX", g_config.enable_tx_index ? "0" : "1", 1);
+        sol_log_info("TX index: %s (cli)", g_config.enable_tx_index ? "enabled" : "disabled");
+        return;
+    }
+
+    if (env && env[0] != '\0') {
+        bool enabled = (strcmp(env, "0") == 0);
+        sol_log_info("TX index: %s (env SOL_SKIP_TX_INDEX=%s)", enabled ? "enabled" : "disabled", env);
+        return;
+    }
+
+    /* Default: disable tx indexing for replay throughput. Users can enable it
+     * explicitly via --tx-index or SOL_SKIP_TX_INDEX=0. */
+    (void)setenv("SOL_SKIP_TX_INDEX", "1", 1);
+    sol_log_info("TX index: disabled (default; pass --tx-index to enable)");
+}
+
+static sol_err_t
+validator_fixup_builtin_accounts(validator_t* v, sol_bank_t* root_bank) {
+    if (!v || !v->accounts_db || !root_bank) {
+        return SOL_OK;
+    }
+
+    sol_account_t* before = sol_accounts_db_load(v->accounts_db, &SOL_SYSTEM_PROGRAM_ID);
+    sol_lt_hash_t before_hash;
+    sol_lt_hash_identity(&before_hash);
+    if (before) {
+        sol_account_lt_hash(&SOL_SYSTEM_PROGRAM_ID, before, &before_hash);
+    }
+
+    sol_err_t ferr = sol_accounts_db_fixup_builtin_program_accounts(v->accounts_db);
+    if (ferr != SOL_OK) {
+        if (before) sol_account_destroy(before);
+        return ferr;
+    }
+
+    sol_account_t* after = sol_accounts_db_load(v->accounts_db, &SOL_SYSTEM_PROGRAM_ID);
+    sol_lt_hash_t after_hash;
+    sol_lt_hash_identity(&after_hash);
+    if (after) {
+        sol_account_lt_hash(&SOL_SYSTEM_PROGRAM_ID, after, &after_hash);
+    }
+
+    bool changed = memcmp(before_hash.v, after_hash.v, sizeof(before_hash.v)) != 0;
+    if (changed) {
+        bool updated = sol_bank_apply_accounts_lt_hash_delta(root_bank,
+                                                             &SOL_SYSTEM_PROGRAM_ID,
+                                                             before,
+                                                             after);
+        if (!updated) {
+            sol_log_warn("System Program fixup applied but bank LtHash was not updated; bank hash may be stale");
+        } else {
+            sol_hash_t new_hash = {0};
+            sol_bank_compute_hash(root_bank, &new_hash);
+            sol_log_warn("System Program fixup updated bank LtHash; recomputed root bank hash");
+        }
+    }
+
+    if (before) sol_account_destroy(before);
+    if (after) sol_account_destroy(after);
+    return SOL_OK;
 }
 
 static void
@@ -2053,7 +2656,7 @@ maybe_seed_repair_peers_from_rpc(validator_t* v) {
         return;
     }
 
-    enum { SOL_REPAIR_SEED_PEERS_MAX = 256 };
+    enum { SOL_REPAIR_SEED_PEERS_MAX = 1024 };
     sol_repair_seed_peer_t peers[SOL_REPAIR_SEED_PEERS_MAX];
     size_t peer_count = 0;
 
@@ -2167,6 +2770,10 @@ maybe_seed_repair_peers_from_rpc(validator_t* v) {
 
 static bool
 maybe_seed_leader_schedule_from_rpc(validator_t* v) {
+    if (g_config.fast_replay) {
+        return false;
+    }
+
     if (!v || !v->tvu || !v->turbine || !v->bank_forks) return false;
 
     const char* rpc_urls[16];
@@ -2185,7 +2792,7 @@ maybe_seed_leader_schedule_from_rpc(validator_t* v) {
     for (size_t i = 0; i < rpc_url_count; i++) {
         const char* rpc_url = rpc_urls[i];
         if (!rpc_url || rpc_url[0] == '\0') continue;
-        err = sol_rpc_get_slot_leaders(rpc_url, 15, start_slot, limit, &leaders, &leaders_len);
+        err = sol_rpc_get_slot_leaders(rpc_url, 2, start_slot, limit, &leaders, &leaders_len);
         if (err == SOL_OK && leaders && leaders_len > 0) {
             used_rpc_url = rpc_url;
             break;
@@ -2221,10 +2828,17 @@ maybe_seed_leader_schedule_from_rpc(validator_t* v) {
     if (v->replay) {
         old_replay = sol_replay_swap_leader_schedule(v->replay, schedule);
     }
+    sol_leader_schedule_t* old_repair = NULL;
+    if (v->repair) {
+        old_repair = (sol_leader_schedule_t*)sol_repair_swap_leader_schedule(v->repair, schedule);
+    }
     v->leader_schedule = schedule;
+    if (v->rpc) {
+        sol_rpc_set_leader_schedule(v->rpc, v->leader_schedule);
+    }
 
-    sol_leader_schedule_t* to_free[4] = { old_tvu, old_turbine, old_replay, prev };
-    for (size_t i = 0; i < 4; i++) {
+    sol_leader_schedule_t* to_free[5] = { old_tvu, old_turbine, old_replay, old_repair, prev };
+    for (size_t i = 0; i < 5; i++) {
         sol_leader_schedule_t* s = to_free[i];
         if (!s || s == schedule) continue;
         bool seen = false;
@@ -2250,12 +2864,71 @@ maybe_seed_leader_schedule_from_rpc(validator_t* v) {
 
 static void
 validator_maybe_refresh_rpc_leader_schedule(validator_t* v) {
+    if (g_config.fast_replay) return;
     if (!v || !v->tvu || !v->turbine || !v->bank_forks || !v->replay) return;
 
-    /* Throttle RPC calls. */
-    static uint64_t last_attempt_ns = 0;
+    validator_leader_schedule_refresh_t* r = &v->leader_schedule_refresh;
+    if (!r->started) return;
+
+    /* Apply any completed refresh without blocking the main loop. */
+    sol_leader_schedule_t* ready = NULL;
+    char ready_rpc_url[256] = {0};
+    pthread_mutex_lock(&r->lock);
+    if (r->ready_schedule) {
+        ready = r->ready_schedule;
+        r->ready_schedule = NULL;
+        strncpy(ready_rpc_url, r->ready_rpc_url, sizeof(ready_rpc_url) - 1);
+        ready_rpc_url[sizeof(ready_rpc_url) - 1] = '\0';
+    }
+    pthread_mutex_unlock(&r->lock);
+
+    if (ready) {
+        if (!leader_schedule_is_usable(ready)) {
+            sol_leader_schedule_destroy(ready);
+        } else {
+            sol_slot_t first = sol_leader_schedule_first_slot(ready);
+            sol_slot_t last = sol_leader_schedule_last_slot(ready);
+
+            sol_leader_schedule_t* prev = v->leader_schedule;
+            sol_leader_schedule_t* old_tvu = sol_tvu_swap_leader_schedule(v->tvu, ready);
+            sol_leader_schedule_t* old_turbine = sol_turbine_swap_leader_schedule(v->turbine, ready);
+            sol_leader_schedule_t* old_replay = sol_replay_swap_leader_schedule(v->replay, ready);
+            sol_leader_schedule_t* old_repair = NULL;
+            if (v->repair) {
+                old_repair = (sol_leader_schedule_t*)sol_repair_swap_leader_schedule(v->repair, ready);
+            }
+            v->leader_schedule = ready;
+            if (v->rpc) {
+                sol_rpc_set_leader_schedule(v->rpc, v->leader_schedule);
+            }
+
+            sol_leader_schedule_t* to_free[5] = { old_tvu, old_turbine, old_replay, old_repair, prev };
+            for (size_t i = 0; i < 5; i++) {
+                sol_leader_schedule_t* s = to_free[i];
+                if (!s || s == ready) continue;
+                bool seen = false;
+                for (size_t j = 0; j < i; j++) {
+                    if (to_free[j] == s) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    sol_leader_schedule_destroy(s);
+                }
+            }
+
+            sol_log_info("Leader schedule refreshed from %s for slots [%lu..%lu]",
+                         ready_rpc_url[0] ? ready_rpc_url : "(rpc)",
+                         (unsigned long)first,
+                         (unsigned long)last);
+        }
+    }
+
+    /* Throttle refresh requests. */
     uint64_t now_ns = monotonic_time_ns();
-    if (last_attempt_ns != 0 && (now_ns - last_attempt_ns) < (5ULL * 1000ULL * 1000ULL * 1000ULL)) {
+    if (r->last_request_ns != 0 &&
+        (now_ns - r->last_request_ns) < (5ULL * 1000ULL * 1000ULL * 1000ULL)) {
         return;
     }
 
@@ -2271,13 +2944,31 @@ validator_maybe_refresh_rpc_leader_schedule(validator_t* v) {
         }
     }
 
-    last_attempt_ns = now_ns;
+    r->last_request_ns = now_ns;
 
-    /* Refresh using RPC slot leaders starting at the current replay cursor. */
+    pthread_mutex_lock(&r->lock);
+    if (!r->shutdown) {
+        r->requested_start = desired_start;
+        r->request_pending = true;
+        pthread_cond_signal(&r->cond);
+    }
+    pthread_mutex_unlock(&r->lock);
+}
+
+static sol_leader_schedule_t*
+validator_fetch_rpc_leader_schedule(sol_slot_t desired_start,
+                                    char* out_rpc_url,
+                                    size_t out_rpc_url_len) {
+    if (out_rpc_url && out_rpc_url_len > 0) {
+        out_rpc_url[0] = '\0';
+    }
+
     const char* rpc_urls[16];
     char* owned_rpc_url = NULL;
-    size_t rpc_url_count = validator_collect_rpc_urls(rpc_urls, sizeof(rpc_urls) / sizeof(rpc_urls[0]), &owned_rpc_url);
-    if (rpc_url_count == 0) return;
+    size_t rpc_url_count = validator_collect_rpc_urls(rpc_urls,
+                                                     sizeof(rpc_urls) / sizeof(rpc_urls[0]),
+                                                     &owned_rpc_url);
+    if (rpc_url_count == 0) return NULL;
 
     const uint64_t start_slot = (uint64_t)desired_start;
     const uint64_t limit = 16384;
@@ -2289,7 +2980,7 @@ validator_maybe_refresh_rpc_leader_schedule(validator_t* v) {
     for (size_t i = 0; i < rpc_url_count; i++) {
         const char* rpc_url = rpc_urls[i];
         if (!rpc_url || rpc_url[0] == '\0') continue;
-        err = sol_rpc_get_slot_leaders(rpc_url, 15, start_slot, limit, &leaders, &leaders_len);
+        err = sol_rpc_get_slot_leaders(rpc_url, 2, start_slot, limit, &leaders, &leaders_len);
         if (err == SOL_OK && leaders && leaders_len > 0) {
             used_rpc_url = rpc_url;
             break;
@@ -2301,49 +2992,124 @@ validator_maybe_refresh_rpc_leader_schedule(validator_t* v) {
 
     if (!used_rpc_url) {
         sol_free(owned_rpc_url);
-        return;
+        return NULL;
+    }
+
+    if (out_rpc_url && out_rpc_url_len > 0) {
+        strncpy(out_rpc_url, used_rpc_url, out_rpc_url_len - 1);
+        out_rpc_url[out_rpc_url_len - 1] = '\0';
     }
 
     sol_leader_schedule_t* schedule =
         sol_leader_schedule_from_slot_leaders(desired_start, leaders, leaders_len);
     sol_free(leaders);
+    sol_free(owned_rpc_url);
 
-    if (!schedule) {
-        sol_free(owned_rpc_url);
+    if (!schedule) return NULL;
+    if (!leader_schedule_is_usable(schedule)) {
+        sol_leader_schedule_destroy(schedule);
+        return NULL;
+    }
+
+    return schedule;
+}
+
+static void*
+validator_leader_schedule_refresh_thread(void* arg) {
+    validator_t* v = (validator_t*)arg;
+    if (!v) return NULL;
+
+    validator_leader_schedule_refresh_t* r = &v->leader_schedule_refresh;
+
+    for (;;) {
+        sol_slot_t desired_start = 0;
+
+        pthread_mutex_lock(&r->lock);
+        while (!r->shutdown && !r->request_pending) {
+            pthread_cond_wait(&r->cond, &r->lock);
+        }
+        if (r->shutdown) {
+            pthread_mutex_unlock(&r->lock);
+            break;
+        }
+        desired_start = r->requested_start;
+        r->request_pending = false;
+        pthread_mutex_unlock(&r->lock);
+
+        char used_rpc_url[256] = {0};
+        sol_leader_schedule_t* schedule =
+            validator_fetch_rpc_leader_schedule(desired_start, used_rpc_url, sizeof(used_rpc_url));
+        if (!schedule) {
+            continue;
+        }
+
+        pthread_mutex_lock(&r->lock);
+        if (r->shutdown) {
+            pthread_mutex_unlock(&r->lock);
+            sol_leader_schedule_destroy(schedule);
+            break;
+        }
+
+        if (r->ready_schedule) {
+            sol_leader_schedule_destroy(r->ready_schedule);
+        }
+        r->ready_schedule = schedule;
+        strncpy(r->ready_rpc_url, used_rpc_url, sizeof(r->ready_rpc_url) - 1);
+        r->ready_rpc_url[sizeof(r->ready_rpc_url) - 1] = '\0';
+        pthread_mutex_unlock(&r->lock);
+    }
+
+    return NULL;
+}
+
+static void
+validator_leader_schedule_refresh_start(validator_t* v) {
+    if (!v) return;
+    if (g_config.fast_replay) return;
+
+    validator_leader_schedule_refresh_t* r = &v->leader_schedule_refresh;
+    if (r->started) return;
+
+    pthread_mutex_lock(&r->lock);
+    r->shutdown = false;
+    r->request_pending = false;
+    r->requested_start = 0;
+    r->last_request_ns = 0;
+    r->ready_rpc_url[0] = '\0';
+    pthread_mutex_unlock(&r->lock);
+
+    if (pthread_create(&r->thread, NULL, validator_leader_schedule_refresh_thread, v) != 0) {
+        sol_log_warn("Failed to start leader schedule refresh thread");
         return;
     }
 
-    sol_slot_t first = sol_leader_schedule_first_slot(schedule);
-    sol_slot_t last = sol_leader_schedule_last_slot(schedule);
+    r->started = true;
+}
 
-    sol_leader_schedule_t* prev = v->leader_schedule;
-    sol_leader_schedule_t* old_tvu = sol_tvu_swap_leader_schedule(v->tvu, schedule);
-    sol_leader_schedule_t* old_turbine = sol_turbine_swap_leader_schedule(v->turbine, schedule);
-    sol_leader_schedule_t* old_replay = sol_replay_swap_leader_schedule(v->replay, schedule);
-    v->leader_schedule = schedule;
+static void
+validator_leader_schedule_refresh_stop(validator_t* v) {
+    if (!v) return;
 
-    sol_leader_schedule_t* to_free[4] = { old_tvu, old_turbine, old_replay, prev };
-    for (size_t i = 0; i < 4; i++) {
-        sol_leader_schedule_t* s = to_free[i];
-        if (!s || s == schedule) continue;
-        bool seen = false;
-        for (size_t j = 0; j < i; j++) {
-            if (to_free[j] == s) {
-                seen = true;
-                break;
-            }
-        }
-        if (!seen) {
-            sol_leader_schedule_destroy(s);
-        }
+    validator_leader_schedule_refresh_t* r = &v->leader_schedule_refresh;
+    if (!r->started) return;
+
+    pthread_mutex_lock(&r->lock);
+    r->shutdown = true;
+    pthread_cond_signal(&r->cond);
+    pthread_mutex_unlock(&r->lock);
+
+    pthread_join(r->thread, NULL);
+    r->started = false;
+
+    sol_leader_schedule_t* stale = NULL;
+    pthread_mutex_lock(&r->lock);
+    stale = r->ready_schedule;
+    r->ready_schedule = NULL;
+    pthread_mutex_unlock(&r->lock);
+
+    if (stale) {
+        sol_leader_schedule_destroy(stale);
     }
-
-    sol_log_info("Leader schedule refreshed from %s for slots [%lu..%lu]",
-                 used_rpc_url,
-                 (unsigned long)first,
-                 (unsigned long)last);
-
-    sol_free(owned_rpc_url);
 }
 
 static bool
@@ -2451,7 +3217,9 @@ health_callback(void* ctx) {
     result.slots_behind = (v->highest_slot > v->current_slot) ?
                           (v->highest_slot - v->current_slot) : 0;
     result.is_syncing = v->is_syncing;
-    result.is_voting = !g_config.no_voting;
+    /* Voting can be disabled either explicitly via --no-voting or implicitly by
+     * omitting/invalid vote account configuration. Report the effective state. */
+    result.is_voting = (!g_config.no_voting) && v->vote_account_initialized;
     result.is_leader = v->is_leader;
     result.has_identity = true;
     result.uptime_seconds = get_time_sec() - v->start_time;
@@ -2575,6 +3343,27 @@ validator_init(validator_t* v) {
     v->start_time = get_time_sec();
     v->is_syncing = true;  /* Start in syncing mode */
 
+    pthread_mutex_init(&v->leader_schedule_refresh.lock, NULL);
+    pthread_cond_init(&v->leader_schedule_refresh.cond, NULL);
+    v->leader_schedule_refresh.ready_rpc_url[0] = '\0';
+
+    sol_io_options_t io_opts = SOL_IO_OPTIONS_DEFAULT;
+    io_opts.backend = g_config.io_backend;
+    io_opts.queue_depth = g_config.io_queue_depth;
+    io_opts.sqpoll = g_config.io_sqpoll;
+    v->io_ctx = sol_io_ctx_new(&io_opts);
+    if (!v->io_ctx) {
+        return SOL_ERR_NOMEM;
+    }
+    if (g_config.io_backend == SOL_IO_BACKEND_URING &&
+        sol_io_ctx_backend(v->io_ctx) != SOL_IO_BACKEND_URING) {
+        if (g_io_backend_cli_overridden) {
+            sol_log_warn("io_uring requested but unavailable; falling back to POSIX IO");
+        } else {
+            sol_log_info("io_uring unavailable; falling back to POSIX IO");
+        }
+    }
+
     /* Generate or load identity */
     if (g_config.identity_path != NULL) {
         sol_log_info("Loading identity from %s", g_config.identity_path);
@@ -2681,6 +3470,8 @@ validator_init(validator_t* v) {
     if (blockstore_db_path) {
         bs_config.storage_type = SOL_BLOCKSTORE_STORAGE_ROCKSDB;
         bs_config.rocksdb_path = blockstore_db_path;
+        bs_config.rocksdb_cache_mb = validator_default_blockstore_rocksdb_cache_mb();
+        sol_log_info("Blockstore RocksDB cache: %lu MB", (unsigned long)bs_config.rocksdb_cache_mb);
     }
     v->blockstore = sol_blockstore_new(&bs_config);
     if (!v->blockstore) {
@@ -2690,6 +3481,53 @@ validator_init(validator_t* v) {
         }
         sol_log_error("Failed to create blockstore");
         return SOL_ERR_IO;
+    }
+
+    /* Initialize RPC / health endpoints early so local RPC is available during
+     * long snapshot download/extraction/ingestion. */
+    v->rpc = NULL;
+    v->health = NULL;
+    if (g_config.enable_rpc) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            sol_log_info("Initializing RPC server on %s:%u...", g_config.rpc_bind, g_config.rpc_port);
+
+            sol_rpc_config_t rpc_config = SOL_RPC_CONFIG_DEFAULT;
+            strncpy(rpc_config.bind_address, g_config.rpc_bind, sizeof(rpc_config.bind_address) - 1);
+            rpc_config.bind_address[sizeof(rpc_config.bind_address) - 1] = '\0';
+            rpc_config.port = g_config.rpc_port;
+            rpc_config.ws_port = (g_config.rpc_port < UINT16_MAX) ? (uint16_t)(g_config.rpc_port + 1) : 0;
+            rpc_config.enable_health_check = true;
+
+            v->rpc = sol_rpc_new(NULL, &rpc_config);
+            if (!v->rpc) {
+                sol_log_error("Failed to create RPC server");
+                return SOL_ERR_NOMEM;
+            }
+
+            sol_rpc_set_blockstore(v->rpc, v->blockstore);
+            sol_rpc_set_identity(v->rpc, &v->identity_pubkey);
+            sol_rpc_set_send_transaction(v->rpc, rpc_send_transaction, v);
+            sol_rpc_set_health_callback(v->rpc, health_callback, v);
+
+            errno = 0;
+            sol_err_t err = sol_rpc_start(v->rpc);
+            if (err == SOL_OK) {
+                g_rpc_port_is_bound = true;
+                break;
+            }
+
+            sol_rpc_destroy(v->rpc);
+            v->rpc = NULL;
+
+            if (err == SOL_ERR_IO && errno == EADDRINUSE && attempt + 1 < 2) {
+                sol_log_warn("RPC bind failed (address already in use); selecting new ports and retrying");
+                validator_autoselect_default_ports();
+                continue;
+            }
+
+            sol_log_error("Failed to start RPC: %s", sol_err_str(err));
+            return err;
+        }
     }
 
     /* Initialize accounts and root bank (from snapshot or empty genesis) */
@@ -2706,6 +3544,10 @@ validator_init(validator_t* v) {
         g_config.snapshot_manifest_url && g_config.snapshot_manifest_url[0] != '\0';
     bool have_snapshot_rpc_fallback =
         g_config.snapshot_rpc_urls && g_config.snapshot_rpc_urls_count > 0;
+    if (have_snapshot_rpc_fallback) {
+        sol_log_info("Snapshot RPC fallback enabled (%lu endpoints)",
+                     (unsigned long)g_config.snapshot_rpc_urls_count);
+    }
 
     /* Default: auto-download a full snapshot when no snapshot is provided. */
     if (!snapshot_path && (have_snapshot_manifest || have_snapshot_rpc_fallback)) {
@@ -2728,14 +3570,18 @@ validator_init(validator_t* v) {
             (void)mkdir_recursive(archive_dir);
         }
 
-        /* Prefer using a local snapshot archive on restarts (fast path). */
+        /* Prefer a local snapshot as a fallback.
+         *
+         * If local archives exist, defer refresh/download until after the
+         * AccountsDB fast-restart bootstrap-state check so restarts don't block
+         * on snapshot downloads. */
         sol_slot_t existing_slot = 0;
         sol_err_t found = find_latest_full_snapshot_archive(
             archive_dir, auto_snapshot_path, sizeof(auto_snapshot_path), &existing_slot);
 
-	        if (found == SOL_OK) {
-	            sol_log_info("Using existing snapshot archive (slot %lu): %s",
-	                         (unsigned long)existing_slot, auto_snapshot_path);
+        if (found == SOL_OK) {
+            sol_log_info("Found existing snapshot archive (slot %lu): %s",
+                         (unsigned long)existing_slot, auto_snapshot_path);
             snapshot_path = auto_snapshot_path;
 
             sol_slot_t existing_incr_slot = 0;
@@ -2743,35 +3589,39 @@ validator_init(validator_t* v) {
                     archive_dir, existing_slot,
                     auto_incremental_snapshot_path, sizeof(auto_incremental_snapshot_path),
                     &existing_incr_slot) == SOL_OK) {
-                sol_log_info("Using existing incremental snapshot archive (slot %lu): %s",
+                sol_log_info("Found existing incremental snapshot archive (slot %lu): %s",
                              (unsigned long)existing_incr_slot, auto_incremental_snapshot_path);
-	                incremental_snapshot_path = auto_incremental_snapshot_path;
-	            }
-	        } else {
-	            /* Fresh bootstrap: download a recent snapshot from the configured sources. */
-	            sol_err_t dl_err = auto_download_snapshot_archives_best_effort(
-	                have_snapshot_manifest ? g_config.snapshot_manifest_url : NULL,
-	                have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls : NULL,
-	                have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls_count : 0,
-	                archive_dir,
-	                auto_snapshot_path,
-	                sizeof(auto_snapshot_path),
-	                auto_incremental_snapshot_path,
-	                sizeof(auto_incremental_snapshot_path));
-	            if (dl_err == SOL_ERR_SHUTDOWN) {
-	                return dl_err;
-	            }
-	            if (dl_err != SOL_OK) {
-	                sol_log_error("Auto snapshot download failed (%s) and no local snapshot archives found",
-	                              sol_err_str(dl_err));
-	                return dl_err;
-	            }
+                incremental_snapshot_path = auto_incremental_snapshot_path;
+            }
+        }
 
-	            snapshot_path = auto_snapshot_path;
-	            if (auto_incremental_snapshot_path[0] != '\0') {
-	                incremental_snapshot_path = auto_incremental_snapshot_path;
-	            }
-	        }
+        /* No local snapshot archives: download now. */
+        if (!snapshot_path) {
+            sol_err_t dl_err = auto_download_snapshot_archives_best_effort(
+                have_snapshot_manifest ? g_config.snapshot_manifest_url : NULL,
+                have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls : NULL,
+                have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls_count : 0,
+                archive_dir,
+                auto_snapshot_refresh_path,
+                sizeof(auto_snapshot_refresh_path),
+                auto_incremental_snapshot_refresh_path,
+                sizeof(auto_incremental_snapshot_refresh_path),
+                v->io_ctx);
+            if (dl_err == SOL_ERR_SHUTDOWN) {
+                return dl_err;
+            }
+            if (dl_err == SOL_OK && auto_snapshot_refresh_path[0] != '\0') {
+                snapshot_path = auto_snapshot_refresh_path;
+                incremental_snapshot_path = NULL;
+                if (auto_incremental_snapshot_refresh_path[0] != '\0') {
+                    incremental_snapshot_path = auto_incremental_snapshot_refresh_path;
+                }
+            } else {
+                sol_log_error("Auto snapshot download failed (%s) and no local snapshot archives found",
+                              sol_err_str(dl_err));
+                return dl_err;
+            }
+        }
 	    }
 
     if (snapshot_path) {
@@ -2792,7 +3642,85 @@ validator_init(validator_t* v) {
                                           &rpc_best_slot);
             }
 
-            best_bootstrap_slot = (rpc_best_slot > manifest_best_slot) ? rpc_best_slot : manifest_best_slot;
+            bool prefer_rpc = (!have_snapshot_manifest && have_snapshot_rpc_fallback);
+            const char* prefer_rpc_env = getenv("SOL_SNAPSHOT_PREFER_RPC_IF_FRESHER");
+            bool prefer_rpc_if_fresher =
+                (prefer_rpc_env && prefer_rpc_env[0] != '\0' && strcmp(prefer_rpc_env, "0") != 0);
+
+            /* Default: keep bootstrap near the chain head by preferring RPC when
+             * the configured manifest is clearly stale.
+             *
+             * Override via SOL_SNAPSHOT_AUTO_PREFER_RPC_LAG_SLOTS (set to 0 to disable). */
+            sol_slot_t auto_prefer_rpc_lag = 5000;
+            const char* auto_prefer_rpc_env = getenv("SOL_SNAPSHOT_AUTO_PREFER_RPC_LAG_SLOTS");
+            if (auto_prefer_rpc_env && auto_prefer_rpc_env[0] != '\0') {
+                errno = 0;
+                char* end = NULL;
+                unsigned long long lag = strtoull(auto_prefer_rpc_env, &end, 10);
+                if (errno == 0 && end && end != auto_prefer_rpc_env) {
+                    while (*end && isspace((unsigned char)*end)) end++;
+                    if (*end == '\0') {
+                        auto_prefer_rpc_lag = (sol_slot_t)lag;
+                    }
+                }
+            }
+
+            if (have_snapshot_manifest && have_snapshot_rpc_fallback && rpc_best_slot != 0) {
+                if (prefer_rpc_if_fresher) {
+                    if (manifest_best_slot == 0 || rpc_best_slot > manifest_best_slot) {
+                        prefer_rpc = true;
+                    }
+                } else if (!prefer_rpc &&
+                           auto_prefer_rpc_lag != 0 &&
+                           manifest_best_slot != 0 &&
+                           rpc_best_slot > manifest_best_slot &&
+                           (rpc_best_slot - manifest_best_slot) > auto_prefer_rpc_lag) {
+                    prefer_rpc = true;
+                }
+            }
+
+            /* For bootstrap target selection, default to the manifest slot when
+             * available.  This keeps auto-snapshot-max-lag logic from forcing
+             * fresh snapshot loads when the configured snapshot service lags
+             * the RPC-reported best slot.
+             *
+             * Set SOL_SNAPSHOT_TARGET_USE_FRESHEST=1 to explicitly use the
+             * freshest known slot (typically RPC). */
+            const char* use_freshest_env = getenv("SOL_SNAPSHOT_TARGET_USE_FRESHEST");
+            const bool use_freshest_for_target =
+                (use_freshest_env && use_freshest_env[0] != '\0' && strcmp(use_freshest_env, "0") != 0);
+            if (use_freshest_for_target && rpc_best_slot != 0) {
+                if (manifest_best_slot == 0 || rpc_best_slot > manifest_best_slot) {
+                    prefer_rpc = true;
+                }
+            }
+
+            if (manifest_best_slot != 0 && rpc_best_slot != 0 &&
+                rpc_best_slot > manifest_best_slot) {
+                sol_slot_t lag = rpc_best_slot - manifest_best_slot;
+                if (prefer_rpc) {
+                    sol_log_warn("Snapshot manifest best slot %lu lags RPC best slot %lu by %lu slots; using RPC for bootstrap target",
+                                 (unsigned long)manifest_best_slot,
+                                 (unsigned long)rpc_best_slot,
+                                 (unsigned long)lag);
+                } else {
+                    sol_log_info("Snapshot manifest best slot %lu lags RPC best slot %lu by %lu slots; using manifest for bootstrap target (set SOL_SNAPSHOT_PREFER_RPC_IF_FRESHER=1 to force RPC)",
+                                 (unsigned long)manifest_best_slot,
+                                 (unsigned long)rpc_best_slot,
+                                 (unsigned long)lag);
+                }
+            } else if (manifest_best_slot != 0 && rpc_best_slot != 0 &&
+                       manifest_best_slot > rpc_best_slot) {
+                sol_log_info("Snapshot manifest best slot %lu is ahead of RPC best slot %lu; using manifest for bootstrap target",
+                             (unsigned long)manifest_best_slot,
+                             (unsigned long)rpc_best_slot);
+            }
+
+            if (prefer_rpc) {
+                best_bootstrap_slot = rpc_best_slot;
+            } else {
+                best_bootstrap_slot = manifest_best_slot ? manifest_best_slot : rpc_best_slot;
+            }
         }
 
         /* Fast restart: if the AccountsDB already contains a persisted bootstrap
@@ -2801,10 +3729,12 @@ validator_init(validator_t* v) {
             sol_accounts_db_config_t db_config = SOL_ACCOUNTS_DB_CONFIG_DEFAULT;
             db_config.storage_type = SOL_ACCOUNTS_STORAGE_APPENDVEC;
             db_config.rocksdb_path = accounts_db_path;
+            db_config.rocksdb_cache_mb = validator_default_accountsdb_rocksdb_cache_mb();
             db_config.appendvec_path = appendvec_path;
 
             sol_accounts_db_t* existing_db = sol_accounts_db_new(&db_config);
             if (existing_db) {
+                sol_accounts_db_set_io_ctx(existing_db, v->io_ctx);
                 sol_accounts_db_bootstrap_state_t bs = {0};
                 bool has_appendvec_files = appendvec_path ? dir_has_any_regular_file(appendvec_path) : false;
                 if (has_appendvec_files &&
@@ -2877,6 +3807,7 @@ validator_init(validator_t* v) {
 	                                sol_snapshot_config_t snapshot_cfg = SOL_SNAPSHOT_CONFIG_DEFAULT;
 	                                snapshot_cfg.verify_accounts_hash =
 	                                    g_config.snapshot_verify_accounts_hash;
+	                                snapshot_cfg.io_ctx = v->io_ctx;
 
 	                                sol_snapshot_mgr_t* snapshot_mgr = sol_snapshot_mgr_new(&snapshot_cfg);
 	                                if (snapshot_mgr) {
@@ -2941,75 +3872,117 @@ validator_init(validator_t* v) {
 	                            }
 	                        }
 
-	                        if (existing_db && !used_bootstrap_state && best_bootstrap_slot != 0) {
-	                            const sol_slot_t max_bootstrap_lag = g_config.snapshot_max_bootstrap_lag_slots;
-	                            if (max_bootstrap_lag != 0 &&
-	                                best_bootstrap_slot > bs.slot &&
-	                                (best_bootstrap_slot - bs.slot) > max_bootstrap_lag) {
-                                sol_log_warn("Persisted AccountsDB bootstrap state lags best snapshot slot by %lu "
-                                             "slots (bootstrap=%lu best=%lu); attempting incremental refresh",
-                                             (unsigned long)(best_bootstrap_slot - bs.slot),
-                                             (unsigned long)bs.slot,
-                                             (unsigned long)best_bootstrap_slot);
+		                        if (existing_db && !used_bootstrap_state && best_bootstrap_slot != 0) {
+		                            const sol_slot_t max_bootstrap_lag = g_config.snapshot_max_bootstrap_lag_slots;
+		                            if (max_bootstrap_lag != 0 &&
+		                                best_bootstrap_slot > bs.slot &&
+		                                (best_bootstrap_slot - bs.slot) > max_bootstrap_lag) {
+	                                sol_log_warn("Persisted AccountsDB bootstrap state lags best snapshot slot by %lu "
+	                                             "slots (bootstrap=%lu best=%lu); attempting incremental refresh",
+	                                             (unsigned long)(best_bootstrap_slot - bs.slot),
+	                                             (unsigned long)bs.slot,
+	                                             (unsigned long)best_bootstrap_slot);
 
-                                sol_bank_t* refreshed_bank = NULL;
-                                bool refreshed = false;
+	                                sol_bank_t* refreshed_bank = NULL;
+	                                bool refreshed = false;
 
-                                const char* ledger_dir = g_config.ledger_path ? g_config.ledger_path : ".";
-                                char archive_dir[PATH_MAX];
-                                int an = snprintf(archive_dir, sizeof(archive_dir), "%s/snapshot-archives", ledger_dir);
-                                if (an >= 0 && (size_t)an < sizeof(archive_dir)) {
-                                    if (!path_exists(archive_dir)) {
-                                        (void)mkdir_recursive(archive_dir);
-                                    }
+	                                const char* ledger_dir = g_config.ledger_path ? g_config.ledger_path : ".";
+	                                char archive_dir[PATH_MAX];
+	                                int an = snprintf(archive_dir, sizeof(archive_dir), "%s/snapshot-archives", ledger_dir);
+	                                if (an >= 0 && (size_t)an < sizeof(archive_dir)) {
+	                                    if (!path_exists(archive_dir)) {
+	                                        (void)mkdir_recursive(archive_dir);
+	                                    }
 
-	                                    char incr_path[PATH_MAX] = {0};
-	                                    sol_slot_t incr_slot = 0;
-	                                    if (find_best_incremental_snapshot_archive(archive_dir,
-	                                                                               full_slot,
-	                                                                               incr_path,
-	                                                                               sizeof(incr_path),
-	                                                                               &incr_slot) != SOL_OK ||
-	                                        incr_slot <= bs.slot) {
-	                                        incr_path[0] = '\0';
-	                                        incr_slot = 0;
-                                    }
+		                                    sol_slot_t refresh_base_slot = 0;
+		                                    if (bs.slot == full_slot) {
+		                                        refresh_base_slot = full_slot;
+		                                    } else if (bs.slot > full_slot) {
+		                                        sol_slot_t inferred_base = 0;
+		                                        char inferred_path[PATH_MAX] = {0};
+		                                        if (find_incremental_base_for_bootstrap_slot(archive_dir,
+		                                                                                     bs.slot,
+		                                                                                     &inferred_base,
+		                                                                                     inferred_path,
+		                                                                                     sizeof(inferred_path)) == SOL_OK &&
+		                                            inferred_base != 0) {
+		                                            refresh_base_slot = inferred_base;
+		                                            sol_log_info("Inferred bootstrap incremental base slot %lu for slot %lu from %s",
+		                                                         (unsigned long)refresh_base_slot,
+		                                                         (unsigned long)bs.slot,
+		                                                         inferred_path[0] ? inferred_path : "(unknown)");
+		                                        } else {
+		                                            sol_log_warn("Unable to infer incremental base slot for persisted bootstrap slot %lu; skipping incremental refresh",
+		                                                         (unsigned long)bs.slot);
+		                                        }
+		                                    } else {
+		                                        /* Persisted bootstrap state predates the selected full snapshot. */
+		                                        sol_log_warn("Persisted bootstrap slot %lu predates selected snapshot full slot %lu; skipping incremental refresh",
+		                                                     (unsigned long)bs.slot,
+		                                                     (unsigned long)full_slot);
+		                                    }
 
-                                    char dl_incr_path[PATH_MAX] = {0};
-                                    sol_slot_t dl_incr_slot = 0;
-                                    if ((incr_slot == 0 || incr_slot < best_bootstrap_slot) &&
-                                        (have_snapshot_manifest || have_snapshot_rpc_fallback)) {
-                                        sol_err_t dl_err =
-                                            auto_download_incremental_snapshot_for_base_best_effort(
-                                                have_snapshot_manifest ? g_config.snapshot_manifest_url : NULL,
-                                                have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls : NULL,
-	                                                have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls_count : 0,
-	                                                archive_dir,
-	                                                full_slot,
-	                                                dl_incr_path,
-	                                                sizeof(dl_incr_path),
-	                                                &dl_incr_slot);
-                                        if (dl_err == SOL_ERR_SHUTDOWN || g_shutdown) {
-                                            sol_accounts_db_destroy(existing_db);
-                                            return SOL_ERR_SHUTDOWN;
-                                        }
-                                        if (dl_err != SOL_OK) {
-                                            dl_incr_path[0] = '\0';
-                                            dl_incr_slot = 0;
-                                        }
-                                    }
+		                                    char incr_path[PATH_MAX] = {0};
+		                                    sol_slot_t incr_slot = 0;
+		                                    if (refresh_base_slot == 0 ||
+		                                        find_best_incremental_snapshot_archive(archive_dir,
+		                                                                               refresh_base_slot,
+		                                                                               incr_path,
+		                                                                               sizeof(incr_path),
+		                                                                               &incr_slot) != SOL_OK ||
+		                                        incr_slot <= bs.slot) {
+		                                        incr_path[0] = '\0';
+		                                        incr_slot = 0;
+		                                    }
 
-                                    const char* apply_incr_path = NULL;
-                                    if (dl_incr_path[0] != '\0' && dl_incr_slot > incr_slot) {
-                                        apply_incr_path = dl_incr_path;
-                                    } else if (incr_path[0] != '\0') {
-                                        apply_incr_path = incr_path;
-                                    }
+		                                    char dl_incr_path[PATH_MAX] = {0};
+		                                    sol_slot_t dl_incr_slot = 0;
+		                                    if (refresh_base_slot != 0 &&
+		                                        (incr_slot == 0 || incr_slot < best_bootstrap_slot) &&
+		                                        (have_snapshot_manifest || have_snapshot_rpc_fallback)) {
+		                                        sol_err_t dl_err =
+		                                            auto_download_incremental_snapshot_for_base_best_effort(
+		                                                have_snapshot_manifest ? g_config.snapshot_manifest_url : NULL,
+		                                                have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls : NULL,
+		                                                have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls_count : 0,
+		                                                archive_dir,
+		                                                refresh_base_slot,
+		                                                dl_incr_path,
+		                                                sizeof(dl_incr_path),
+		                                                &dl_incr_slot,
+		                                                v->io_ctx);
+		                                        if (dl_err == SOL_ERR_SHUTDOWN || g_shutdown) {
+		                                            sol_accounts_db_destroy(existing_db);
+		                                            return SOL_ERR_SHUTDOWN;
+		                                        }
+		                                        if (dl_err != SOL_OK) {
+		                                            dl_incr_path[0] = '\0';
+		                                            dl_incr_slot = 0;
+		                                        }
+		                                    }
 
-                                    if (apply_incr_path) {
-                                        sol_snapshot_config_t snapshot_cfg = SOL_SNAPSHOT_CONFIG_DEFAULT;
-                                        snapshot_cfg.verify_accounts_hash =
-                                            g_config.snapshot_verify_accounts_hash;
+		                                    /* Never apply an incremental snapshot that doesn't advance the persisted slot. */
+		                                    if (dl_incr_slot <= bs.slot) {
+		                                        dl_incr_path[0] = '\0';
+		                                        dl_incr_slot = 0;
+		                                    }
+
+		                                    const char* apply_incr_path = NULL;
+		                                    sol_slot_t apply_incr_slot = 0;
+		                                    if (dl_incr_path[0] != '\0' && dl_incr_slot > apply_incr_slot) {
+		                                        apply_incr_path = dl_incr_path;
+		                                        apply_incr_slot = dl_incr_slot;
+		                                    }
+		                                    if (incr_path[0] != '\0' && incr_slot > apply_incr_slot) {
+		                                        apply_incr_path = incr_path;
+		                                        apply_incr_slot = incr_slot;
+		                                    }
+
+		                                    if (apply_incr_path && refresh_base_slot != 0 && apply_incr_slot > bs.slot) {
+		                                        sol_snapshot_config_t snapshot_cfg = SOL_SNAPSHOT_CONFIG_DEFAULT;
+		                                        snapshot_cfg.verify_accounts_hash =
+		                                            g_config.snapshot_verify_accounts_hash;
+		                                        snapshot_cfg.io_ctx = v->io_ctx;
 
                                         sol_snapshot_mgr_t* snapshot_mgr = sol_snapshot_mgr_new(&snapshot_cfg);
                                         if (snapshot_mgr) {
@@ -3030,14 +4003,14 @@ validator_init(validator_t* v) {
                                                 }
                                             }
 
-	                                            sol_err_t rerr =
-	                                                sol_snapshot_apply_incremental_to_accounts_db(snapshot_mgr,
-	                                                                                              apply_incr_path,
-	                                                                                              full_slot,
-	                                                                                              existing_db,
-	                                                                                              &refreshed_bank);
-                                            sol_snapshot_mgr_destroy(snapshot_mgr);
-                                            snapshot_mgr = NULL;
+		                                            sol_err_t rerr =
+		                                                sol_snapshot_apply_incremental_to_accounts_db(snapshot_mgr,
+		                                                                                              apply_incr_path,
+		                                                                                              refresh_base_slot,
+		                                                                                              existing_db,
+		                                                                                              &refreshed_bank);
+		                                            sol_snapshot_mgr_destroy(snapshot_mgr);
+		                                            snapshot_mgr = NULL;
 
                                             if (rerr == SOL_OK && refreshed_bank) {
                                                 root_bank = refreshed_bank;
@@ -3061,16 +4034,30 @@ validator_init(validator_t* v) {
                                                              (unsigned long)bs.slot,
                                                              (unsigned long)sol_bank_slot(root_bank));
                                             } else {
-                                                sol_log_warn("Incremental refresh failed (%s); forcing fresh snapshot load",
+                                                if (rerr == SOL_ERR_SNAPSHOT_CORRUPT && apply_incr_path &&
+                                                    apply_incr_path[0] != '\0') {
+                                                    if (path_parent_is_symlink(apply_incr_path)) {
+                                                        sol_log_warn("Not removing corrupt incremental snapshot archive because parent dir is a symlink: %s",
+                                                                     apply_incr_path);
+                                                    } else {
+                                                        sol_log_warn("Removing corrupt incremental snapshot archive: %s",
+                                                                     apply_incr_path);
+                                                        (void)unlink(apply_incr_path);
+                                                    }
+                                                }
+                                                sol_log_warn("Incremental refresh failed (%s); skipping incremental refresh",
                                                              sol_err_str(rerr));
                                             }
                                         } else {
-                                            sol_log_warn("Failed to create snapshot manager; forcing fresh snapshot load");
+                                            sol_log_warn("Failed to create snapshot manager; skipping incremental refresh");
                                         }
                                     }
                                 }
 
                                 if (!refreshed) {
+                                    sol_log_warn("Incremental refresh unavailable; forcing fresh snapshot load (bootstrap=%lu best=%lu)",
+                                                 (unsigned long)bs.slot,
+                                                 (unsigned long)best_bootstrap_slot);
                                     sol_accounts_db_destroy(existing_db);
                                     existing_db = NULL;
                                 }
@@ -3091,16 +4078,37 @@ validator_init(validator_t* v) {
                             }
 
                             if (expected_slot != 0 && bs.slot != expected_slot) {
-                                sol_log_warn("AccountsDB bootstrap slot %lu does not match snapshot archive slot %lu; "
-                                             "skipping snapshot load and using existing state",
-                                             (unsigned long)bs.slot,
-                                             (unsigned long)expected_slot);
+                                /* If the persisted bootstrap state is BEHIND the selected
+                                 * snapshot archive, it may be incompatible (stale/partial) and
+                                 * we should fall back to snapshot extraction.
+                                 *
+                                 * If it is AHEAD, accept it: the node has already applied a
+                                 * newer incremental snapshot on a prior run.  Forcing a reload
+                                 * would unnecessarily purge a large AppendVec directory. */
+                                if (bs.slot < expected_slot) {
+                                    sol_log_warn("AccountsDB bootstrap slot %lu lags snapshot archive slot %lu; "
+                                                 "forcing fresh snapshot load",
+                                                 (unsigned long)bs.slot,
+                                                 (unsigned long)expected_slot);
+                                    sol_accounts_db_destroy(existing_db);
+                                    existing_db = NULL;
+                                } else {
+                                    sol_log_warn("AccountsDB bootstrap slot %lu is ahead of snapshot archive slot %lu; "
+                                                 "using persisted state",
+                                                 (unsigned long)bs.slot,
+                                                 (unsigned long)expected_slot);
+                                }
+                            }
+
+                            if (!existing_db) {
+                                /* Fall back to snapshot extraction below. */
                             } else {
                                 sol_log_info("Using persisted AccountsDB bootstrap state at slot %lu (skipping snapshot load)",
                                              (unsigned long)bs.slot);
                             }
 
-                            sol_bank_config_t bank_config = SOL_BANK_CONFIG_DEFAULT;
+                            if (existing_db) {
+                                sol_bank_config_t bank_config = SOL_BANK_CONFIG_DEFAULT;
                             if (bs.ticks_per_slot) bank_config.ticks_per_slot = bs.ticks_per_slot;
                             if (bs.hashes_per_tick) bank_config.hashes_per_tick = bs.hashes_per_tick;
                             if (bs.slots_per_epoch) bank_config.slots_per_epoch = bs.slots_per_epoch;
@@ -3224,6 +4232,13 @@ validator_init(validator_t* v) {
 
                             v->accounts_db = existing_db;
                             used_bootstrap_state = true;
+
+                            sol_err_t idx_err = sol_accounts_db_maybe_build_appendvec_index(existing_db);
+                            if (idx_err != SOL_OK) {
+                                sol_log_warn("AccountsDB: AppendVec in-memory index build failed; continuing without it: %s",
+                                             sol_err_str(idx_err));
+                            }
+                            }
                         }
                     }
                 } else {
@@ -3268,7 +4283,8 @@ validator_init(validator_t* v) {
                         auto_snapshot_refresh_path,
                         sizeof(auto_snapshot_refresh_path),
                         auto_incremental_snapshot_refresh_path,
-                        sizeof(auto_incremental_snapshot_refresh_path));
+                        sizeof(auto_incremental_snapshot_refresh_path),
+                        v->io_ctx);
                     if (dl_err == SOL_ERR_SHUTDOWN || g_shutdown) {
                         return SOL_ERR_SHUTDOWN;
                     }
@@ -3320,6 +4336,7 @@ validator_init(validator_t* v) {
 
                 sol_snapshot_config_t snapshot_cfg = SOL_SNAPSHOT_CONFIG_DEFAULT;
                 snapshot_cfg.verify_accounts_hash = g_config.snapshot_verify_accounts_hash;
+                snapshot_cfg.io_ctx = v->io_ctx;
 
                 sol_snapshot_mgr_t* snapshot_mgr = sol_snapshot_mgr_new(&snapshot_cfg);
                 if (!snapshot_mgr) {
@@ -3347,6 +4364,7 @@ validator_init(validator_t* v) {
                 if (accounts_db_path) {
                     snapshot_db_config.storage_type = SOL_ACCOUNTS_STORAGE_APPENDVEC;
                     snapshot_db_config.rocksdb_path = accounts_db_path;
+                    snapshot_db_config.rocksdb_cache_mb = validator_default_accountsdb_rocksdb_cache_mb();
                     snapshot_db_config.appendvec_path = appendvec_path;
                 }
 
@@ -3430,7 +4448,8 @@ validator_init(validator_t* v) {
                     auto_snapshot_path,
                     sizeof(auto_snapshot_path),
                     auto_incremental_snapshot_path,
-                    sizeof(auto_incremental_snapshot_path));
+                    sizeof(auto_incremental_snapshot_path),
+                    v->io_ctx);
                 if (dl_err == SOL_ERR_SHUTDOWN || g_shutdown) {
                     return SOL_ERR_SHUTDOWN;
                 }
@@ -3452,6 +4471,81 @@ validator_init(validator_t* v) {
             return err;
         }
 
+        /* Opportunistic: apply a follow-up incremental snapshot on top of the
+         * loaded bank when possible (usually via RPC). This helps when the
+         * snapshot service is stale but an incremental-on-top exists. */
+        if (auto_snapshot_bootstrap && (have_snapshot_manifest || have_snapshot_rpc_fallback)) {
+            const char* ledger_dir = g_config.ledger_path ? g_config.ledger_path : ".";
+            char archive_dir[PATH_MAX];
+            int n = snprintf(archive_dir, sizeof(archive_dir), "%s/snapshot-archives", ledger_dir);
+            if (n > 0 && (size_t)n < sizeof(archive_dir)) {
+                if (!path_exists(archive_dir)) {
+                    (void)mkdir_recursive(archive_dir);
+                }
+
+                /* Incremental snapshots are taken relative to a full snapshot base slot.
+                 * After loading full(+incr), try to fetch and apply a newer incremental
+                 * for the same full base slot (when available). */
+                sol_slot_t follow_base_slot = 0;
+                if (incremental_snapshot_path && incremental_snapshot_path[0] != '\0') {
+                    sol_snapshot_info_t ii = {0};
+                    if (sol_snapshot_get_info(incremental_snapshot_path, &ii) == SOL_OK &&
+                        ii.base_slot != 0) {
+                        follow_base_slot = ii.base_slot;
+                    }
+                }
+                if (follow_base_slot == 0 && snapshot_path) {
+                    sol_snapshot_info_t fi = {0};
+                    if (sol_snapshot_get_info(snapshot_path, &fi) == SOL_OK && fi.slot != 0) {
+                        follow_base_slot = fi.slot;
+                    }
+                }
+
+                if (follow_base_slot != 0) {
+                    sol_err_t ferr = validator_maybe_apply_followup_incremental_snapshot(
+                        v,
+                        &root_bank,
+                        follow_base_slot,
+                        have_snapshot_manifest ? g_config.snapshot_manifest_url : NULL,
+                        have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls : NULL,
+                        have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls_count : 0,
+                        archive_dir);
+                    if (ferr == SOL_ERR_SHUTDOWN || g_shutdown) {
+                        return SOL_ERR_SHUTDOWN;
+                    }
+                }
+
+                /* Hop onto a newer base slot when possible. It is common for
+                 * snapshot services to publish an incremental that lands on a
+                 * slot which is itself a full snapshot base on RPC. Applying
+                 * a base-matching incremental for that slot avoids replaying
+                 * tens of minutes of history without downloading another full
+                 * snapshot archive. */
+                enum { SOL_FOLLOWUP_INCREMENTAL_HOPS_MAX = 2 };
+                for (int hop = 0; hop < SOL_FOLLOWUP_INCREMENTAL_HOPS_MAX; hop++) {
+                    sol_slot_t base = root_bank ? sol_bank_slot(root_bank) : 0;
+                    if (base == 0) {
+                        break;
+                    }
+                    sol_err_t herr = validator_maybe_apply_followup_incremental_snapshot(
+                        v,
+                        &root_bank,
+                        base,
+                        have_snapshot_manifest ? g_config.snapshot_manifest_url : NULL,
+                        have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls : NULL,
+                        have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls_count : 0,
+                        archive_dir);
+                    if (herr == SOL_ERR_SHUTDOWN || g_shutdown) {
+                        return SOL_ERR_SHUTDOWN;
+                    }
+                    sol_slot_t after = root_bank ? sol_bank_slot(root_bank) : 0;
+                    if (after <= base) {
+                        break;
+                    }
+                }
+            }
+        }
+
         v->current_slot = sol_bank_slot(root_bank);
         v->highest_slot = v->current_slot;
         v->is_syncing = false;
@@ -3468,6 +4562,7 @@ validator_init(validator_t* v) {
         if (accounts_db_path) {
             db_config.storage_type = SOL_ACCOUNTS_STORAGE_APPENDVEC;
             db_config.rocksdb_path = accounts_db_path;
+            db_config.rocksdb_cache_mb = validator_default_accountsdb_rocksdb_cache_mb();
             db_config.appendvec_path = appendvec_path;
         }
 
@@ -3476,6 +4571,7 @@ validator_init(validator_t* v) {
             sol_log_error("Failed to create accounts database");
             return SOL_ERR_NOMEM;
         }
+        sol_accounts_db_set_io_ctx(v->accounts_db, v->io_ctx);
 
         /* Initialize root bank */
         sol_log_info("Initializing root bank...");
@@ -3491,6 +4587,15 @@ validator_init(validator_t* v) {
         v->snapshot_start_hash = (sol_hash_t){0};
         v->snapshot_verified = true;
         v->last_snapshot_verify_ns = 0;
+    }
+
+    /* Ensure builtin program accounts are present and update bank LtHash if needed. */
+    {
+        sol_err_t fixerr = validator_fixup_builtin_accounts(v, root_bank);
+        if (fixerr != SOL_OK) {
+            sol_log_error("Builtin program fixup failed: %s", sol_err_str(fixerr));
+            return fixerr;
+        }
     }
 
     /* Ensure a minimal owner index is available for replay/consensus.
@@ -3528,6 +4633,22 @@ validator_init(validator_t* v) {
         }
     }
 
+    /* Performance: during bootstrap/catchup, prioritize throughput over
+     * durability for the AccountsDB RocksDB index. This can materially reduce
+     * replay latency on disk-heavy workloads.
+     *
+     * NOTE: Disabling WAL means recent index updates may be lost on crash; the
+     * node can recover by reloading a snapshot. */
+    if (v->accounts_db) {
+        bool wal_disabled = (sol_accounts_db_set_disable_wal(v->accounts_db, true) == SOL_OK);
+        bool bulk_enabled = (sol_accounts_db_set_bulk_load_mode(v->accounts_db, true) == SOL_OK);
+        if (wal_disabled || bulk_enabled) {
+            sol_log_info("AccountsDB index mode: wal=%s bulk=%s",
+                         wal_disabled ? "disabled" : "default",
+                         bulk_enabled ? "enabled" : "default");
+        }
+    }
+
     /* Auto-discover gossip shred version and genesis hash when not configured. */
     maybe_autodiscover_shred_version_and_genesis_hash(root_bank);
 
@@ -3538,6 +4659,9 @@ validator_init(validator_t* v) {
         sol_log_error("Failed to create bank forks");
         sol_bank_destroy(root_bank);
         return SOL_ERR_NOMEM;
+    }
+    if (v->rpc) {
+        sol_rpc_set_bank_forks(v->rpc, v->bank_forks);
     }
 
     /* Initialize replay stage */
@@ -3591,6 +4715,9 @@ validator_init(validator_t* v) {
         validator_autoselect_default_ports();
     }
     sol_gossip_set_value_callback(v->gossip, gossip_value_callback, v);
+    if (v->rpc) {
+        sol_rpc_set_gossip(v->rpc, v->gossip);
+    }
 
     /* Add entrypoints. */
     for (size_t ei = 0; ei < g_config.entrypoints_count; ei++) {
@@ -3633,6 +4760,11 @@ validator_init(validator_t* v) {
     /* Initialize turbine */
     sol_log_info("Initializing turbine...");
     sol_turbine_config_t turbine_config = SOL_TURBINE_CONFIG_DEFAULT;
+    /* When running in a non-voting / bootstrap mode, prioritize ingesting and
+     * verifying the full shred feed over best-effort retransmit. */
+    if (g_config.no_voting) {
+        turbine_config.enable_retransmit = false;
+    }
     v->turbine = sol_turbine_new(&turbine_config, v->gossip, &v->identity_pubkey);
     if (!v->turbine) {
         sol_log_error("Failed to create turbine");
@@ -3642,6 +4774,17 @@ validator_init(validator_t* v) {
     /* Initialize repair */
     sol_log_info("Initializing repair service...");
     sol_repair_config_t repair_config = SOL_REPAIR_CONFIG_DEFAULT;
+    /* Catchup is tail-latency sensitive. A tighter timeout improves retry
+     * responsiveness; the repair thread also uses fanout to hedge. */
+    repair_config.request_timeout_ms = 100;
+    /* Large machines can sustain a much larger in-flight repair set, which is
+     * critical when we are missing the Turbine stream (e.g. zero-stake bootstrap)
+     * and must pull shreds over repair. */
+    repair_config.max_pending_requests = 32768;
+    sol_log_info("Repair config: request_timeout_ms=%u max_pending_requests=%u max_retries=%u",
+                 (unsigned)repair_config.request_timeout_ms,
+                 (unsigned)repair_config.max_pending_requests,
+                 (unsigned)repair_config.max_retries);
     v->repair = sol_repair_new(&repair_config, v->gossip, &v->identity);
     if (!v->repair) {
         sol_log_error("Failed to create repair service");
@@ -3697,6 +4840,11 @@ validator_init(validator_t* v) {
     sol_log_info("Initializing TVU on port %u...", g_config.tvu_port);
     sol_tvu_config_t tvu_config = SOL_TVU_CONFIG_DEFAULT;
     tvu_config.base_port = g_config.tvu_port;
+    tvu_config.skip_shred_verify = g_config.fast_replay;
+    /* Replay is sequential at the bank-forks level; running many concurrent
+     * replay threads just adds contention with the tx-exec pool and increases
+     * per-slot latency. */
+    tvu_config.replay_threads = 1;
     v->tvu = sol_tvu_new(v->blockstore, v->replay, v->turbine, v->repair, &tvu_config);
     if (!v->tvu) {
         sol_log_error("Failed to create TVU");
@@ -3726,11 +4874,18 @@ validator_init(validator_t* v) {
             sol_tvu_set_leader_schedule(v->tvu, v->leader_schedule);
             (void)sol_turbine_swap_leader_schedule(v->turbine, v->leader_schedule);
             (void)sol_replay_swap_leader_schedule(v->replay, v->leader_schedule);
+            if (v->repair) {
+                (void)sol_repair_swap_leader_schedule(v->repair, v->leader_schedule);
+            }
             sol_log_info("Leader schedule initialized for epoch %lu",
                          (unsigned long)sol_leader_schedule_epoch(v->leader_schedule));
         } else {
             sol_log_warn("Leader schedule unavailable - shred signature verification disabled");
         }
+    }
+
+    if (v->rpc && v->leader_schedule) {
+        sol_rpc_set_leader_schedule(v->rpc, v->leader_schedule);
     }
 
     /* Initialize Prometheus metrics */
@@ -3765,25 +4920,18 @@ validator_init(validator_t* v) {
     }
 
     /* Initialize RPC / health endpoints */
-    v->rpc = NULL;
     if (g_config.enable_rpc) {
-        sol_log_info("Initializing RPC server on %s:%u...", g_config.rpc_bind, g_config.rpc_port);
-
-        sol_rpc_config_t rpc_config = SOL_RPC_CONFIG_DEFAULT;
-        strncpy(rpc_config.bind_address, g_config.rpc_bind, sizeof(rpc_config.bind_address) - 1);
-        rpc_config.bind_address[sizeof(rpc_config.bind_address) - 1] = '\0';
-        rpc_config.port = g_config.rpc_port;
-        rpc_config.ws_port = (g_config.rpc_port < UINT16_MAX) ? (uint16_t)(g_config.rpc_port + 1) : 0;
-        rpc_config.enable_health_check = true;
-
-        v->rpc = sol_rpc_new(v->bank_forks, &rpc_config);
         if (!v->rpc) {
-            sol_log_error("Failed to create RPC server");
-            return SOL_ERR_NOMEM;
+            sol_log_error("RPC enabled but server is not initialized");
+            return SOL_ERR_UNINITIALIZED;
         }
+        sol_rpc_set_bank_forks(v->rpc, v->bank_forks);
         sol_rpc_set_blockstore(v->rpc, v->blockstore);
         sol_rpc_set_gossip(v->rpc, v->gossip);
         sol_rpc_set_identity(v->rpc, &v->identity_pubkey);
+        if (v->leader_schedule) {
+            sol_rpc_set_leader_schedule(v->rpc, v->leader_schedule);
+        }
         sol_rpc_set_send_transaction(v->rpc, rpc_send_transaction, v);
         sol_rpc_set_health_callback(v->rpc, health_callback, v);
     } else {
@@ -3822,6 +4970,7 @@ validator_start(validator_t* v) {
 
     /* Start turbine */
     sol_log_info("Starting turbine...");
+    sol_turbine_set_shred_batch_callback(v->turbine, turbine_shred_batch_callback, v->tvu);
     sol_turbine_set_shred_callback(v->turbine, turbine_shred_callback, v->tvu);
     err = sol_turbine_start(v->turbine, g_config.tvu_port);
     if (err != SOL_OK) {
@@ -3837,6 +4986,14 @@ validator_start(validator_t* v) {
     if (err != SOL_OK) {
         sol_log_error("Failed to start repair: %s", sol_err_str(err));
         return err;
+    }
+    if (!v->repair_pump_started) {
+        int rc = pthread_create(&v->repair_pump_thread, NULL, repair_pump_thread_main, v);
+        if (rc != 0) {
+            sol_log_error("Failed to start repair pump thread: %s", strerror(rc));
+            return SOL_ERR_IO;
+        }
+        v->repair_pump_started = true;
     }
 
     /* Start TVU */
@@ -3889,13 +5046,14 @@ validator_start(validator_t* v) {
     }
 
     /* Start RPC server */
-    if (v->rpc) {
+    if (v->rpc && !sol_rpc_is_running(v->rpc)) {
         sol_log_info("Starting RPC server...");
         err = sol_rpc_start(v->rpc);
         if (err != SOL_OK) {
             sol_log_error("Failed to start RPC: %s", sol_err_str(err));
             return err;
         }
+        g_rpc_port_is_bound = true;
     }
 
     /* Start health server */
@@ -3908,6 +5066,9 @@ validator_start(validator_t* v) {
         }
     }
 
+    /* Keep leader schedule refreshed without stalling the packet pump. */
+    validator_leader_schedule_refresh_start(v);
+
     sol_log_info("All validator services started");
     return SOL_OK;
 }
@@ -3918,6 +5079,9 @@ validator_start(validator_t* v) {
 static void
 validator_stop(validator_t* v) {
     sol_log_info("Stopping validator services...");
+
+    /* Stop background refresh workers before tearing down dependencies. */
+    validator_leader_schedule_refresh_stop(v);
 
     /* Stop RPC server */
     if (v->rpc) {
@@ -3963,6 +5127,10 @@ validator_stop(validator_t* v) {
     if (v->repair) {
         sol_repair_stop(v->repair);
     }
+    if (v->repair_pump_started) {
+        (void)pthread_join(v->repair_pump_thread, NULL);
+        v->repair_pump_started = false;
+    }
 
     /* Stop gossip */
     if (v->gossip) {
@@ -3982,6 +5150,10 @@ validator_cleanup(validator_t* v) {
     /* Clear global pointer */
     g_validator = NULL;
 
+    validator_leader_schedule_refresh_stop(v);
+    pthread_cond_destroy(&v->leader_schedule_refresh.cond);
+    pthread_mutex_destroy(&v->leader_schedule_refresh.lock);
+
     if (v->rpc) sol_rpc_destroy(v->rpc);
     if (v->health) sol_health_server_destroy(v->health);
     if (v->prometheus) sol_prometheus_destroy(v->prometheus);
@@ -4000,6 +5172,7 @@ validator_cleanup(validator_t* v) {
     if (v->bank_forks) sol_bank_forks_destroy(v->bank_forks);
     if (v->accounts_db) sol_accounts_db_destroy(v->accounts_db);
     if (v->blockstore) sol_blockstore_destroy(v->blockstore);
+    if (v->io_ctx) sol_io_ctx_destroy(v->io_ctx);
 
     sol_log_info("Cleanup complete");
 }
@@ -4122,6 +5295,29 @@ validator_refresh_epoch_caches(validator_t* v, sol_bank_t* bank) {
 
             sol_log_info("Vote stake cache updated for epoch %lu (total=%lu)",
                          (unsigned long)epoch, (unsigned long)total_stake);
+
+            /* Seed bank sysvar refresh cache so the first replayed slot does
+             * not spend seconds rebuilding the same map in Clock median
+             * timestamp computation. */
+            sol_err_t seed_err =
+                sol_bank_seed_vote_stakes_cache(sol_bank_get_accounts_db(bank),
+                                                epoch,
+                                                v->vote_stakes,
+                                                v->vote_stakes_total);
+            if (seed_err != SOL_OK) {
+                sol_log_warn("Failed to seed bank vote-stakes cache for epoch %lu: %s",
+                             (unsigned long)epoch,
+                             sol_err_str(seed_err));
+            }
+
+            sol_err_t ts_seed_err =
+                sol_bank_seed_vote_timestamp_cache(sol_bank_get_accounts_db(bank),
+                                                   v->vote_stakes);
+            if (ts_seed_err != SOL_OK) {
+                sol_log_warn("Failed to seed bank vote-timestamp cache for epoch %lu: %s",
+                             (unsigned long)epoch,
+                             sol_err_str(ts_seed_err));
+            }
         }
 
         if (v->turbine) {
@@ -4167,6 +5363,7 @@ validator_refresh_epoch_caches(validator_t* v, sol_bank_t* bank) {
         sol_leader_schedule_t* old_tvu = NULL;
         sol_leader_schedule_t* old_turbine = NULL;
         sol_leader_schedule_t* old_replay = NULL;
+        sol_leader_schedule_t* old_repair = NULL;
         if (v->tvu) {
             old_tvu = sol_tvu_swap_leader_schedule(v->tvu, new_schedule);
         }
@@ -4176,10 +5373,13 @@ validator_refresh_epoch_caches(validator_t* v, sol_bank_t* bank) {
         if (v->replay) {
             old_replay = sol_replay_swap_leader_schedule(v->replay, new_schedule);
         }
+        if (v->repair) {
+            old_repair = (sol_leader_schedule_t*)sol_repair_swap_leader_schedule(v->repair, new_schedule);
+        }
         v->leader_schedule = new_schedule;
 
-        sol_leader_schedule_t* to_free[4] = { old_tvu, old_turbine, old_replay, prev };
-        for (size_t i = 0; i < 4; i++) {
+        sol_leader_schedule_t* to_free[5] = { old_tvu, old_turbine, old_replay, old_repair, prev };
+        for (size_t i = 0; i < 5; i++) {
             sol_leader_schedule_t* s = to_free[i];
             if (!s || s == new_schedule) continue;
             bool seen = false;
@@ -4403,23 +5603,28 @@ validator_run(validator_t* v) {
 
     while (!g_shutdown) {
         uint64_t now_ns = monotonic_time_ns();
+        bool did_work = false;
 
         /* Pump gossip + repair sockets (both are non-blocking). */
         if (v->gossip) {
-            (void)sol_gossip_run_once(v->gossip, 0);
+            sol_err_t err = sol_gossip_run_once(v->gossip, 0);
+            if (err == SOL_OK) did_work = true;
         }
-        if (v->repair) {
-            (void)sol_repair_run_once(v->repair, 0);
+        if (v->repair && !v->repair_pump_started) {
+            sol_err_t err = sol_repair_run_once(v->repair, 0);
+            if (err == SOL_OK) did_work = true;
         }
 
         /* Pump turbine/shred ingress */
         if (v->turbine) {
-            sol_turbine_run_once(v->turbine, 0);
+            sol_err_t err = sol_turbine_run_once(v->turbine, 0);
+            if (err == SOL_OK) did_work = true;
         }
 
         /* Check for new slots */
         sol_slot_t new_slot = sol_replay_best_slot(v->replay);
         if (new_slot != v->current_slot) {
+            did_work = true;
             v->current_slot = new_slot;
             if (new_slot > v->highest_slot) {
                 v->highest_slot = new_slot;
@@ -4442,6 +5647,76 @@ validator_run(validator_t* v) {
         /* Keep leader schedule populated for upcoming catchup slots. */
         validator_maybe_refresh_rpc_leader_schedule(v);
         validator_maybe_update_tpu_forwarding(v, now_ns);
+
+        /* Non-voting or fast-replay mode: advance root based on replay progress
+         * so bank_forks doesn't grow without bound. */
+        /* If we aren't actually voting (either via --no-voting or because no
+         * vote account is configured), fork-choice roots may not advance and
+         * AccountsDB fork chains can grow without bound, which tanks replay
+         * throughput. Keep the root moving in that case. */
+        if ((g_config.no_voting || g_config.fast_replay || !v->vote_account_initialized) &&
+            v->replay && v->bank_forks) {
+            static uint64_t last_auto_root_ns = 0;
+            const uint64_t auto_root_period_ns = 2ULL * 1000ULL * 1000ULL * 1000ULL; /* 2s */
+            static sol_slot_t auto_root_window = 0;
+            static bool auto_root_window_logged = false;
+
+            if (auto_root_window == 0) {
+                /* Smaller window keeps AccountsDB fork chains shallow, which
+                 * materially improves replay throughput in --no-voting mode. */
+                sol_slot_t window = 64;
+
+                const char* env = getenv("SOL_AUTO_ROOT_WINDOW");
+                if (env && env[0] != '\0') {
+                    errno = 0;
+                    char* end = NULL;
+                    unsigned long long v = strtoull(env, &end, 10);
+                    if (errno == 0 && end && end != env) {
+                        while (*end && isspace((unsigned char)*end)) end++;
+                        if (*end == '\0') {
+                            window = (sol_slot_t)v;
+                        }
+                    }
+                }
+
+                if (window < 16) window = 16;
+                if (window > 4096) window = 4096;
+
+                auto_root_window = window;
+            }
+
+            if (last_auto_root_ns == 0 || (now_ns - last_auto_root_ns) >= auto_root_period_ns) {
+                last_auto_root_ns = now_ns;
+
+                sol_slot_t highest_replayed = sol_replay_highest_replayed_slot(v->replay);
+                sol_slot_t current_root = sol_replay_root_slot(v->replay);
+
+                if (!auto_root_window_logged) {
+                    auto_root_window_logged = true;
+                    sol_log_info("Auto root window: %lu slots%s",
+                                 (unsigned long)auto_root_window,
+                                 getenv("SOL_AUTO_ROOT_WINDOW") ? " (env SOL_AUTO_ROOT_WINDOW)" : "");
+                }
+
+                if (highest_replayed > current_root + auto_root_window) {
+                    sol_slot_t target_root = highest_replayed - auto_root_window;
+                    sol_err_t err = sol_replay_set_root(v->replay, target_root);
+                    if (err == SOL_OK) {
+                        sol_log_info("Auto root advanced to slot %lu (highest_replayed=%lu)",
+                                     (unsigned long)target_root,
+                                     (unsigned long)highest_replayed);
+                        if (v->blockstore) {
+                            (void)sol_blockstore_set_rooted(v->blockstore, target_root);
+                            (void)sol_blockstore_purge_slots_below(v->blockstore, target_root);
+                        }
+                    } else if (err != SOL_ERR_NOTFOUND) {
+                        sol_log_warn("Auto root advance failed for slot %lu: %s",
+                                     (unsigned long)target_root,
+                                     sol_err_str(err));
+                    }
+                }
+            }
+        }
 
         /* Advance root (best-effort) based on fork-choice supermajority.
          * Uses (slot, bank_hash) to remain safe under duplicate slots. */
@@ -4628,6 +5903,10 @@ validator_run(validator_t* v) {
 
             sol_tpu_stats_t tpu_stats = sol_tpu_stats(v->tpu);
             sol_tvu_stats_t tvu_stats = sol_tvu_stats(v->tvu);
+            sol_turbine_stats_t turbine_stats = {0};
+            if (v->turbine) {
+                sol_turbine_stats(v->turbine, &turbine_stats);
+            }
             sol_repair_stats_t repair_stats = {0};
             size_t repair_pending = 0;
             if (v->repair) {
@@ -4635,21 +5914,62 @@ validator_run(validator_t* v) {
                 repair_pending = sol_repair_pending_count(v->repair);
             }
 
-            sol_slot_t highest_replayed = v->replay ? sol_replay_highest_replayed_slot(v->replay) : 0;
-            sol_slot_t catchup_next = highest_replayed ? (highest_replayed + 1) : 0;
-            bool catchup_have_meta = false;
-            uint32_t catchup_rx = 0;
-            uint32_t catchup_last = 0;
-            const char* catchup_full = "-";
-            if (catchup_next && v->blockstore) {
-                sol_slot_meta_t meta;
-                if (sol_blockstore_get_slot_meta(v->blockstore, catchup_next, &meta) == SOL_OK) {
-                    catchup_have_meta = true;
-                    catchup_rx = meta.received_data;
-                    catchup_last = meta.last_shred_index;
-                    catchup_full = meta.is_full ? "yes" : "no";
-                }
-            }
+	            sol_slot_t highest_replayed = v->replay ? sol_replay_highest_replayed_slot(v->replay) : 0;
+	            sol_slot_t catchup_next = highest_replayed ? (highest_replayed + 1) : 0;
+	            bool catchup_have_meta = false;
+	            uint32_t catchup_rx = 0;
+	            uint32_t catchup_last = 0;
+	            const char* catchup_full = "-";
+	            uint32_t catchup_missing = 0;
+	            uint32_t catchup_missing_first = 0;
+	            uint32_t catchup_missing_last = 0;
+
+	            size_t catchup_repair_pending_total = 0;
+	            size_t catchup_repair_pending_shreds = 0;
+	            uint32_t catchup_repair_max_retries = 0;
+
+	            if (catchup_next && v->blockstore) {
+	                sol_slot_meta_t meta;
+	                if (sol_blockstore_get_slot_meta(v->blockstore, catchup_next, &meta) == SOL_OK) {
+	                    catchup_have_meta = true;
+	                    catchup_rx = meta.received_data;
+	                    catchup_last = meta.last_shred_index;
+	                    catchup_full = meta.is_full ? "yes" : "no";
+
+	                    uint32_t expected = 0;
+	                    if (meta.is_full && meta.num_data_shreds > 0) {
+	                        expected = meta.num_data_shreds;
+	                    } else if (meta.last_shred_index > 0) {
+	                        expected = meta.last_shred_index + 1;
+	                    }
+	                    if (expected > catchup_rx) {
+	                        catchup_missing = expected - catchup_rx;
+	                    }
+
+	                    /* Debugging aid: enumerate missing indices for catchup-next. */
+	                    if (catchup_missing > 0) {
+	                        uint32_t missing_idx[4096];
+	                        size_t missing_len = sol_blockstore_get_missing_shreds(
+	                            v->blockstore,
+	                            catchup_next,
+	                            missing_idx,
+	                            sizeof(missing_idx) / sizeof(missing_idx[0]));
+	                        if (missing_len > 0) {
+	                            catchup_missing_first = missing_idx[0];
+	                            catchup_missing_last = missing_idx[missing_len - 1];
+	                        }
+	                    }
+	                }
+	            }
+
+	            if (catchup_next && v->repair) {
+	                sol_repair_pending_slot_stats_t pst;
+	                if (sol_repair_pending_slot_stats(v->repair, catchup_next, &pst)) {
+	                    catchup_repair_pending_total = pst.total;
+	                    catchup_repair_pending_shreds = pst.shreds;
+	                    catchup_repair_max_retries = pst.max_retries;
+	                }
+	            }
 
             /* Update is_syncing based on slot lag */
             v->is_syncing = (v->highest_slot > v->current_slot + 10);
@@ -4678,26 +5998,37 @@ validator_run(validator_t* v) {
             sol_slot_t highest = v->highest_slot;
             sol_slot_t behind = (highest > v->current_slot) ? (highest - v->current_slot) : 0;
 
-            sol_log_info("Stats: slot=%lu (highest=%lu behind=%lu peers=%zu sync=%s), Catchup(next=%lu meta=%s rx=%u last=%u full=%s), TPU(rx=%lu,verify=%lu), TVU(rx=%lu,ok=%lu,bad=%lu,dup=%lu,complete=%lu,replayed=%lu,failed=%lu), Repair(sent=%lu,pending=%zu,recv=%lu,repaired=%lu,timeouts=%lu,dups=%lu,invalid=%lu), votes=%lu",
-                (unsigned long)v->current_slot,
-                (unsigned long)highest,
-                (unsigned long)behind,
-                peers,
+	            sol_log_info("Stats: slot=%lu (highest=%lu behind=%lu peers=%zu sync=%s), Catchup(next=%lu meta=%s rx=%u last=%u full=%s missing=%u miss_first=%u miss_last=%u repair_pending=%zu/%zu repair_retry=%u), TPU(rx=%lu,verify=%lu), TVU(rx=%lu,ok=%lu,bad=%lu,dup=%lu,complete=%lu,replayed=%lu,failed=%lu), Turbine(rx=%lu,rtx=%lu,dup=%lu,bad=%lu,slots=%lu), Repair(sent=%lu,pending=%zu,recv=%lu,repaired=%lu,timeouts=%lu,dups=%lu,invalid=%lu), votes=%lu",
+	                (unsigned long)v->current_slot,
+	                (unsigned long)highest,
+	                (unsigned long)behind,
+	                peers,
                 v->is_syncing ? "yes" : "no",
                 (unsigned long)catchup_next,
                 catchup_have_meta ? "yes" : "no",
                 (unsigned)catchup_rx,
                 (unsigned)catchup_last,
-                catchup_full,
-                (unsigned long)tpu_stats.packets_received,
-                (unsigned long)tpu_stats.signatures_verified,
-                (unsigned long)tvu_stats.shreds_received,
+	                catchup_full,
+	                (unsigned)catchup_missing,
+	                (unsigned)catchup_missing_first,
+	                (unsigned)catchup_missing_last,
+	                catchup_repair_pending_total,
+	                catchup_repair_pending_shreds,
+	                (unsigned)catchup_repair_max_retries,
+	                (unsigned long)tpu_stats.packets_received,
+	                (unsigned long)tpu_stats.signatures_verified,
+	                (unsigned long)tvu_stats.shreds_received,
                 (unsigned long)tvu_stats.shreds_verified,
                 (unsigned long)tvu_stats.shreds_failed,
                 (unsigned long)tvu_stats.shreds_duplicate,
                 (unsigned long)tvu_stats.blocks_completed,
                 (unsigned long)tvu_stats.blocks_replayed,
                 (unsigned long)tvu_stats.blocks_failed,
+                (unsigned long)turbine_stats.shreds_received,
+                (unsigned long)turbine_stats.shreds_retransmitted,
+                (unsigned long)turbine_stats.duplicate_shreds,
+                (unsigned long)turbine_stats.invalid_shreds,
+                (unsigned long)turbine_stats.slots_completed,
                 (unsigned long)repair_stats.requests_sent,
                 repair_pending,
                 (unsigned long)repair_stats.responses_received,
@@ -4706,10 +6037,37 @@ validator_run(validator_t* v) {
                 (unsigned long)repair_stats.duplicates,
                 (unsigned long)repair_stats.invalid_responses,
                 (unsigned long)votes_count);
+
         }
 
-        /* Keep the loop responsive enough for mainnet packet rates. */
-        usleep(1000);  /* 1ms */
+        /* Keep the loop responsive enough for mainnet packet rates.
+         *
+         * A non-trivial sleep here adds an artificial ~200us bubble each
+         * iteration when idle, which can accumulate into visible slot pacing
+         * jitter. Prefer yielding when there's no immediate work; optionally
+         * sleep when explicitly configured for lower CPU usage. */
+        static int idle_sleep_us_cached = -1;
+        if (__builtin_expect(idle_sleep_us_cached < 0, 0)) {
+            const char* env = getenv("SOL_IDLE_SLEEP_US");
+            int v = 0;
+            if (env && env[0] != '\0') {
+                v = atoi(env);
+                if (v < 0) v = 0;
+                if (v > 1000000) v = 1000000;
+            }
+            idle_sleep_us_cached = v;
+            if (idle_sleep_us_cached > 0) {
+                sol_log_info("Idle loop sleep: %dus (env SOL_IDLE_SLEEP_US)", idle_sleep_us_cached);
+            }
+        }
+
+        if (did_work) {
+            sched_yield();
+        } else if (idle_sleep_us_cached > 0) {
+            usleep((useconds_t)idle_sleep_us_cached);
+        } else {
+            sched_yield();
+        }
     }
 }
 
@@ -4729,7 +6087,8 @@ main(int argc, char* argv[]) {
     log_config.format = g_config.log_format;
     if (g_config.log_file) {
         log_config.log_file = g_config.log_file;
-        log_config.backends |= SOL_LOG_BACKEND_FILE;
+        /* --log-file means "instead of stderr" (also matches --help text). */
+        log_config.backends = SOL_LOG_BACKEND_FILE;
     }
     /* Disable colors for JSON format */
     if (g_config.log_format == SOL_LOG_FORMAT_JSON) {
@@ -4742,6 +6101,12 @@ main(int argc, char* argv[]) {
 
     /* Apply any implicit defaults that should not require flags. */
     validator_apply_implicit_defaults();
+
+    /* Performance default: disable the tx index unless explicitly enabled. */
+    validator_apply_tx_index_defaults();
+
+    /* Apply fast-replay overrides before any bank/replay initialization. */
+    validator_apply_fast_replay();
 
     /* Best-effort production default: raise fd limit so RocksDB, networking,
      * and snapshot extraction don't fail on low ulimit settings. */
@@ -4770,6 +6135,10 @@ main(int argc, char* argv[]) {
     sol_log_info("RPC: %s on %s:%u", g_config.enable_rpc ? "enabled" : "disabled",
                  g_config.rpc_bind, g_config.rpc_port);
     sol_log_info("TPU QUIC: %s", g_config.enable_quic ? "enabled" : "disabled");
+    sol_log_info("IO: %s (qd=%u sqpoll=%u)",
+                 sol_io_backend_str(g_config.io_backend),
+                 (unsigned)g_config.io_queue_depth,
+                 g_config.io_sqpoll ? 1u : 0u);
 
     /* Setup signal handlers */
     signal(SIGINT, signal_handler);
@@ -4803,8 +6172,17 @@ main(int argc, char* argv[]) {
 
     /* Fast exit for dev-halt mode to avoid cleanup hangs */
     if (g_config.dev_halt_at_slot > 0) {
-        sol_log_info("Dev halt: fast exit (skipping cleanup)");
-        _exit(0);
+        /* Default: fast-exit to avoid shutdown hangs in dev loops.
+         * For profiling/atexit hooks, set SOL_DEV_HALT_FAST_EXIT=0. */
+        const char* env = getenv("SOL_DEV_HALT_FAST_EXIT");
+        bool fast_exit = true;
+        if (env && env[0] != '\0' && strcmp(env, "0") == 0) {
+            fast_exit = false;
+        }
+        if (fast_exit) {
+            sol_log_info("Dev halt: fast exit (skipping cleanup)");
+            _exit(0);
+        }
     }
 
     validator_cleanup(&validator);

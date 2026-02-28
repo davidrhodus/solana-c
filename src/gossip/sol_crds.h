@@ -239,7 +239,7 @@ size_t sol_crds_get_votes_for_slot(
  *
  * Parameters:
  *   crds - The CRDS store
- *   since - Return entries with local_timestamp > since
+ *   since - Return entries with insert_timestamp > since (wallclock ms)
  *   out - Array to fill with entry pointers
  *   max_count - Maximum entries to return
  *

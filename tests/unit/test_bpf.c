@@ -359,7 +359,7 @@ TEST(divide_by_zero) {
 }
 
 /*
- * Test SBPFv2 signed remainder (ALU64)
+ * Test SBPFv2 signed remainder (PQR 64-bit)
  */
 TEST(srem64) {
     sol_bpf_vm_t* vm = sol_bpf_vm_new(NULL);
@@ -367,7 +367,7 @@ TEST(srem64) {
 
     sol_bpf_insn_t program[] = {
         SOL_BPF_MOV64_IMM(0, -10),
-        sol_bpf_insn(SOL_BPF_CLASS_ALU64 | SOL_BPF_SRC_K | SOL_BPF_ALU_SREM, 0, 0, 0, 3),  /* r0 %= 3 (signed) */
+        sol_bpf_insn(SOL_BPF_CLASS_PQR | SOL_BPF_SRC_K | SOL_BPF_PQR_SREM | SOL_BPF_PQR_64, 0, 0, 0, 3),  /* r0 %= 3 (signed) */
         SOL_BPF_EXIT()
     };
 
@@ -389,7 +389,7 @@ TEST(srem64_divisor_zero) {
 
     sol_bpf_insn_t program[] = {
         SOL_BPF_MOV64_IMM(0, -10),
-        sol_bpf_insn(SOL_BPF_CLASS_ALU64 | SOL_BPF_SRC_K | SOL_BPF_ALU_SREM, 0, 0, 0, 0),  /* r0 %= 0 (signed) */
+        sol_bpf_insn(SOL_BPF_CLASS_PQR | SOL_BPF_SRC_K | SOL_BPF_PQR_SREM | SOL_BPF_PQR_64, 0, 0, 0, 0),  /* r0 %= 0 (signed) */
         SOL_BPF_EXIT()
     };
 
@@ -415,7 +415,7 @@ TEST(srem64_overflow_case) {
     sol_bpf_insn_t program[] = {
         sol_bpf_insn(SOL_BPF_OP_LDDW, 0, 0, 0, (int32_t)lo),
         sol_bpf_insn(0, 0, 0, 0, (int32_t)hi),
-        sol_bpf_insn(SOL_BPF_CLASS_ALU64 | SOL_BPF_SRC_K | SOL_BPF_ALU_SREM, 0, 0, 0, -1),
+        sol_bpf_insn(SOL_BPF_CLASS_PQR | SOL_BPF_SRC_K | SOL_BPF_PQR_SREM | SOL_BPF_PQR_64, 0, 0, 0, -1),
         SOL_BPF_EXIT()
     };
 

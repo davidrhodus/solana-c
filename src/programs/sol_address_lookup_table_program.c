@@ -54,7 +54,7 @@ get_account(sol_invoke_context_t* ctx, uint8_t index,
 
     /* Agave creates a default account for any key not in the DB */
     if (!*account) {
-        *account = sol_calloc(1, sizeof(sol_account_t));
+        *account = sol_account_alloc();
         if (*account) {
             (*account)->meta.owner = SOL_SYSTEM_PROGRAM_ID;
             (*account)->meta.rent_epoch = UINT64_MAX;

@@ -13,6 +13,82 @@
 #include <stdlib.h>
 #include <time.h>
 
+typedef struct sol_replay_verify_worker {
+    pthread_mutex_t             mu;
+    pthread_cond_t              cv;
+    pthread_cond_t              done;
+    pthread_t                   thread;
+    bool                        inited;
+    bool                        started;
+    bool                        stop;
+    bool                        has_job;
+    bool                        job_done;
+    const sol_entry_batch_t*    batch;
+    sol_hash_t                  start_hash;
+    sol_entry_verify_result_t   verify;
+    bool                        start_hash_mismatch;
+} sol_replay_verify_worker_t;
+
+static bool
+replay_verify_tail_ok(const sol_entry_batch_t* batch) {
+    if (!batch || batch->num_entries == 0) return false;
+
+    /* If the batch verifies when starting from entry[0].hash, the slot likely
+     * belongs to a different parent hash/fork. */
+    bool tail_ok = true;
+    sol_hash_t prev = batch->entries[0].hash;
+    for (size_t i = 1; i < batch->num_entries; i++) {
+        const sol_entry_t* entry = &batch->entries[i];
+        sol_hash_t expected_hash;
+        sol_entry_compute_hash(entry, &prev, &expected_hash);
+        if (memcmp(expected_hash.bytes, entry->hash.bytes, 32) != 0) {
+            tail_ok = false;
+            break;
+        }
+        prev = entry->hash;
+    }
+    return tail_ok;
+}
+
+static void*
+replay_verify_worker_main(void* arg) {
+    sol_replay_verify_worker_t* w = (sol_replay_verify_worker_t*)arg;
+    if (!w) return NULL;
+
+    pthread_mutex_lock(&w->mu);
+    for (;;) {
+        while (!w->stop && !w->has_job) {
+            pthread_cond_wait(&w->cv, &w->mu);
+        }
+        if (w->stop) {
+            break;
+        }
+
+        const sol_entry_batch_t* batch = w->batch;
+        sol_hash_t start_hash = w->start_hash;
+
+        /* Mark the job as consumed so submitters can enqueue a new one after
+         * observing job_done. */
+        w->has_job = false;
+        pthread_mutex_unlock(&w->mu);
+
+        sol_entry_verify_result_t verify = sol_entry_batch_verify(batch, &start_hash);
+        bool mismatch = false;
+        if (!verify.valid && verify.failed_entry == 0) {
+            mismatch = replay_verify_tail_ok(batch);
+        }
+
+        pthread_mutex_lock(&w->mu);
+        w->verify = verify;
+        w->start_hash_mismatch = mismatch;
+        w->job_done = true;
+        pthread_cond_signal(&w->done);
+    }
+    pthread_mutex_unlock(&w->mu);
+
+    return NULL;
+}
+
 /*
  * Pending slot entry
  */
@@ -28,6 +104,7 @@ typedef struct sol_pending_slot {
 typedef struct sol_replayed_slot {
     sol_slot_t                  slot;
     bool                        is_dead;
+    bool                        in_progress;
     uint32_t                    variant_count; /* Variants observed when last attempted */
     uint32_t                    complete_variant_count; /* Complete variants observed when last attempted */
     struct sol_replayed_slot*   next;
@@ -63,7 +140,72 @@ struct sol_replay {
 
     /* Thread safety */
     pthread_mutex_t         lock;
+
+    /* Best-effort async entry-hash verification worker (avoids per-slot thread create/join). */
+    sol_replay_verify_worker_t verify_worker;
 };
+
+static bool
+replay_skip_tx_index(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    const char* env = getenv("SOL_SKIP_TX_INDEX");
+    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached != 0;
+}
+
+static bool
+replay_fast_mode(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    const char* env = getenv("SOL_SKIP_TX_PROCESSING");
+    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached != 0;
+}
+
+static bool
+replay_force_advance(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    const char* env = getenv("SOL_FAST_REPLAY_FORCE_ADVANCE");
+    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached != 0;
+}
+
+static bool
+replay_verify_entries(const sol_replay_t* replay) {
+    if (!replay) return false;
+    if (!replay->config.verify_entries) return false;
+    if (replay_fast_mode()) return false;
+    return true;
+}
+
+static bool
+replay_get_leader_pubkey(sol_replay_t* replay, sol_slot_t slot, sol_pubkey_t* out) {
+    if (!replay || !out) return false;
+
+    bool found = false;
+    pthread_mutex_lock(&replay->lock);
+    if (replay->leader_schedule) {
+        const sol_pubkey_t* leader =
+            sol_leader_schedule_get_leader(replay->leader_schedule, slot);
+        if (leader && !sol_pubkey_is_zero(leader)) {
+            *out = *leader;
+            found = true;
+        }
+    }
+    pthread_mutex_unlock(&replay->lock);
+    return found;
+}
 
 static void
 replay_set_highest_replayed_locked(sol_replay_t* replay, sol_slot_t slot) {
@@ -77,6 +219,18 @@ replay_set_highest_replayed_locked(sol_replay_t* replay, sol_slot_t slot) {
     if (slot > cur) {
         __atomic_store_n(&replay->highest_replayed_slot_atomic, slot, __ATOMIC_RELAXED);
     }
+}
+
+static inline void
+replay_store_u64_be(uint8_t* dst, uint64_t v) {
+    dst[0] = (uint8_t)(v >> 56);
+    dst[1] = (uint8_t)(v >> 48);
+    dst[2] = (uint8_t)(v >> 40);
+    dst[3] = (uint8_t)(v >> 32);
+    dst[4] = (uint8_t)(v >> 24);
+    dst[5] = (uint8_t)(v >> 16);
+    dst[6] = (uint8_t)(v >> 8);
+    dst[7] = (uint8_t)(v);
 }
 
 /*
@@ -123,6 +277,18 @@ count_complete_variants(sol_blockstore_t* bs, sol_slot_t slot, uint32_t variant_
     return complete;
 }
 
+static bool
+replay_has_any_shreds(const sol_replay_t* replay, sol_slot_t slot) {
+    if (!replay || !replay->blockstore) return false;
+
+    sol_slot_meta_t meta;
+    if (sol_blockstore_get_slot_meta(replay->blockstore, slot, &meta) != SOL_OK) {
+        return false;
+    }
+
+    return meta.received_data > 0;
+}
+
 /*
  * Mark slot as replayed (or update existing entry)
  */
@@ -137,6 +303,7 @@ mark_replayed(sol_replay_t* replay,
         existing->is_dead = is_dead;
         existing->variant_count = variant_count;
         existing->complete_variant_count = complete_variant_count;
+        existing->in_progress = false;
         return;
     }
 
@@ -145,12 +312,52 @@ mark_replayed(sol_replay_t* replay,
 
     entry->slot = slot;
     entry->is_dead = is_dead;
+    entry->in_progress = false;
     entry->variant_count = variant_count;
     entry->complete_variant_count = complete_variant_count;
 
     size_t idx = slot_hash(slot, replay->replayed_bucket_count);
     entry->next = replay->replayed_buckets[idx];
     replay->replayed_buckets[idx] = entry;
+}
+
+static sol_replayed_slot_t*
+ensure_replayed_entry(sol_replay_t* replay, sol_slot_t slot) {
+    sol_replayed_slot_t* entry = find_replayed(replay, slot);
+    if (entry) {
+        return entry;
+    }
+
+    entry = sol_calloc(1, sizeof(sol_replayed_slot_t));
+    if (!entry) return NULL;
+
+    entry->slot = slot;
+    entry->is_dead = false;
+    entry->in_progress = false;
+    entry->variant_count = 0;
+    entry->complete_variant_count = 0;
+
+    size_t idx = slot_hash(slot, replay->replayed_bucket_count);
+    entry->next = replay->replayed_buckets[idx];
+    replay->replayed_buckets[idx] = entry;
+    return entry;
+}
+
+static bool
+remove_replayed_entry(sol_replay_t* replay, sol_slot_t slot) {
+    size_t idx = slot_hash(slot, replay->replayed_bucket_count);
+    sol_replayed_slot_t** prev = &replay->replayed_buckets[idx];
+    sol_replayed_slot_t* entry = *prev;
+    while (entry) {
+        if (entry->slot == slot) {
+            *prev = entry->next;
+            sol_free(entry);
+            return true;
+        }
+        prev = &entry->next;
+        entry = entry->next;
+    }
+    return false;
 }
 
 /*
@@ -161,6 +368,46 @@ get_time_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static bool
+replay_timing_enable(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) {
+        return v != 0;
+    }
+
+    const char* env = getenv("SOL_REPLAY_TIMING");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static long
+replay_timing_threshold_ms(void) {
+    static long cached = -1;
+    long v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) {
+        return v;
+    }
+
+    long threshold = 300; /* default */
+    const char* env = getenv("SOL_REPLAY_TIMING_THRESHOLD_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            threshold = parsed;
+        }
+    }
+
+    if (threshold < 0) {
+        threshold = 0;
+    }
+
+    __atomic_store_n(&cached, threshold, __ATOMIC_RELEASE);
+    return threshold;
 }
 
 static void
@@ -187,6 +434,18 @@ bank_frozen_log_enable_lt_hash_checksum(void) {
 }
 
 static bool
+bank_frozen_log_enable_accounts_delta_hash(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    const char* env = getenv("SOL_LOG_BANK_FROZEN_ACCOUNTS_DELTA_HASH");
+    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached != 0;
+}
+
+static bool
 bank_frozen_log_enable_vote_parity(void) {
     static int cached = -1;
     if (cached >= 0) {
@@ -198,9 +457,30 @@ bank_frozen_log_enable_vote_parity(void) {
     return cached != 0;
 }
 
+static bool
+bank_frozen_log_force_info(void) {
+    static int cached = -1;
+    if (cached >= 0) {
+        return cached != 0;
+    }
+
+    const char* env = getenv("SOL_LOG_BANK_FROZEN");
+    cached = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    return cached != 0;
+}
+
 static void
 log_bank_frozen(sol_bank_t* bank) {
     if (!bank || !sol_bank_is_frozen(bank)) return;
+    if (replay_fast_mode()) return;
+
+    /* These logs are helpful for parity debugging but far too verbose for
+     * mainnet replay. Default: only emit when log-level is DEBUG/TRACE or when
+     * explicitly forced via SOL_LOG_BANK_FROZEN=1. */
+    const bool force_info = bank_frozen_log_force_info();
+    if (!force_info && sol_log_get_level() > SOL_LOG_DEBUG) {
+        return;
+    }
 
     sol_slot_t slot = sol_bank_slot(bank);
     uint64_t signature_count = sol_bank_signature_count(bank);
@@ -222,11 +502,13 @@ log_bank_frozen(sol_bank_t* bank) {
 
     char accounts_delta_hash_b58[SOL_PUBKEY_BASE58_LEN] = {0};
     sol_hash_t accounts_delta_hash = {0};
-    if (sol_bank_get_accounts_delta_hash(bank, &accounts_delta_hash) &&
-        !sol_hash_is_zero(&accounts_delta_hash)) {
-        bytes32_to_base58(accounts_delta_hash.bytes,
-                          accounts_delta_hash_b58,
-                          sizeof(accounts_delta_hash_b58));
+    if (bank_frozen_log_enable_accounts_delta_hash()) {
+        if (sol_bank_get_accounts_delta_hash(bank, &accounts_delta_hash) &&
+            !sol_hash_is_zero(&accounts_delta_hash)) {
+            bytes32_to_base58(accounts_delta_hash.bytes,
+                              accounts_delta_hash_b58,
+                              sizeof(accounts_delta_hash_b58));
+        }
     }
 
     sol_blake3_t lt_checksum = {0};
@@ -236,16 +518,29 @@ log_bank_frozen(sol_bank_t* bank) {
         bytes32_to_base58(lt_checksum.bytes, lt_checksum_b58, sizeof(lt_checksum_b58));
     }
 
-    sol_log_info("bank frozen: %lu hash: %s signature_count: %lu tx_processed: %lu tx_succeeded: %lu tx_failed: %lu last_blockhash: %s accounts_delta_hash: %s accounts_lt_hash checksum: %s",
-                 (unsigned long)slot,
-                 bank_hash_b58[0] ? bank_hash_b58 : "-",
-                 (unsigned long)signature_count,
-                 (unsigned long)bank_stats.transactions_processed,
-                 (unsigned long)bank_stats.transactions_succeeded,
-                 (unsigned long)bank_stats.transactions_failed,
-                 last_blockhash_b58[0] ? last_blockhash_b58 : "-",
-                 accounts_delta_hash_b58[0] ? accounts_delta_hash_b58 : "-",
-                 lt_checksum_b58[0] ? lt_checksum_b58 : "-");
+    if (force_info) {
+        sol_log_info("bank frozen: %lu hash: %s signature_count: %lu tx_processed: %lu tx_succeeded: %lu tx_failed: %lu last_blockhash: %s accounts_delta_hash: %s accounts_lt_hash checksum: %s",
+                     (unsigned long)slot,
+                     bank_hash_b58[0] ? bank_hash_b58 : "-",
+                     (unsigned long)signature_count,
+                     (unsigned long)bank_stats.transactions_processed,
+                     (unsigned long)bank_stats.transactions_succeeded,
+                     (unsigned long)bank_stats.transactions_failed,
+                     last_blockhash_b58[0] ? last_blockhash_b58 : "-",
+                     accounts_delta_hash_b58[0] ? accounts_delta_hash_b58 : "-",
+                     lt_checksum_b58[0] ? lt_checksum_b58 : "-");
+    } else {
+        sol_log_debug("bank frozen: %lu hash: %s signature_count: %lu tx_processed: %lu tx_succeeded: %lu tx_failed: %lu last_blockhash: %s accounts_delta_hash: %s accounts_lt_hash checksum: %s",
+                      (unsigned long)slot,
+                      bank_hash_b58[0] ? bank_hash_b58 : "-",
+                      (unsigned long)signature_count,
+                      (unsigned long)bank_stats.transactions_processed,
+                      (unsigned long)bank_stats.transactions_succeeded,
+                      (unsigned long)bank_stats.transactions_failed,
+                      last_blockhash_b58[0] ? last_blockhash_b58 : "-",
+                      accounts_delta_hash_b58[0] ? accounts_delta_hash_b58 : "-",
+                      lt_checksum_b58[0] ? lt_checksum_b58 : "-");
+    }
 
     uint64_t total_prevalidation_rejected =
         bank_stats.rejected_sanitize +
@@ -257,32 +552,58 @@ log_bank_frozen(sol_bank_t* bank) {
         bank_stats.rejected_insufficient_funds +
         bank_stats.rejected_signature;
     if (total_prevalidation_rejected > 0 || bank_stats.transactions_failed > 0) {
-        sol_log_info("bank frozen: %lu rejection_breakdown: sanitize=%lu duplicate=%lu v0_resolve=%lu compute_budget=%lu blockhash=%lu fee_payer_missing=%lu insufficient_funds=%lu signature=%lu (total_prevalidation=%lu execution_failed=%lu)",
-                     (unsigned long)slot,
-                     (unsigned long)bank_stats.rejected_sanitize,
-                     (unsigned long)bank_stats.rejected_duplicate,
-                     (unsigned long)bank_stats.rejected_v0_resolve,
-                     (unsigned long)bank_stats.rejected_compute_budget,
-                     (unsigned long)bank_stats.rejected_blockhash,
-                     (unsigned long)bank_stats.rejected_fee_payer_missing,
-                     (unsigned long)bank_stats.rejected_insufficient_funds,
-                     (unsigned long)bank_stats.rejected_signature,
-                     (unsigned long)total_prevalidation_rejected,
-                     (unsigned long)(bank_stats.transactions_failed - total_prevalidation_rejected));
+        if (force_info) {
+            sol_log_info("bank frozen: %lu rejection_breakdown: sanitize=%lu duplicate=%lu v0_resolve=%lu compute_budget=%lu blockhash=%lu fee_payer_missing=%lu insufficient_funds=%lu signature=%lu (total_prevalidation=%lu execution_failed=%lu)",
+                         (unsigned long)slot,
+                         (unsigned long)bank_stats.rejected_sanitize,
+                         (unsigned long)bank_stats.rejected_duplicate,
+                         (unsigned long)bank_stats.rejected_v0_resolve,
+                         (unsigned long)bank_stats.rejected_compute_budget,
+                         (unsigned long)bank_stats.rejected_blockhash,
+                         (unsigned long)bank_stats.rejected_fee_payer_missing,
+                         (unsigned long)bank_stats.rejected_insufficient_funds,
+                         (unsigned long)bank_stats.rejected_signature,
+                         (unsigned long)total_prevalidation_rejected,
+                         (unsigned long)(bank_stats.transactions_failed - total_prevalidation_rejected));
+        } else {
+            sol_log_debug("bank frozen: %lu rejection_breakdown: sanitize=%lu duplicate=%lu v0_resolve=%lu compute_budget=%lu blockhash=%lu fee_payer_missing=%lu insufficient_funds=%lu signature=%lu (total_prevalidation=%lu execution_failed=%lu)",
+                          (unsigned long)slot,
+                          (unsigned long)bank_stats.rejected_sanitize,
+                          (unsigned long)bank_stats.rejected_duplicate,
+                          (unsigned long)bank_stats.rejected_v0_resolve,
+                          (unsigned long)bank_stats.rejected_compute_budget,
+                          (unsigned long)bank_stats.rejected_blockhash,
+                          (unsigned long)bank_stats.rejected_fee_payer_missing,
+                          (unsigned long)bank_stats.rejected_insufficient_funds,
+                          (unsigned long)bank_stats.rejected_signature,
+                          (unsigned long)total_prevalidation_rejected,
+                          (unsigned long)(bank_stats.transactions_failed - total_prevalidation_rejected));
+        }
     }
 
     /* BankHashStats (compare with Agave's bank frozen stats) */
-    sol_log_info("bank frozen: %lu stats: { num_updated_accounts: %lu, num_removed_accounts: %lu, num_lamports_stored: %lu, total_data_len: %lu, num_executable_accounts: %lu }",
-                 (unsigned long)slot,
-                 (unsigned long)bank_stats.num_updated_accounts,
-                 (unsigned long)bank_stats.num_removed_accounts,
-                 (unsigned long)bank_stats.num_lamports_stored,
-                 (unsigned long)bank_stats.total_data_len,
-                 (unsigned long)bank_stats.num_executable_accounts);
+    if (force_info) {
+        sol_log_info("bank frozen: %lu stats: { num_updated_accounts: %lu, num_removed_accounts: %lu, num_lamports_stored: %lu, total_data_len: %lu, num_executable_accounts: %lu }",
+                     (unsigned long)slot,
+                     (unsigned long)bank_stats.num_updated_accounts,
+                     (unsigned long)bank_stats.num_removed_accounts,
+                     (unsigned long)bank_stats.num_lamports_stored,
+                     (unsigned long)bank_stats.total_data_len,
+                     (unsigned long)bank_stats.num_executable_accounts);
+    } else {
+        sol_log_debug("bank frozen: %lu stats: { num_updated_accounts: %lu, num_removed_accounts: %lu, num_lamports_stored: %lu, total_data_len: %lu, num_executable_accounts: %lu }",
+                      (unsigned long)slot,
+                      (unsigned long)bank_stats.num_updated_accounts,
+                      (unsigned long)bank_stats.num_removed_accounts,
+                      (unsigned long)bank_stats.num_lamports_stored,
+                      (unsigned long)bank_stats.total_data_len,
+                      (unsigned long)bank_stats.num_executable_accounts);
+    }
 }
 
 static void
 log_bank_frozen_vote_parity(sol_replay_t* replay, sol_bank_t* bank) {
+    if (replay_fast_mode()) return;
     if (!bank_frozen_log_enable_vote_parity()) return;
     if (!replay || !replay->fork_choice || !bank || !sol_bank_is_frozen(bank)) return;
 
@@ -452,6 +773,29 @@ sol_replay_new(sol_bank_forks_t* bank_forks,
         return NULL;
     }
 
+    /* Best-effort: start a persistent entry-verification worker to avoid the
+     * overhead of pthread_create/join per slot. */
+    memset(&replay->verify_worker, 0, sizeof(replay->verify_worker));
+    if (pthread_mutex_init(&replay->verify_worker.mu, NULL) == 0) {
+        if (pthread_cond_init(&replay->verify_worker.cv, NULL) == 0) {
+            if (pthread_cond_init(&replay->verify_worker.done, NULL) == 0) {
+                replay->verify_worker.inited = true;
+                replay->verify_worker.stop = false;
+                replay->verify_worker.has_job = false;
+                replay->verify_worker.job_done = true;
+                if (pthread_create(&replay->verify_worker.thread, NULL, replay_verify_worker_main,
+                                   &replay->verify_worker) == 0) {
+                    replay->verify_worker.started = true;
+                }
+            } else {
+                pthread_cond_destroy(&replay->verify_worker.cv);
+                pthread_mutex_destroy(&replay->verify_worker.mu);
+            }
+        } else {
+            pthread_mutex_destroy(&replay->verify_worker.mu);
+        }
+    }
+
     /* Mark root slot as replayed */
     sol_slot_t root = sol_bank_forks_root_slot(bank_forks);
     uint32_t root_variants = (uint32_t)sol_blockstore_num_variants(blockstore, root);
@@ -478,6 +822,22 @@ void
 sol_replay_destroy(sol_replay_t* replay) {
     if (!replay) return;
 
+    if (replay->verify_worker.inited) {
+        if (replay->verify_worker.started) {
+            pthread_mutex_lock(&replay->verify_worker.mu);
+            replay->verify_worker.stop = true;
+            pthread_cond_broadcast(&replay->verify_worker.cv);
+            pthread_cond_broadcast(&replay->verify_worker.done);
+            pthread_mutex_unlock(&replay->verify_worker.mu);
+            (void)pthread_join(replay->verify_worker.thread, NULL);
+            replay->verify_worker.started = false;
+        }
+        pthread_cond_destroy(&replay->verify_worker.done);
+        pthread_cond_destroy(&replay->verify_worker.cv);
+        pthread_mutex_destroy(&replay->verify_worker.mu);
+        replay->verify_worker.inited = false;
+    }
+
     /* Free pending slots */
     sol_pending_slot_t* pending = replay->pending_slots;
     while (pending) {
@@ -502,118 +862,330 @@ sol_replay_destroy(sol_replay_t* replay) {
     sol_free(replay);
 }
 
+typedef struct replay_entries_timing {
+    uint64_t    process_entries_ns;
+    uint64_t    freeze_ns;
+    uint64_t    compute_hash_ns;
+    uint64_t    verify_sync_ns;
+    uint64_t    verify_wait_ns;
+} replay_entries_timing_t;
+
 static sol_replay_result_t
 replay_entries(sol_replay_t* replay,
                sol_bank_t* bank,
                sol_slot_t slot,
-               const sol_entry_batch_t* batch) {
+               const sol_entry_batch_t* batch,
+               replay_entries_timing_t* timing) {
     if (!replay || !bank || !batch) {
         return SOL_REPLAY_DEAD;
     }
 
-    /* Verify entry hash chain */
-    const sol_hash_t* start_hash = sol_bank_blockhash(bank);
+    if (timing) {
+        memset(timing, 0, sizeof(*timing));
+    }
 
-    sol_entry_verify_result_t verify = sol_entry_batch_verify(batch, start_hash);
-    if (!verify.valid) {
-        bool start_hash_mismatch = false;
-        if (verify.failed_entry == 0 && batch->num_entries > 0) {
-            /* If the batch verifies when starting from entry[0].hash, the
-             * slot likely belongs to a different parent hash/fork. */
-            bool tail_ok = true;
-            sol_hash_t prev = batch->entries[0].hash;
-            for (size_t i = 1; i < batch->num_entries; i++) {
-                const sol_entry_t* entry = &batch->entries[i];
-                sol_hash_t expected_hash;
-                sol_entry_compute_hash(entry, &prev, &expected_hash);
-                if (memcmp(expected_hash.bytes, entry->hash.bytes, 32) != 0) {
-                    tail_ok = false;
-                    break;
-                }
-                prev = entry->hash;
-            }
-            if (tail_ok) {
-                start_hash_mismatch = true;
-            }
-        }
+    /* Verify entry hash chain (skip in fast-replay mode).
+     *
+     * This is PoH-heavy and can be overlapped with transaction execution.
+     * Verification reads the entry batch only; bank processing mutates the
+     * bank overlay. If verification fails, the caller destroys the bank and
+     * discards the work. */
+    bool verify_enabled = replay_verify_entries(replay);
+    bool verify_async = false;
+    sol_entry_verify_result_t verify = {0};
+    bool start_hash_mismatch = false;
 
-        if (start_hash_mismatch) {
-            sol_log_warn("Entry hash chain mismatch at start for slot %llu (likely wrong parent hash)",
+    if (verify_enabled) {
+        const sol_hash_t* start_hash = sol_bank_blockhash(bank);
+        if (!start_hash) {
+            sol_log_warn("Missing start blockhash for slot %llu; cannot verify entry hash chain",
                          (unsigned long long)slot);
-            return SOL_REPLAY_INCOMPLETE;
+            return SOL_REPLAY_DEAD;
         }
 
-        sol_log_warn("Entry hash chain verification failed for slot %llu at entry %u",
-                     (unsigned long long)slot, verify.failed_entry);
-        return SOL_REPLAY_DEAD;
+        if (replay->verify_worker.started) {
+            pthread_mutex_lock(&replay->verify_worker.mu);
+            /* One in-flight job at a time; replay threads are currently capped,
+             * but be robust to accidental misuse. */
+            while (!replay->verify_worker.job_done && !replay->verify_worker.stop) {
+                pthread_cond_wait(&replay->verify_worker.done, &replay->verify_worker.mu);
+            }
+            replay->verify_worker.batch = batch;
+            replay->verify_worker.start_hash = *start_hash;
+            replay->verify_worker.job_done = false;
+            replay->verify_worker.has_job = true;
+            pthread_cond_signal(&replay->verify_worker.cv);
+            pthread_mutex_unlock(&replay->verify_worker.mu);
+            verify_async = true;
+        } else {
+            uint64_t t0 = timing ? get_time_ns() : 0;
+            sol_hash_t h = *start_hash;
+            verify = sol_entry_batch_verify(batch, &h);
+            if (timing) {
+                timing->verify_sync_ns = get_time_ns() - t0;
+            }
+            if (!verify.valid && verify.failed_entry == 0) {
+                start_hash_mismatch = replay_verify_tail_ok(batch);
+            }
+        }
     }
 
     /* Process entries through bank */
+    uint64_t t_process0 = timing ? get_time_ns() : 0;
     sol_err_t err = sol_bank_process_entries(bank, batch);
+    if (timing) {
+        timing->process_entries_ns = get_time_ns() - t_process0;
+    }
     if (err != SOL_OK) {
         sol_log_warn("Failed to process entries for slot %llu: %s",
                      (unsigned long long)slot, sol_err_str(err));
+        if (verify_async) {
+            pthread_mutex_lock(&replay->verify_worker.mu);
+            while (!replay->verify_worker.job_done && !replay->verify_worker.stop) {
+                pthread_cond_wait(&replay->verify_worker.done, &replay->verify_worker.mu);
+            }
+            pthread_mutex_unlock(&replay->verify_worker.mu);
+        }
         return SOL_REPLAY_DEAD;
     }
 
     /* A slot is only valid once it reaches max tick height. */
     if (!sol_bank_has_full_ticks(bank)) {
-        sol_log_warn("Slot %llu did not reach max tick height (tick_height=%llu max_tick_height=%llu)",
-                     (unsigned long long)slot,
-                     (unsigned long long)sol_bank_tick_height(bank),
-                     (unsigned long long)sol_bank_max_tick_height(bank));
-        return SOL_REPLAY_INCOMPLETE;
+        if (!replay_fast_mode()) {
+            sol_log_warn("Slot %llu did not reach max tick height (tick_height=%llu max_tick_height=%llu)",
+                         (unsigned long long)slot,
+                         (unsigned long long)sol_bank_tick_height(bank),
+                         (unsigned long long)sol_bank_max_tick_height(bank));
+            if (verify_async) {
+                pthread_mutex_lock(&replay->verify_worker.mu);
+                while (!replay->verify_worker.job_done && !replay->verify_worker.stop) {
+                    pthread_cond_wait(&replay->verify_worker.done, &replay->verify_worker.mu);
+                }
+                pthread_mutex_unlock(&replay->verify_worker.mu);
+            }
+            return SOL_REPLAY_INCOMPLETE;
+        }
+        sol_log_debug("Fast replay: slot %llu missing ticks (tick_height=%llu max_tick_height=%llu)",
+                      (unsigned long long)slot,
+                      (unsigned long long)sol_bank_tick_height(bank),
+                      (unsigned long long)sol_bank_max_tick_height(bank));
+    }
+
+    /* If entry verification is running asynchronously, overlap freeze + bank
+     * hash computation with that work. On large-core hosts, transaction
+     * execution and bank hashing parallelize well; PoH verification can become
+     * the critical path. */
+    if (verify_async) {
+        uint64_t t0 = timing ? get_time_ns() : 0;
+        sol_bank_freeze(bank);
+        if (timing) {
+            uint64_t t1 = get_time_ns();
+            timing->freeze_ns = t1 - t0;
+            t0 = t1;
+        }
+
+        /* Precompute bank hash (includes accounts lt-hash). This is also
+         * required for duplicate-safe insert into bank forks. */
+        sol_hash_t tmp = {0};
+        sol_bank_compute_hash(bank, &tmp);
+        if (timing) {
+            timing->compute_hash_ns = get_time_ns() - t0;
+        }
+    }
+
+    /* Ensure verification completes (if enabled) before we accept the slot. */
+    if (verify_async) {
+        uint64_t t0 = timing ? get_time_ns() : 0;
+        pthread_mutex_lock(&replay->verify_worker.mu);
+        while (!replay->verify_worker.job_done && !replay->verify_worker.stop) {
+            pthread_cond_wait(&replay->verify_worker.done, &replay->verify_worker.mu);
+        }
+        verify = replay->verify_worker.verify;
+        start_hash_mismatch = replay->verify_worker.start_hash_mismatch;
+        pthread_mutex_unlock(&replay->verify_worker.mu);
+        if (timing) {
+            timing->verify_wait_ns = get_time_ns() - t0;
+        }
+    }
+
+    if (verify_enabled) {
+        if (!verify.valid) {
+            if (start_hash_mismatch) {
+                sol_log_warn("Entry hash chain mismatch at start for slot %llu (likely wrong parent hash)",
+                             (unsigned long long)slot);
+                return SOL_REPLAY_INCOMPLETE;
+            }
+
+            sol_log_warn("Entry hash chain verification failed for slot %llu at entry %u",
+                         (unsigned long long)slot, verify.failed_entry);
+            return SOL_REPLAY_DEAD;
+        }
     }
 
     /* Best-effort transaction signature indexing for RPC queries. */
-    if (replay->blockstore) {
-        for (size_t ei = 0; ei < batch->num_entries; ei++) {
-            const sol_entry_t* entry = &batch->entries[ei];
-            for (uint32_t ti = 0; ti < entry->num_transactions; ti++) {
-                const sol_transaction_t* tx = &entry->transactions[ti];
-                const sol_signature_t* sig = sol_transaction_signature(tx);
-                if (!sig) continue;
+    if (replay->blockstore && !replay_skip_tx_index()) {
+        sol_blockstore_t* bs = replay->blockstore;
 
-                sol_err_t tx_err = SOL_OK;
-                sol_tx_status_entry_t st = {0};
-                if (sol_bank_get_tx_status(bank, sig, &st)) {
-                    tx_err = st.status;
-                }
+        if (sol_blockstore_address_sig_batch_supported(bs)) {
+            enum {
+                ADDR_SIG_KEY_LEN = 32 + 8 + 64,
+                ADDR_SIG_VAL_LEN = 4,
+            };
 
-                const sol_pubkey_t* account_keys = tx->message.account_keys;
-                size_t account_keys_len = tx->message.account_keys_len;
+            /* Chunked batches to cap memory and RocksDB write batch size. */
+            const size_t max_ops_per_batch = 65536;
+            sol_batch_op_t* ops = sol_alloc(max_ops_per_batch * sizeof(*ops));
+            uint8_t* keys = sol_alloc(max_ops_per_batch * ADDR_SIG_KEY_LEN);
+            uint8_t* vals = sol_alloc(max_ops_per_batch * ADDR_SIG_VAL_LEN);
 
-                sol_pubkey_t resolved_keys[SOL_MAX_MESSAGE_ACCOUNTS];
-                bool resolved_writable[SOL_MAX_MESSAGE_ACCOUNTS];
-                bool resolved_signer[SOL_MAX_MESSAGE_ACCOUNTS];
-                size_t resolved_len = 0;
+            if (ops && keys && vals) {
+                const uint64_t inv_slot = UINT64_MAX - (uint64_t)slot;
+                size_t op_count = 0;
+                sol_err_t first_err = SOL_OK;
 
-                if (tx->message.version == SOL_MESSAGE_VERSION_V0) {
-                    if (sol_bank_resolve_transaction_accounts(bank,
-                                                              tx,
-                                                              resolved_keys,
-                                                              resolved_writable,
-                                                              resolved_signer,
-                                                              SOL_MAX_MESSAGE_ACCOUNTS,
-                                                              &resolved_len) == SOL_OK) {
-                        account_keys = resolved_keys;
-                        account_keys_len = resolved_len;
+                for (size_t ei = 0; ei < batch->num_entries && first_err == SOL_OK; ei++) {
+                    const sol_entry_t* entry = &batch->entries[ei];
+                    for (uint32_t ti = 0; ti < entry->num_transactions && first_err == SOL_OK; ti++) {
+                        const sol_transaction_t* tx = &entry->transactions[ti];
+                        const sol_signature_t* sig = sol_transaction_signature(tx);
+                        if (!sig) continue;
+
+                        sol_err_t tx_err = SOL_OK;
+                        sol_tx_status_entry_t st = {0};
+                        if (sol_bank_get_tx_status(bank, sig, &st)) {
+                            tx_err = st.status;
+                        }
+
+                        const sol_pubkey_t* account_keys = tx->message.account_keys;
+                        size_t account_keys_len = tx->message.account_keys_len;
+
+                        sol_pubkey_t resolved_keys[SOL_MAX_MESSAGE_ACCOUNTS];
+                        bool resolved_writable[SOL_MAX_MESSAGE_ACCOUNTS];
+                        bool resolved_signer[SOL_MAX_MESSAGE_ACCOUNTS];
+                        size_t resolved_len = 0;
+
+                        if (tx->message.version == SOL_MESSAGE_VERSION_V0) {
+                            if (sol_bank_resolve_transaction_accounts(bank,
+                                                                      tx,
+                                                                      resolved_keys,
+                                                                      resolved_writable,
+                                                                      resolved_signer,
+                                                                      SOL_MAX_MESSAGE_ACCOUNTS,
+                                                                      &resolved_len) == SOL_OK) {
+                                account_keys = resolved_keys;
+                                account_keys_len = resolved_len;
+                            }
+                        }
+
+                        int32_t err32 = (int32_t)tx_err;
+
+                        for (size_t ai = 0; ai < account_keys_len; ai++) {
+                            if (op_count == max_ops_per_batch) {
+                                sol_storage_batch_t wbatch = {
+                                    .ops = ops,
+                                    .count = op_count,
+                                    .capacity = op_count,
+                                };
+                                sol_err_t werr = sol_blockstore_address_sig_batch_write(bs, &wbatch);
+                                if (werr != SOL_OK) {
+                                    first_err = werr;
+                                    break;
+                                }
+                                op_count = 0;
+                            }
+
+                            uint8_t* key = keys + (op_count * ADDR_SIG_KEY_LEN);
+                            uint8_t* val = vals + (op_count * ADDR_SIG_VAL_LEN);
+
+                            memcpy(key, account_keys[ai].bytes, 32);
+                            replay_store_u64_be(key + 32, inv_slot);
+                            memcpy(key + 32 + 8, sig->bytes, 64);
+
+                            memcpy(val, &err32, sizeof(err32));
+
+                            ops[op_count] = (sol_batch_op_t){
+                                .op = SOL_BATCH_OP_PUT,
+                                .key = key,
+                                .key_len = ADDR_SIG_KEY_LEN,
+                                .value = val,
+                                .value_len = ADDR_SIG_VAL_LEN,
+                            };
+                            op_count++;
+                        }
                     }
                 }
 
-                (void)sol_blockstore_index_transaction(
-                    replay->blockstore,
-                    slot,
-                    sig,
-                    account_keys,
-                    account_keys_len,
-                    tx_err
-                );
+                if (first_err == SOL_OK && op_count > 0) {
+                    sol_storage_batch_t wbatch = {
+                        .ops = ops,
+                        .count = op_count,
+                        .capacity = op_count,
+                    };
+                    first_err = sol_blockstore_address_sig_batch_write(bs, &wbatch);
+                }
+
+                if (first_err != SOL_OK) {
+                    sol_log_debug("Transaction indexing batch-write failed for slot %llu: %s",
+                                  (unsigned long long)slot,
+                                  sol_err_str(first_err));
+                }
+            } else {
+                sol_log_debug("Transaction indexing batch-write skipped for slot %llu: OOM",
+                              (unsigned long long)slot);
+            }
+
+            sol_free(ops);
+            sol_free(keys);
+            sol_free(vals);
+        } else {
+            for (size_t ei = 0; ei < batch->num_entries; ei++) {
+                const sol_entry_t* entry = &batch->entries[ei];
+                for (uint32_t ti = 0; ti < entry->num_transactions; ti++) {
+                    const sol_transaction_t* tx = &entry->transactions[ti];
+                    const sol_signature_t* sig = sol_transaction_signature(tx);
+                    if (!sig) continue;
+
+                    sol_err_t tx_err = SOL_OK;
+                    sol_tx_status_entry_t st = {0};
+                    if (sol_bank_get_tx_status(bank, sig, &st)) {
+                        tx_err = st.status;
+                    }
+
+                    const sol_pubkey_t* account_keys = tx->message.account_keys;
+                    size_t account_keys_len = tx->message.account_keys_len;
+
+                    sol_pubkey_t resolved_keys[SOL_MAX_MESSAGE_ACCOUNTS];
+                    bool resolved_writable[SOL_MAX_MESSAGE_ACCOUNTS];
+                    bool resolved_signer[SOL_MAX_MESSAGE_ACCOUNTS];
+                    size_t resolved_len = 0;
+
+                    if (tx->message.version == SOL_MESSAGE_VERSION_V0) {
+                        if (sol_bank_resolve_transaction_accounts(bank,
+                                                                  tx,
+                                                                  resolved_keys,
+                                                                  resolved_writable,
+                                                                  resolved_signer,
+                                                                  SOL_MAX_MESSAGE_ACCOUNTS,
+                                                                  &resolved_len) == SOL_OK) {
+                            account_keys = resolved_keys;
+                            account_keys_len = resolved_len;
+                        }
+                    }
+
+                    (void)sol_blockstore_index_transaction(
+                        replay->blockstore,
+                        slot,
+                        sig,
+                        account_keys,
+                        account_keys_len,
+                        tx_err
+                    );
+                }
             }
         }
     }
 
-    replay->stats.entries_processed += batch->num_entries;
+    __atomic_fetch_add(&replay->stats.entries_processed, batch->num_entries, __ATOMIC_RELAXED);
 
     return SOL_REPLAY_SUCCESS;
 }
@@ -623,6 +1195,14 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
                 sol_replay_slot_info_t* info) {
     if (!replay) return SOL_REPLAY_DEAD;
 
+    sol_replay_result_t result = SOL_REPLAY_DEAD;
+    bool previously_replayed = false;
+    bool previously_success = false;
+    bool entry_created = false;
+    uint32_t current_variants = 0;
+    uint32_t current_complete_variants = 0;
+    sol_replayed_slot_t* replayed = NULL;
+
     pthread_mutex_lock(&replay->lock);
 
     /* Initialize info */
@@ -631,28 +1211,23 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
         info->slot = slot;
     }
 
-    sol_replayed_slot_t* replayed = find_replayed(replay, slot);
-    bool previously_replayed = (replayed != NULL);
-    bool previously_success = (replayed != NULL) && !replayed->is_dead;
+    replayed = find_replayed(replay, slot);
+    previously_replayed = (replayed != NULL);
+    previously_success = (replayed != NULL) && !replayed->is_dead;
 
-    /* Fast-path: if a slot was already successfully replayed, never replay it
-     * again.  Replay results are deterministic for a given parent bank and
-     * transaction set, so new block variants (duplicate shreds) cannot change
-     * the outcome.  Re-replaying was causing 5x duplicate work because the
-     * blockstore can accumulate up to 5 variants per slot. */
-    if (previously_success) {
+    if (replayed && replayed->in_progress) {
         if (info) {
-            info->result = SOL_REPLAY_DUPLICATE;
+            info->result = SOL_REPLAY_INCOMPLETE;
         }
         pthread_mutex_unlock(&replay->lock);
-        return SOL_REPLAY_DUPLICATE;
+        return SOL_REPLAY_INCOMPLETE;
     }
 
     /* If a new block variant shows up later (duplicate slot), or a previously
      * incomplete variant becomes complete, we want to replay again to insert
      * additional candidate banks. */
-    uint32_t current_variants = (uint32_t)sol_blockstore_num_variants(replay->blockstore, slot);
-    uint32_t current_complete_variants =
+    current_variants = (uint32_t)sol_blockstore_num_variants(replay->blockstore, slot);
+    current_complete_variants =
         count_complete_variants(replay->blockstore, slot, current_variants);
 
     bool has_new_variants =
@@ -660,10 +1235,24 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     bool has_new_complete_variants =
         replayed && current_complete_variants > replayed->complete_variant_count;
 
-    bool has_new_work = has_new_variants || has_new_complete_variants;
+    /* Fast-path: already replayed successfully. Only allow a reattempt when
+     * a new variant or newly completed variant appears, so we can refresh
+     * the observed variant counters. */
+    if (previously_success) {
+        /* New *complete* variants may belong to a different fork. Those must be
+         * replayed to insert additional (slot, bank_hash) candidates so children
+         * can validate against the correct parent hash. */
+        if (!has_new_complete_variants) {
+            if (info) {
+                info->result = SOL_REPLAY_DUPLICATE;
+            }
+            pthread_mutex_unlock(&replay->lock);
+            return SOL_REPLAY_DUPLICATE;
+        }
+    }
 
     /* Fast-path: already replayed (dead) and no new variants to consider. */
-    if (replayed && !has_new_work) {
+    if (replayed && !has_new_variants && !has_new_complete_variants) {
         if (info) {
             info->result = SOL_REPLAY_DEAD;
         }
@@ -672,7 +1261,8 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     }
 
     /* Check if slot is complete in blockstore */
-    if (!sol_blockstore_is_slot_complete(replay->blockstore, slot)) {
+    if (!sol_blockstore_is_slot_complete(replay->blockstore, slot) &&
+        !replay_fast_mode()) {
         if (info) info->result = SOL_REPLAY_INCOMPLETE;
         pthread_mutex_unlock(&replay->lock);
         return SOL_REPLAY_INCOMPLETE;
@@ -687,7 +1277,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     sol_bank_t* existing_bank = sol_bank_forks_get(replay->bank_forks, slot);
     if (existing_bank && !previously_replayed) {
         /* Don't mark the slot as replayed until the bank has full ticks. */
-        if (!sol_bank_has_full_ticks(existing_bank)) {
+        if (!sol_bank_has_full_ticks(existing_bank) && !replay_fast_mode()) {
             if (info) info->result = SOL_REPLAY_INCOMPLETE;
             pthread_mutex_unlock(&replay->lock);
             return SOL_REPLAY_INCOMPLETE;
@@ -726,13 +1316,34 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
         return SOL_REPLAY_SUCCESS;
     }
 
+    replayed = ensure_replayed_entry(replay, slot);
+    if (!replayed) {
+        if (info) info->result = SOL_REPLAY_DEAD;
+        pthread_mutex_unlock(&replay->lock);
+        return SOL_REPLAY_DEAD;
+    }
+    if (!previously_replayed) {
+        entry_created = true;
+    }
+    replayed->in_progress = true;
+    pthread_mutex_unlock(&replay->lock);
+
     /* Find a complete block variant to learn the parent slot. */
     size_t num_variants = current_variants ? current_variants :
                          sol_blockstore_num_variants(replay->blockstore, slot);
     if (num_variants == 0) {
-        if (info) info->result = SOL_REPLAY_DEAD;
+        if (info) {
+            info->result = replay_fast_mode() ? SOL_REPLAY_INCOMPLETE : SOL_REPLAY_DEAD;
+        }
+        pthread_mutex_lock(&replay->lock);
+        if (entry_created) {
+            remove_replayed_entry(replay, slot);
+        } else {
+            sol_replayed_slot_t* cur = find_replayed(replay, slot);
+            if (cur) cur->in_progress = false;
+        }
         pthread_mutex_unlock(&replay->lock);
-        return SOL_REPLAY_DEAD;
+        return replay_fast_mode() ? SOL_REPLAY_INCOMPLETE : SOL_REPLAY_DEAD;
     }
 
     sol_block_t* first_block = NULL;
@@ -750,9 +1361,18 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     }
 
     if (!first_block) {
-        if (info) info->result = SOL_REPLAY_DEAD;
+        if (info) {
+            info->result = replay_fast_mode() ? SOL_REPLAY_INCOMPLETE : SOL_REPLAY_DEAD;
+        }
+        pthread_mutex_lock(&replay->lock);
+        if (entry_created) {
+            remove_replayed_entry(replay, slot);
+        } else {
+            sol_replayed_slot_t* cur = find_replayed(replay, slot);
+            if (cur) cur->in_progress = false;
+        }
         pthread_mutex_unlock(&replay->lock);
-        return SOL_REPLAY_DEAD;
+        return replay_fast_mode() ? SOL_REPLAY_INCOMPLETE : SOL_REPLAY_DEAD;
     }
 
     sol_slot_t parent_slot = first_block->parent_slot;
@@ -772,15 +1392,18 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     } else if (sol_replay_has_frozen_bank(replay, parent_slot)) {
         parent_available = true;
     } else {
+        pthread_mutex_lock(&replay->lock);
         sol_replayed_slot_t* parent_replayed = find_replayed(replay, parent_slot);
         if (parent_replayed && !parent_replayed->is_dead) {
             parent_available = true;
         }
+        pthread_mutex_unlock(&replay->lock);
     }
 
     if (!parent_available) {
         /* Parent not available yet - add to pending */
         sol_pending_slot_t* pending = sol_calloc(1, sizeof(sol_pending_slot_t));
+        pthread_mutex_lock(&replay->lock);
         if (pending) {
             pending->slot = slot;
             pending->parent_slot = parent_slot;
@@ -788,10 +1411,16 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             replay->pending_slots = pending;
             replay->pending_count++;
         }
+        if (entry_created) {
+            remove_replayed_entry(replay, slot);
+        } else {
+            sol_replayed_slot_t* cur = find_replayed(replay, slot);
+            if (cur) cur->in_progress = false;
+        }
+        pthread_mutex_unlock(&replay->lock);
 
         if (info) info->result = SOL_REPLAY_PARENT_MISSING;
         sol_block_destroy(first_block);
-        pthread_mutex_unlock(&replay->lock);
         return SOL_REPLAY_PARENT_MISSING;
     }
 
@@ -806,19 +1435,55 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     sol_bank_forks_iterate(replay->bank_forks, collect_bank_hashes_cb, &parents);
     if (parents.count == 0) {
         sol_free(parents.hashes);
-        sol_block_destroy(first_block);
-        if (info) info->result = SOL_REPLAY_DEAD;
-        pthread_mutex_unlock(&replay->lock);
-        return SOL_REPLAY_DEAD;
+        parents.hashes = NULL;
+        parents.cap = 0;
+
+        if (!replay_fast_mode()) {
+            sol_block_destroy(first_block);
+            if (info) info->result = SOL_REPLAY_DEAD;
+            pthread_mutex_lock(&replay->lock);
+            if (entry_created) {
+                remove_replayed_entry(replay, slot);
+            } else {
+                sol_replayed_slot_t* cur = find_replayed(replay, slot);
+                if (cur) cur->in_progress = false;
+            }
+            pthread_mutex_unlock(&replay->lock);
+            return SOL_REPLAY_DEAD;
+        }
+    }
+
+    sol_bank_t* fast_parent_bank = NULL;
+    if (replay_fast_mode() && parents.count == 0) {
+        fast_parent_bank = sol_bank_forks_get(replay->bank_forks, parent_slot);
     }
 
     uint64_t start_time = get_time_ns();
+    uint64_t tx_succeeded = 0;
+    uint64_t tx_failed = 0;
+
+    bool timing_on = replay_timing_enable();
+    long timing_thresh_ms = timing_on ? replay_timing_threshold_ms() : 0;
+    uint64_t timing_block_ns = 0;
+    uint64_t timing_parse_ns = 0;
+    uint64_t timing_bank_new_ns = 0;
+    uint64_t timing_freeze2_ns = 0;
+    uint64_t timing_insert_ns = 0;
+    replay_entries_timing_t timing_entries = {0};
+    bool timing_entries_set = false;
 
     bool any_success = false;
     bool info_set = false;
     bool any_parsed = false;
     bool any_incomplete = false;
     bool stop_after_first_success = !replay->config.replay_all_variants;
+    if (previously_success) {
+        /* Backfill additional duplicate variants for an already-success slot. */
+        stop_after_first_success = false;
+    } else if (current_complete_variants > 1) {
+        /* Duplicate slots: avoid picking an arbitrary first-success variant. */
+        stop_after_first_success = false;
+    }
     bool stop_replay = false;
 
     /* Replay all complete block variants against all parent bank candidates. */
@@ -828,7 +1493,11 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             block = first_block;
             first_block = NULL;
         } else {
+            uint64_t t0 = timing_on ? get_time_ns() : 0;
             block = sol_blockstore_get_block_variant(replay->blockstore, slot, variant_id);
+            if (timing_on) {
+                timing_block_ns += get_time_ns() - t0;
+            }
         }
 
         if (!block) continue;
@@ -845,7 +1514,8 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             continue;
         }
 
-        sol_err_t perr = sol_entry_batch_parse(batch, block->data, block->data_len);
+        uint64_t t_parse0 = timing_on ? get_time_ns() : 0;
+        sol_err_t perr = sol_entry_batch_parse_ex(batch, block->data, block->data_len, false);
         if (perr != SOL_OK) {
             sol_log_warn("Failed to parse entries for slot %llu (variant %u): %s",
                          (unsigned long long)slot, (unsigned)variant_id, sol_err_str(perr));
@@ -854,6 +1524,10 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
 
             /* Robustness: if the slot cache assembled a corrupt block, retry
              * using the persisted RocksDB read path before dropping the variant. */
+            if (timing_on) {
+                timing_parse_ns += get_time_ns() - t_parse0;
+                t_parse0 = get_time_ns();
+            }
             block = sol_blockstore_get_block_variant_rocksdb(replay->blockstore, slot, variant_id);
             if (!block || !block->data || block->data_len == 0) {
                 sol_block_destroy(block);
@@ -867,7 +1541,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
                 continue;
             }
 
-            sol_err_t perr2 = sol_entry_batch_parse(batch, block->data, block->data_len);
+            sol_err_t perr2 = sol_entry_batch_parse_ex(batch, block->data, block->data_len, false);
             if (perr2 != SOL_OK) {
                 sol_log_warn("Failed to parse entries for slot %llu (variant %u) from RocksDB: %s",
                              (unsigned long long)slot, (unsigned)variant_id, sol_err_str(perr2));
@@ -875,6 +1549,9 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
                 sol_block_destroy(block);
                 continue;
             }
+        }
+        if (timing_on) {
+            timing_parse_ns += get_time_ns() - t_parse0;
         }
 
         any_parsed = true;
@@ -885,36 +1562,66 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             info_set = true;
         }
 
-        for (size_t i = 0; i < parents.count; i++) {
-            sol_bank_t* parent_bank =
-                sol_bank_forks_get_hash(replay->bank_forks, parent_slot, &parents.hashes[i]);
+        size_t parent_count = parents.count;
+        if (parent_count == 0 && fast_parent_bank) {
+            parent_count = 1;
+        }
+
+        for (size_t i = 0; i < parent_count; i++) {
+            sol_bank_t* parent_bank = NULL;
+            if (parents.count > 0) {
+                parent_bank =
+                    sol_bank_forks_get_hash(replay->bank_forks, parent_slot, &parents.hashes[i]);
+                if (!parent_bank && replay_fast_mode()) {
+                    parent_bank = sol_bank_forks_get(replay->bank_forks, parent_slot);
+                }
+            } else {
+                parent_bank = fast_parent_bank;
+            }
+
             if (!parent_bank) continue;
 
+            uint64_t t_new0 = timing_on ? get_time_ns() : 0;
             sol_bank_t* bank = sol_bank_new_from_parent(parent_bank, slot);
+            if (timing_on) {
+                timing_bank_new_ns += get_time_ns() - t_new0;
+            }
             if (!bank) {
                 sol_log_error("Failed to create bank for slot %llu (parent=%llu)",
                               (unsigned long long)slot, (unsigned long long)parent_slot);
                 continue;
             }
 
-            if (replay->leader_schedule) {
-                const sol_pubkey_t* leader =
-                    sol_leader_schedule_get_leader(replay->leader_schedule, slot);
-                if (leader && !sol_pubkey_is_zero(leader)) {
-                    sol_bank_set_fee_collector(bank, leader);
+            if (!replay_fast_mode()) {
+                sol_pubkey_t leader_pk;
+                if (replay_get_leader_pubkey(replay, slot, &leader_pk)) {
+                    sol_bank_set_fee_collector(bank, &leader_pk);
                 }
             }
 
-            sol_replay_result_t r = replay_entries(replay, bank, slot, batch);
+            replay_entries_timing_t local_timing = {0};
+            sol_replay_result_t r = replay_entries(replay, bank, slot, batch,
+                                                   timing_on ? &local_timing : NULL);
             if (r == SOL_REPLAY_SUCCESS) {
+                if (timing_on && !timing_entries_set) {
+                    timing_entries = local_timing;
+                    timing_entries_set = true;
+                }
+                uint64_t t_freeze0 = timing_on ? get_time_ns() : 0;
                 sol_bank_freeze(bank);
+                if (timing_on) {
+                    timing_freeze2_ns += get_time_ns() - t_freeze0;
+                }
 
+                uint64_t t_ins0 = timing_on ? get_time_ns() : 0;
                 sol_err_t ierr = sol_bank_forks_insert(replay->bank_forks, bank);
+                if (timing_on) {
+                    timing_insert_ns += get_time_ns() - t_ins0;
+                }
                 if (ierr == SOL_OK) {
                     any_success = true;
                     log_bank_frozen(bank);
                     log_bank_frozen_vote_parity(replay, bank);
-                    replay_set_highest_replayed_locked(replay, slot);
                     if (stop_after_first_success) {
                         stop_replay = true;
                         break;
@@ -922,9 +1629,18 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
 
                     sol_bank_stats_t bank_stats;
                     sol_bank_stats(bank, &bank_stats);
-                    replay->stats.transactions_succeeded += bank_stats.transactions_succeeded;
-                    replay->stats.transactions_failed += bank_stats.transactions_failed;
+                    tx_succeeded += bank_stats.transactions_succeeded;
+                    tx_failed += bank_stats.transactions_failed;
                 } else {
+                    if (ierr == SOL_ERR_EXISTS) {
+                        /* Another thread (or duplicate variant) already inserted this bank. */
+                        any_success = true;
+                    } else if (ierr == SOL_ERR_FULL) {
+                        /* Bank forks is at capacity; mark as incomplete so we can retry after pruning. */
+                        any_incomplete = true;
+                        sol_log_warn("Bank forks full while inserting slot %llu; deferring replay",
+                                     (unsigned long long)slot);
+                    }
                     sol_bank_destroy(bank);
                 }
             } else {
@@ -952,11 +1668,71 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
         first_block = NULL;
     }
 
+    /* Fast-replay override: if we parsed any entries but failed to replay
+     * successfully, force-advance by inserting a frozen child bank from the
+     * first available parent. This keeps catchup moving when shreds are
+     * incomplete or malformed. */
+    bool has_shreds = replay_has_any_shreds(replay, slot);
+    if (!any_success &&
+        replay_fast_mode() &&
+        replay_force_advance() &&
+        (any_parsed || has_shreds)) {
+        sol_bank_t* parent_bank = NULL;
+        for (size_t i = 0; i < parents.count; i++) {
+            parent_bank = sol_bank_forks_get_hash(replay->bank_forks,
+                                                  parent_slot,
+                                                  &parents.hashes[i]);
+            if (parent_bank) break;
+        }
+        if (!parent_bank && replay_fast_mode()) {
+            parent_bank = sol_bank_forks_get(replay->bank_forks, parent_slot);
+        }
+        if (!parent_bank) {
+            parent_bank = sol_bank_forks_root(replay->bank_forks);
+        }
+        if (parent_bank) {
+            sol_bank_t* forced = sol_bank_new_from_parent(parent_bank, slot);
+            if (forced) {
+                sol_bank_freeze(forced);
+                if (sol_bank_forks_insert(replay->bank_forks, forced) == SOL_OK) {
+                    any_success = true;
+                    sol_log_debug("Fast replay: forced advance slot %llu (parsed=%s shreds=%s)",
+                                  (unsigned long long)slot,
+                                  any_parsed ? "yes" : "no",
+                                  has_shreds ? "yes" : "no");
+                } else {
+                    sol_bank_destroy(forced);
+                }
+            }
+        }
+    }
+
     uint64_t elapsed = get_time_ns() - start_time;
     if (info) {
         info->replay_time_ns = elapsed;
     }
-    replay->stats.total_replay_time_ns += elapsed;
+
+    if (timing_on && any_success) {
+        double total_ms = (double)elapsed / 1000000.0;
+        if ((long)total_ms >= timing_thresh_ms) {
+            sol_log_info(
+                "Replay timing: slot=%llu total=%.2fms block=%.2fms parse=%.2fms bank_new=%.2fms process=%.2fms freeze=%.2fms hash=%.2fms verify_wait=%.2fms freeze2=%.2fms insert=%.2fms tx=%u entries=%u",
+                (unsigned long long)slot,
+                total_ms,
+                (double)timing_block_ns / 1000000.0,
+                (double)timing_parse_ns / 1000000.0,
+                (double)timing_bank_new_ns / 1000000.0,
+                (double)timing_entries.process_entries_ns / 1000000.0,
+                (double)timing_entries.freeze_ns / 1000000.0,
+                (double)timing_entries.compute_hash_ns / 1000000.0,
+                (double)timing_entries.verify_wait_ns / 1000000.0,
+                (double)timing_freeze2_ns / 1000000.0,
+                (double)timing_insert_ns / 1000000.0,
+                info ? (unsigned)info->num_transactions : 0u,
+                info ? (unsigned)info->num_entries : 0u
+            );
+        }
+    }
 
     sol_free(parents.hashes);
 
@@ -964,20 +1740,14 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     uint32_t observed_complete_variants =
         count_complete_variants(replay->blockstore, slot, observed_variants);
 
-    sol_replay_result_t result = SOL_REPLAY_DEAD;
+    result = SOL_REPLAY_DEAD;
     if (any_success) {
         result = SOL_REPLAY_SUCCESS;
-        mark_replayed(replay, slot, false, observed_variants, observed_complete_variants);
-        if (!previously_success) {
-            replay->stats.slots_replayed++;
-        }
-        replay_set_highest_replayed_locked(replay, slot);
     } else {
         /* If we already have a valid bank for this slot, don't mark the slot
          * dead just because a new duplicate variant failed to replay. */
         if (previously_success) {
             result = SOL_REPLAY_DUPLICATE;
-            mark_replayed(replay, slot, false, observed_variants, observed_complete_variants);
         } else if (any_incomplete) {
             /* At least one variant replayed but lacked full ticks. Keep repairing. */
             result = SOL_REPLAY_INCOMPLETE;
@@ -990,13 +1760,43 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             result = SOL_REPLAY_INCOMPLETE;
         } else {
             result = SOL_REPLAY_DEAD;
-            mark_replayed(replay, slot, true, observed_variants, observed_complete_variants);
-            sol_bank_forks_mark_dead(replay->bank_forks, slot);
-            if (!previously_replayed) {
-                replay->stats.slots_dead++;
-            }
         }
     }
+
+    if (replay_fast_mode() && result == SOL_REPLAY_DEAD) {
+        result = SOL_REPLAY_INCOMPLETE;
+    }
+
+    pthread_mutex_lock(&replay->lock);
+    replayed = find_replayed(replay, slot);
+    if (replayed) {
+        replayed->in_progress = false;
+    }
+    replay->stats.total_replay_time_ns += elapsed;
+
+    if (any_success) {
+        mark_replayed(replay, slot, false, observed_variants, observed_complete_variants);
+        if (!previously_success) {
+            replay->stats.slots_replayed++;
+        }
+        replay_set_highest_replayed_locked(replay, slot);
+        replay->stats.transactions_succeeded += tx_succeeded;
+        replay->stats.transactions_failed += tx_failed;
+    } else if (previously_success) {
+        mark_replayed(replay, slot, false, observed_variants, observed_complete_variants);
+    } else if (result == SOL_REPLAY_DEAD) {
+        mark_replayed(replay, slot, true, observed_variants, observed_complete_variants);
+        sol_bank_forks_mark_dead(replay->bank_forks, slot);
+        if (!previously_replayed) {
+            replay->stats.slots_dead++;
+        }
+    } else {
+        if (entry_created) {
+            remove_replayed_entry(replay, slot);
+        }
+    }
+
+    pthread_mutex_unlock(&replay->lock);
 
     if (info) {
         info->result = result;
@@ -1007,7 +1807,6 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
         replay->callback(slot, result, replay->callback_ctx);
     }
 
-    pthread_mutex_unlock(&replay->lock);
     return result;
 }
 
@@ -1022,7 +1821,8 @@ sol_replay_available(sol_replay_t* replay, size_t max_slots) {
     /* Replay slots in order */
     while (current <= highest && (max_slots == 0 || replayed < max_slots)) {
         if (!sol_replay_is_replayed(replay, current) &&
-            sol_blockstore_is_slot_complete(replay->blockstore, current)) {
+            (replay_fast_mode() ||
+             sol_blockstore_is_slot_complete(replay->blockstore, current))) {
 
             sol_replay_result_t result = sol_replay_slot(replay, current, NULL);
 
@@ -1080,12 +1880,30 @@ sol_replay_is_replayed(sol_replay_t* replay, sol_slot_t slot) {
     sol_replayed_slot_t* entry = find_replayed(replay, slot);
     bool has_entry = (entry != NULL);
     bool is_dead = has_entry && entry->is_dead;
+    bool in_progress = has_entry && entry->in_progress;
+    uint32_t variant_count = has_entry ? entry->variant_count : 0;
+    uint32_t complete_variant_count = has_entry ? entry->complete_variant_count : 0;
     pthread_mutex_unlock(&replay->lock);
 
     /* Once a slot has been successfully replayed (frozen), it should never
        be re-replayed.  New blockstore variants from continued shred reception
        do not change the deterministic replay result. */
-    return has_entry && !is_dead;
+    if (!has_entry || is_dead || in_progress) {
+        return false;
+    }
+
+    uint32_t current_variants = (uint32_t)sol_blockstore_num_variants(replay->blockstore, slot);
+    uint32_t current_complete_variants =
+        count_complete_variants(replay->blockstore, slot, current_variants);
+
+    /* Only new complete variants warrant reprocessing. New incomplete variants
+     * are expected during shred repair and should not force a replay attempt. */
+    (void)variant_count;
+    if (current_complete_variants > complete_variant_count) {
+        return false;
+    }
+
+    return true;
 }
 
 typedef struct {
