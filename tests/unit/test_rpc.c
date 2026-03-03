@@ -285,6 +285,8 @@ TEST(rpc_backpressure_method_shedding) {
     const char* cheap_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getVersion\"}";
     const char* heavy_req =
         "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"getProgramAccounts\",\"params\":[]}";
+    const char* heavy_req2 =
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"simulateTransaction\",\"params\":[]}";
 
     sol_rpc_set_backpressure_mode(rpc, 2u);
 
@@ -305,6 +307,21 @@ TEST(rpc_backpressure_method_shedding) {
     ASSERT(strstr(resp2, "\"code\":-32020") != NULL);
     sol_json_builder_destroy(b2);
 
+    sol_json_builder_t* b2b = sol_json_builder_new(512);
+    ASSERT(b2b != NULL);
+    sol_rpc_handle_request_json(rpc, heavy_req2, strlen(heavy_req2), b2b);
+    const char* resp2b = sol_json_builder_str(b2b);
+    ASSERT(resp2b != NULL);
+    ASSERT(strstr(resp2b, "\"error\"") != NULL);
+    ASSERT(strstr(resp2b, "\"code\":-32020") != NULL);
+    sol_json_builder_destroy(b2b);
+
+    sol_rpc_backpressure_stats_t bp = {0};
+    sol_rpc_backpressure_stats(rpc, &bp);
+    ASSERT(bp.dropped_total == 2);
+    ASSERT(bp.dropped_get_program_accounts == 1);
+    ASSERT(bp.dropped_simulate_transaction == 1);
+
     sol_rpc_set_backpressure_mode(rpc, 0u);
 
     sol_json_builder_t* b3 = sol_json_builder_new(512);
@@ -315,6 +332,10 @@ TEST(rpc_backpressure_method_shedding) {
     ASSERT(strstr(resp3, "\"error\"") != NULL);
     ASSERT(strstr(resp3, "\"code\":-32020") == NULL);
     sol_json_builder_destroy(b3);
+
+    sol_rpc_backpressure_stats_t bp_after = {0};
+    sol_rpc_backpressure_stats(rpc, &bp_after);
+    ASSERT(bp_after.dropped_total == 2);
 
     sol_rpc_destroy(rpc);
 }

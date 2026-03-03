@@ -93,6 +93,20 @@ typedef struct {
     bool                    active;
 } sol_http_client_t;
 
+typedef enum {
+    RPC_BP_METHOD_GET_PROGRAM_ACCOUNTS = 0,
+    RPC_BP_METHOD_GET_TOKEN_ACCOUNTS_BY_OWNER = 1,
+    RPC_BP_METHOD_GET_SIGNATURES_FOR_ADDRESS = 2,
+    RPC_BP_METHOD_GET_MULTIPLE_ACCOUNTS = 3,
+    RPC_BP_METHOD_GET_BLOCKS = 4,
+    RPC_BP_METHOD_GET_BLOCKS_WITH_LIMIT = 5,
+    RPC_BP_METHOD_GET_BLOCK = 6,
+    RPC_BP_METHOD_GET_TRANSACTION = 7,
+    RPC_BP_METHOD_SIMULATE_TRANSACTION = 8,
+    RPC_BP_METHOD_OTHER = 9,
+    RPC_BP_METHOD_COUNT = 10,
+} rpc_backpressure_method_t;
+
 /*
  * RPC server structure
  */
@@ -140,6 +154,8 @@ struct sol_rpc {
     uint32_t                rate_limit_burst_runtime;
     uint64_t                rate_last_ms;
     uint64_t                rate_tokens_milli;  /* tokens * 1000 */
+    uint64_t                backpressure_dropped_total;
+    uint64_t                backpressure_dropped_by_method[RPC_BP_METHOD_COUNT];
 
     /* Stats */
     sol_rpc_stats_t         stats;
@@ -245,22 +261,51 @@ rpc_rate_limit_allow(sol_rpc_t* rpc) {
     return true;
 }
 
-static bool
-rpc_method_blocked_under_backpressure(const char* method) {
-    if (!method || method[0] == '\0') return false;
+static rpc_backpressure_method_t
+rpc_backpressure_method_classify(const char* method, bool* blocked) {
+    if (blocked) *blocked = false;
+    if (!method || method[0] == '\0') {
+        return RPC_BP_METHOD_OTHER;
+    }
 
-    /* Keep core validator-critical methods available while shedding expensive
-     * historical scans and large account/range queries. */
-    return
-        strcmp(method, "getProgramAccounts") == 0 ||
-        strcmp(method, "getTokenAccountsByOwner") == 0 ||
-        strcmp(method, "getSignaturesForAddress") == 0 ||
-        strcmp(method, "getMultipleAccounts") == 0 ||
-        strcmp(method, "getBlocks") == 0 ||
-        strcmp(method, "getBlocksWithLimit") == 0 ||
-        strcmp(method, "getBlock") == 0 ||
-        strcmp(method, "getTransaction") == 0 ||
-        strcmp(method, "simulateTransaction") == 0;
+    if (strcmp(method, "getProgramAccounts") == 0) {
+        if (blocked) *blocked = true;
+        return RPC_BP_METHOD_GET_PROGRAM_ACCOUNTS;
+    }
+    if (strcmp(method, "getTokenAccountsByOwner") == 0) {
+        if (blocked) *blocked = true;
+        return RPC_BP_METHOD_GET_TOKEN_ACCOUNTS_BY_OWNER;
+    }
+    if (strcmp(method, "getSignaturesForAddress") == 0) {
+        if (blocked) *blocked = true;
+        return RPC_BP_METHOD_GET_SIGNATURES_FOR_ADDRESS;
+    }
+    if (strcmp(method, "getMultipleAccounts") == 0) {
+        if (blocked) *blocked = true;
+        return RPC_BP_METHOD_GET_MULTIPLE_ACCOUNTS;
+    }
+    if (strcmp(method, "getBlocks") == 0) {
+        if (blocked) *blocked = true;
+        return RPC_BP_METHOD_GET_BLOCKS;
+    }
+    if (strcmp(method, "getBlocksWithLimit") == 0) {
+        if (blocked) *blocked = true;
+        return RPC_BP_METHOD_GET_BLOCKS_WITH_LIMIT;
+    }
+    if (strcmp(method, "getBlock") == 0) {
+        if (blocked) *blocked = true;
+        return RPC_BP_METHOD_GET_BLOCK;
+    }
+    if (strcmp(method, "getTransaction") == 0) {
+        if (blocked) *blocked = true;
+        return RPC_BP_METHOD_GET_TRANSACTION;
+    }
+    if (strcmp(method, "simulateTransaction") == 0) {
+        if (blocked) *blocked = true;
+        return RPC_BP_METHOD_SIMULATE_TRANSACTION;
+    }
+
+    return RPC_BP_METHOD_OTHER;
 }
 
 /*
@@ -3927,14 +3972,19 @@ sol_rpc_handle_request_json(sol_rpc_t* rpc, const char* body, size_t body_len,
     uint8_t backpressure_mode = rpc
         ? __atomic_load_n(&rpc->backpressure_mode_runtime, __ATOMIC_ACQUIRE)
         : 0u;
+    bool backpressure_blocked = false;
+    rpc_backpressure_method_t backpressure_method =
+        rpc_backpressure_method_classify(method, &backpressure_blocked);
     if (rpc &&
         rpc->backpressure_reject_mode != 0u &&
         backpressure_mode >= rpc->backpressure_reject_mode &&
-        rpc_method_blocked_under_backpressure(method)) {
+        backpressure_blocked) {
         rpc_error_response(response,
                            &id,
                            SOL_RPC_ERR_RATE_LIMITED,
                            "RPC backpressure: method temporarily disabled");
+        __atomic_fetch_add(&rpc->backpressure_dropped_total, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&rpc->backpressure_dropped_by_method[backpressure_method], 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&rpc->stats.requests_total, 1, __ATOMIC_RELAXED);
         __atomic_fetch_add(&rpc->stats.requests_failed, 1, __ATOMIC_RELAXED);
         return;
@@ -5282,6 +5332,36 @@ sol_rpc_stats(const sol_rpc_t* rpc) {
         stats.ws_subscriptions = __atomic_load_n(&rpc->stats.ws_subscriptions, __ATOMIC_RELAXED);
     }
     return stats;
+}
+
+void
+sol_rpc_backpressure_stats(const sol_rpc_t* rpc, sol_rpc_backpressure_stats_t* stats) {
+    if (!stats) return;
+    memset(stats, 0, sizeof(*stats));
+    if (!rpc) return;
+
+    stats->dropped_total =
+        __atomic_load_n(&rpc->backpressure_dropped_total, __ATOMIC_RELAXED);
+    stats->dropped_get_program_accounts =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_GET_PROGRAM_ACCOUNTS], __ATOMIC_RELAXED);
+    stats->dropped_get_token_accounts_by_owner =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_GET_TOKEN_ACCOUNTS_BY_OWNER], __ATOMIC_RELAXED);
+    stats->dropped_get_signatures_for_address =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_GET_SIGNATURES_FOR_ADDRESS], __ATOMIC_RELAXED);
+    stats->dropped_get_multiple_accounts =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_GET_MULTIPLE_ACCOUNTS], __ATOMIC_RELAXED);
+    stats->dropped_get_blocks =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_GET_BLOCKS], __ATOMIC_RELAXED);
+    stats->dropped_get_blocks_with_limit =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_GET_BLOCKS_WITH_LIMIT], __ATOMIC_RELAXED);
+    stats->dropped_get_block =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_GET_BLOCK], __ATOMIC_RELAXED);
+    stats->dropped_get_transaction =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_GET_TRANSACTION], __ATOMIC_RELAXED);
+    stats->dropped_simulate_transaction =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_SIMULATE_TRANSACTION], __ATOMIC_RELAXED);
+    stats->dropped_other =
+        __atomic_load_n(&rpc->backpressure_dropped_by_method[RPC_BP_METHOD_OTHER], __ATOMIC_RELAXED);
 }
 
 void

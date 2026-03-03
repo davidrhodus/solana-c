@@ -289,6 +289,7 @@ typedef struct {
     sol_metric_t*         metric_shreds_received;
     sol_metric_t*         metric_peers_connected;
     sol_metric_t*         metric_votes_submitted;
+    sol_metric_t*         metric_rpc_backpressure_dropped;
 
     /* State */
     bool                is_leader;
@@ -5100,6 +5101,12 @@ validator_init(validator_t* v) {
             v->metric_votes_submitted = sol_metric_counter_register(
                 v->prometheus, SOL_METRIC_VOTES_SUBMITTED,
                 "Total votes submitted", NULL);
+            static const char* rpc_bp_labels[] = {"method", NULL};
+            v->metric_rpc_backpressure_dropped = sol_metric_counter_register(
+                v->prometheus,
+                "solana_rpc_backpressure_dropped_total",
+                "RPC requests dropped by backpressure mode",
+                rpc_bp_labels);
         }
     }
 
@@ -5804,6 +5811,11 @@ validator_parse_env_u64(const char* name, uint64_t* out) {
     return true;
 }
 
+static uint64_t
+validator_counter_delta_u64(uint64_t current, uint64_t previous) {
+    return (current >= previous) ? (current - previous) : current;
+}
+
 static validator_rpc_backpressure_config_t
 validator_rpc_backpressure_config(void) {
     validator_rpc_backpressure_config_t cfg = {
@@ -5942,6 +5954,7 @@ validator_run(validator_t* v) {
     bool rpc_backpressure_cfg_logged = false;
     uint8_t rpc_backpressure_mode = 0;
     validator_rpc_backpressure_config_t rpc_backpressure_cfg = {0};
+    sol_rpc_backpressure_stats_t last_rpc_bp_stats = {0};
     const uint64_t stats_period_ns = 10ULL * 1000ULL * 1000ULL * 1000ULL;
     const uint64_t root_period_ns = 1ULL * 1000ULL * 1000ULL * 1000ULL;
     uint64_t root_purge_period_ns = 15ULL * 1000ULL * 1000ULL * 1000ULL; /* 15s */
@@ -6429,6 +6442,12 @@ validator_run(validator_t* v) {
                 sol_repair_stats(v->repair, &repair_stats);
                 repair_pending = sol_repair_pending_count(v->repair);
             }
+            sol_rpc_stats_t rpc_stats = {0};
+            sol_rpc_backpressure_stats_t rpc_bp_stats = {0};
+            if (v->rpc) {
+                rpc_stats = sol_rpc_stats(v->rpc);
+                sol_rpc_backpressure_stats(v->rpc, &rpc_bp_stats);
+            }
 
 	            sol_slot_t highest_replayed = v->replay ? sol_replay_highest_replayed_slot(v->replay) : 0;
 	            sol_slot_t catchup_next = highest_replayed ? (highest_replayed + 1) : 0;
@@ -6508,6 +6527,89 @@ validator_run(validator_t* v) {
                     sol_metric_gauge_set(v->metric_peers_connected,
                         (double)sol_gossip_num_peers(v->gossip), NULL);
                 }
+                if (v->metric_rpc_backpressure_dropped && v->rpc) {
+                    uint64_t d_total = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_total, last_rpc_bp_stats.dropped_total);
+                    uint64_t d_gpa = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_get_program_accounts,
+                        last_rpc_bp_stats.dropped_get_program_accounts);
+                    uint64_t d_tok_owner = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_get_token_accounts_by_owner,
+                        last_rpc_bp_stats.dropped_get_token_accounts_by_owner);
+                    uint64_t d_sig_addr = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_get_signatures_for_address,
+                        last_rpc_bp_stats.dropped_get_signatures_for_address);
+                    uint64_t d_multi = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_get_multiple_accounts,
+                        last_rpc_bp_stats.dropped_get_multiple_accounts);
+                    uint64_t d_blocks = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_get_blocks,
+                        last_rpc_bp_stats.dropped_get_blocks);
+                    uint64_t d_blocks_limit = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_get_blocks_with_limit,
+                        last_rpc_bp_stats.dropped_get_blocks_with_limit);
+                    uint64_t d_block = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_get_block,
+                        last_rpc_bp_stats.dropped_get_block);
+                    uint64_t d_tx = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_get_transaction,
+                        last_rpc_bp_stats.dropped_get_transaction);
+                    uint64_t d_sim = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_simulate_transaction,
+                        last_rpc_bp_stats.dropped_simulate_transaction);
+                    uint64_t d_other = validator_counter_delta_u64(
+                        rpc_bp_stats.dropped_other,
+                        last_rpc_bp_stats.dropped_other);
+
+                    if (d_total > 0) {
+                        const char* labels[] = {"total", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_total, labels);
+                    }
+                    if (d_gpa > 0) {
+                        const char* labels[] = {"getProgramAccounts", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_gpa, labels);
+                    }
+                    if (d_tok_owner > 0) {
+                        const char* labels[] = {"getTokenAccountsByOwner", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_tok_owner, labels);
+                    }
+                    if (d_sig_addr > 0) {
+                        const char* labels[] = {"getSignaturesForAddress", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_sig_addr, labels);
+                    }
+                    if (d_multi > 0) {
+                        const char* labels[] = {"getMultipleAccounts", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_multi, labels);
+                    }
+                    if (d_blocks > 0) {
+                        const char* labels[] = {"getBlocks", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_blocks, labels);
+                    }
+                    if (d_blocks_limit > 0) {
+                        const char* labels[] = {"getBlocksWithLimit", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_blocks_limit, labels);
+                    }
+                    if (d_block > 0) {
+                        const char* labels[] = {"getBlock", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_block, labels);
+                    }
+                    if (d_tx > 0) {
+                        const char* labels[] = {"getTransaction", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_tx, labels);
+                    }
+                    if (d_sim > 0) {
+                        const char* labels[] = {"simulateTransaction", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_sim, labels);
+                    }
+                    if (d_other > 0) {
+                        const char* labels[] = {"other", NULL};
+                        sol_metric_counter_add(v->metric_rpc_backpressure_dropped, (double)d_other, labels);
+                    }
+                }
+            }
+
+            if (v->rpc) {
+                last_rpc_bp_stats = rpc_bp_stats;
             }
 
             size_t peers = v->gossip ? sol_gossip_num_peers(v->gossip) : 0;
@@ -6553,6 +6655,24 @@ validator_run(validator_t* v) {
                 (unsigned long)repair_stats.duplicates,
                 (unsigned long)repair_stats.invalid_responses,
                 (unsigned long)votes_count);
+
+            if (v->rpc) {
+                sol_log_info("RPC: req_total=%lu ok=%lu fail=%lu active=%lu ws=%lu subs=%lu "
+                             "bp_drop_total=%lu gpa=%lu token_owner=%lu sig_addr=%lu tx=%lu sim=%lu other=%lu",
+                             (unsigned long)rpc_stats.requests_total,
+                             (unsigned long)rpc_stats.requests_success,
+                             (unsigned long)rpc_stats.requests_failed,
+                             (unsigned long)rpc_stats.active_connections,
+                             (unsigned long)rpc_stats.ws_connections,
+                             (unsigned long)rpc_stats.ws_subscriptions,
+                             (unsigned long)rpc_bp_stats.dropped_total,
+                             (unsigned long)rpc_bp_stats.dropped_get_program_accounts,
+                             (unsigned long)rpc_bp_stats.dropped_get_token_accounts_by_owner,
+                             (unsigned long)rpc_bp_stats.dropped_get_signatures_for_address,
+                             (unsigned long)rpc_bp_stats.dropped_get_transaction,
+                             (unsigned long)rpc_bp_stats.dropped_simulate_transaction,
+                             (unsigned long)rpc_bp_stats.dropped_other);
+            }
 
         }
 

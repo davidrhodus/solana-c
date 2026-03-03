@@ -146,6 +146,23 @@ typedef struct {
 } sol_rpc_stats_t;
 
 /*
+ * RPC backpressure drop counters (monotonic)
+ */
+typedef struct {
+    uint64_t    dropped_total;
+    uint64_t    dropped_get_program_accounts;
+    uint64_t    dropped_get_token_accounts_by_owner;
+    uint64_t    dropped_get_signatures_for_address;
+    uint64_t    dropped_get_multiple_accounts;
+    uint64_t    dropped_get_blocks;
+    uint64_t    dropped_get_blocks_with_limit;
+    uint64_t    dropped_get_block;
+    uint64_t    dropped_get_transaction;
+    uint64_t    dropped_simulate_transaction;
+    uint64_t    dropped_other;
+} sol_rpc_backpressure_stats_t;
+
+/*
  * WebSocket subscription types
  */
 typedef enum {
@@ -210,6 +227,14 @@ bool sol_rpc_is_running(const sol_rpc_t* rpc);
  * Get server stats
  */
 sol_rpc_stats_t sol_rpc_stats(const sol_rpc_t* rpc);
+
+/*
+ * Get RPC backpressure drop counters.
+ */
+void sol_rpc_backpressure_stats(
+    const sol_rpc_t*               rpc,
+    sol_rpc_backpressure_stats_t*  stats
+);
 
 /*
  * Set bank forks for state queries.
