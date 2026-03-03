@@ -5914,6 +5914,7 @@ validator_rpc_backpressure_apply(validator_t* v,
 
     sol_rpc_set_rate_limit(v->rpc, rps, 0u);
     sol_rpc_set_max_connections(v->rpc, max_conn);
+    sol_rpc_set_backpressure_mode(v->rpc, mode);
 
     sol_log_info("RPC backpressure mode=%s lag=%lu blockstore_highest=%lu replayed=%lu "
                  "rate_limit_rps=%u max_conn=%lu",

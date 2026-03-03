@@ -278,6 +278,47 @@ TEST(rpc_dynamic_rate_limit) {
     sol_rpc_destroy(rpc);
 }
 
+TEST(rpc_backpressure_method_shedding) {
+    sol_rpc_t* rpc = sol_rpc_new(NULL, NULL);
+    ASSERT(rpc != NULL);
+
+    const char* cheap_req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getVersion\"}";
+    const char* heavy_req =
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"getProgramAccounts\",\"params\":[]}";
+
+    sol_rpc_set_backpressure_mode(rpc, 2u);
+
+    sol_json_builder_t* b1 = sol_json_builder_new(512);
+    ASSERT(b1 != NULL);
+    sol_rpc_handle_request_json(rpc, cheap_req, strlen(cheap_req), b1);
+    const char* resp1 = sol_json_builder_str(b1);
+    ASSERT(resp1 != NULL);
+    ASSERT(strstr(resp1, "\"result\"") != NULL);
+    sol_json_builder_destroy(b1);
+
+    sol_json_builder_t* b2 = sol_json_builder_new(512);
+    ASSERT(b2 != NULL);
+    sol_rpc_handle_request_json(rpc, heavy_req, strlen(heavy_req), b2);
+    const char* resp2 = sol_json_builder_str(b2);
+    ASSERT(resp2 != NULL);
+    ASSERT(strstr(resp2, "\"error\"") != NULL);
+    ASSERT(strstr(resp2, "\"code\":-32020") != NULL);
+    sol_json_builder_destroy(b2);
+
+    sol_rpc_set_backpressure_mode(rpc, 0u);
+
+    sol_json_builder_t* b3 = sol_json_builder_new(512);
+    ASSERT(b3 != NULL);
+    sol_rpc_handle_request_json(rpc, heavy_req, strlen(heavy_req), b3);
+    const char* resp3 = sol_json_builder_str(b3);
+    ASSERT(resp3 != NULL);
+    ASSERT(strstr(resp3, "\"error\"") != NULL);
+    ASSERT(strstr(resp3, "\"code\":-32020") == NULL);
+    sol_json_builder_destroy(b3);
+
+    sol_rpc_destroy(rpc);
+}
+
 static size_t
 test_base64_encode(const uint8_t* input, size_t input_len, char* output, size_t output_max) {
     static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -617,6 +658,7 @@ int main(void) {
     RUN_TEST(rpc_stats);
     RUN_TEST(rpc_rate_limiting);
     RUN_TEST(rpc_dynamic_rate_limit);
+    RUN_TEST(rpc_backpressure_method_shedding);
     RUN_TEST(rpc_send_transaction_invokes_callback);
     RUN_TEST(rpc_get_health_uses_callback);
     RUN_TEST(rpc_get_epoch_schedule);

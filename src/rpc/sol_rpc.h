@@ -288,6 +288,19 @@ void sol_rpc_set_max_connections(
 );
 
 /*
+ * Set RPC backpressure mode (used for method-level load shedding).
+ *
+ * mode:
+ *   0 = normal
+ *   1 = high backlog
+ *   2 = severe backlog
+ */
+void sol_rpc_set_backpressure_mode(
+    sol_rpc_t*  rpc,
+    uint8_t     mode
+);
+
+/*
  * WebSocket subscription notifications
  *
  * These functions notify subscribed clients of state changes.

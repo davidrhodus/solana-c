@@ -99,6 +99,8 @@ typedef struct {
 struct sol_rpc {
     sol_rpc_config_t        config;
     size_t                  max_connections_runtime;
+    uint8_t                 backpressure_reject_mode;
+    uint8_t                 backpressure_mode_runtime;
     sol_bank_forks_t*       bank_forks;
     sol_blockstore_t*       blockstore;
     struct sol_gossip*      gossip;
@@ -241,6 +243,24 @@ rpc_rate_limit_allow(sol_rpc_t* rpc) {
     rpc->rate_tokens_milli -= 1000ULL;
     pthread_mutex_unlock(&rpc->rate_lock);
     return true;
+}
+
+static bool
+rpc_method_blocked_under_backpressure(const char* method) {
+    if (!method || method[0] == '\0') return false;
+
+    /* Keep core validator-critical methods available while shedding expensive
+     * historical scans and large account/range queries. */
+    return
+        strcmp(method, "getProgramAccounts") == 0 ||
+        strcmp(method, "getTokenAccountsByOwner") == 0 ||
+        strcmp(method, "getSignaturesForAddress") == 0 ||
+        strcmp(method, "getMultipleAccounts") == 0 ||
+        strcmp(method, "getBlocks") == 0 ||
+        strcmp(method, "getBlocksWithLimit") == 0 ||
+        strcmp(method, "getBlock") == 0 ||
+        strcmp(method, "getTransaction") == 0 ||
+        strcmp(method, "simulateTransaction") == 0;
 }
 
 /*
@@ -3904,6 +3924,22 @@ sol_rpc_handle_request_json(sol_rpc_t* rpc, const char* body, size_t body_len,
         return;
     }
 
+    uint8_t backpressure_mode = rpc
+        ? __atomic_load_n(&rpc->backpressure_mode_runtime, __ATOMIC_ACQUIRE)
+        : 0u;
+    if (rpc &&
+        rpc->backpressure_reject_mode != 0u &&
+        backpressure_mode >= rpc->backpressure_reject_mode &&
+        rpc_method_blocked_under_backpressure(method)) {
+        rpc_error_response(response,
+                           &id,
+                           SOL_RPC_ERR_RATE_LIMITED,
+                           "RPC backpressure: method temporarily disabled");
+        __atomic_fetch_add(&rpc->stats.requests_total, 1, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&rpc->stats.requests_failed, 1, __ATOMIC_RELAXED);
+        return;
+    }
+
     /* Route to method handler */
     if (strcmp(method, "getVersion") == 0) {
         handle_get_version(rpc, response, &id);
@@ -5010,6 +5046,17 @@ sol_rpc_new(sol_bank_forks_t* bank_forks, const sol_rpc_config_t* config) {
     }
 
     rpc->max_connections_runtime = rpc->config.max_connections;
+    rpc->backpressure_mode_runtime = 0u;
+    rpc->backpressure_reject_mode = 2u; /* default: shed expensive methods only in severe mode */
+    const char* reject_mode_env = getenv("SOL_RPC_BACKPRESSURE_REJECT_MODE");
+    if (reject_mode_env && reject_mode_env[0] != '\0') {
+        char* end = NULL;
+        unsigned long v = strtoul(reject_mode_env, &end, 10);
+        if (end && end != reject_mode_env) {
+            if (v > 2ul) v = 2ul;
+            rpc->backpressure_reject_mode = (uint8_t)v;
+        }
+    }
     rpc->bank_forks = bank_forks;
     rpc->listen_fd = -1;
     rpc->ws_listen_fd = -1;
@@ -5326,4 +5373,11 @@ void
 sol_rpc_set_max_connections(sol_rpc_t* rpc, size_t max_connections) {
     if (!rpc) return;
     __atomic_store_n(&rpc->max_connections_runtime, max_connections, __ATOMIC_RELEASE);
+}
+
+void
+sol_rpc_set_backpressure_mode(sol_rpc_t* rpc, uint8_t mode) {
+    if (!rpc) return;
+    if (mode > 2u) mode = 2u;
+    __atomic_store_n(&rpc->backpressure_mode_runtime, mode, __ATOMIC_RELEASE);
 }
