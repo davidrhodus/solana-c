@@ -219,13 +219,13 @@ replay_verify_worker_count(void) {
         return cached;
     }
 
-    /* Scale verify workers with CPU count by default, but keep headroom for
-     * tx execution/replay workers to avoid scheduler starvation tails. */
+    /* Scale verify workers with CPU count by default, but keep enough headroom
+     * for tx execution/replay workers on high-core boxes. */
     uint32_t workers = 8;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu > 0) {
-        uint32_t scaled = (uint32_t)(ncpu / 4);
-        if (scaled < 8u) scaled = 8u;
+        uint32_t scaled = (uint32_t)(ncpu / 8);
+        if (scaled < 4u) scaled = 4u;
         workers = scaled;
     }
     const char* env = getenv("SOL_REPLAY_VERIFY_WORKERS");
@@ -238,7 +238,7 @@ replay_verify_worker_count(void) {
     }
 
     if (workers < 1u) workers = 1u;
-    if (workers > 48u) workers = 48u;
+    if (workers > 32u) workers = 32u;
     cached = workers;
     return cached;
 }
@@ -352,6 +352,18 @@ replay_find_slot_parent(sol_replay_t* replay, sol_slot_t slot, sol_slot_t* out_p
         num_variants = 1;
     }
 
+    /* Prefer metadata-only lookup: this avoids assembling/loading full block
+     * payloads in the replay scheduling hot path. */
+    for (uint32_t variant_id = 0; variant_id < (uint32_t)num_variants; variant_id++) {
+        sol_slot_meta_t meta;
+        if (sol_blockstore_get_slot_meta_variant(replay->blockstore, slot, variant_id, &meta) != SOL_OK) {
+            continue;
+        }
+        *out_parent_slot = meta.parent_slot;
+        return true;
+    }
+
+    /* Fallback for ledgers that may have block data without variant metadata. */
     for (uint32_t variant_id = 0; variant_id < (uint32_t)num_variants; variant_id++) {
         sol_block_t* block = sol_blockstore_get_block_variant(replay->blockstore, slot, variant_id);
         if (!block) continue;

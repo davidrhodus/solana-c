@@ -360,27 +360,92 @@ tvu_cpu_count(void) {
     return (uint32_t)n;
 }
 
+typedef enum {
+    TVU_THREAD_ROLE_VERIFY = 0,
+    TVU_THREAD_ROLE_REPLAY = 1,
+    TVU_THREAD_ROLE_REPAIR = 2,
+} tvu_thread_role_t;
+
+static const char*
+tvu_thread_override_env(tvu_thread_role_t role) {
+    switch (role) {
+        case TVU_THREAD_ROLE_VERIFY:
+            return "SOL_TVU_SHRED_VERIFY_THREADS";
+        case TVU_THREAD_ROLE_REPLAY:
+            return "SOL_TVU_REPLAY_THREADS";
+        case TVU_THREAD_ROLE_REPAIR:
+            return "SOL_TVU_REPAIR_THREADS";
+        default:
+            return NULL;
+    }
+}
+
 static uint32_t
-tvu_pick_threads(uint32_t requested, uint32_t max_threads, uint32_t min_auto) {
-    uint32_t threads = requested;
-    if (threads == 0) {
-        uint32_t cpu_count = tvu_cpu_count();
-        threads = cpu_count;
+tvu_auto_threads_for_role(uint32_t cpu_count, tvu_thread_role_t role) {
+    uint32_t threads = cpu_count;
+
+    if (role == TVU_THREAD_ROLE_REPLAY) {
+        /* Replay slot selection has shared locks and parent checks; keep
+         * defaults tighter than verify/repair to reduce scheduler contention
+         * on large-core machines. */
+        if (threads >= 128u) {
+            threads /= 16u; /* 128c -> 8 threads */
+        } else if (threads >= 96u) {
+            threads /= 12u; /* 96c -> 8 threads */
+        } else if (threads >= 64u) {
+            threads /= 8u;  /* 64c -> 8 threads */
+        } else if (threads >= 48u) {
+            threads /= 6u;  /* 48c -> 8 threads */
+        } else if (threads >= 24u) {
+            threads /= 4u;
+        } else if (threads >= 12u) {
+            threads /= 3u;
+        } else if (threads >= 4u) {
+            threads /= 2u;
+        }
+    } else {
         /* Avoid oversubscription: replay also runs a large tx worker pool.
          * Very high TVU worker counts can increase tail latency via scheduler
          * contention even when median slot time looks healthy. */
         if (threads >= 128u) {
-            threads /= 4u; /* 128c -> 32 threads */
+            threads /= 8u; /* 128c -> 16 threads */
         } else if (threads >= 96u) {
-            threads /= 3u; /* 96c -> 32 threads */
+            threads /= 6u; /* 96c -> 16 threads */
         } else if (threads >= 64u) {
-            threads = (threads * 3u) / 8u; /* 64c -> 24 threads */
+            threads /= 4u; /* 64c -> 16 threads */
         } else if (threads >= 48u) {
             threads /= 3u;
         } else if (threads >= 24u) {
             threads /= 2u;
         }
-        if (threads < min_auto && cpu_count > 1) {
+    }
+
+    return threads;
+}
+
+static uint32_t
+tvu_pick_threads(uint32_t requested,
+                 uint32_t max_threads,
+                 uint32_t min_auto,
+                 tvu_thread_role_t role) {
+    uint32_t threads = requested;
+    if (threads == 0) {
+        uint32_t cpu_count = tvu_cpu_count();
+        bool env_override = false;
+        threads = tvu_auto_threads_for_role(cpu_count, role);
+
+        const char* env_name = tvu_thread_override_env(role);
+        const char* env = env_name ? getenv(env_name) : NULL;
+        if (env && env[0] != '\0') {
+            char* end = NULL;
+            unsigned long parsed = strtoul(env, &end, 10);
+            if (end && end != env) {
+                threads = (uint32_t)parsed;
+                env_override = true;
+            }
+        }
+
+        if (!env_override && threads < min_auto && cpu_count > 1) {
             threads = min_auto;
         }
     }
@@ -391,6 +456,46 @@ tvu_pick_threads(uint32_t requested, uint32_t max_threads, uint32_t min_auto) {
         threads = max_threads;
     }
     return threads;
+}
+
+static void
+tvu_collect_smallest_slot_candidates(sol_slot_t* slots,
+                                     size_t* count,
+                                     size_t cap,
+                                     sol_slot_t slot,
+                                     sol_slot_t* max_slot,
+                                     size_t* max_idx) {
+    if (!slots || !count || cap == 0 || !max_slot || !max_idx || slot == 0) {
+        return;
+    }
+
+    if (*count < cap) {
+        size_t idx = *count;
+        slots[idx] = slot;
+        if (idx == 0 || slot > *max_slot) {
+            *max_slot = slot;
+            *max_idx = idx;
+        }
+        (*count)++;
+        return;
+    }
+
+    if (slot >= *max_slot) {
+        return;
+    }
+
+    slots[*max_idx] = slot;
+
+    sol_slot_t new_max = slots[0];
+    size_t new_max_idx = 0;
+    for (size_t i = 1; i < cap; i++) {
+        if (slots[i] > new_max) {
+            new_max = slots[i];
+            new_max_idx = i;
+        }
+    }
+    *max_slot = new_max;
+    *max_idx = new_max_idx;
 }
 
 static uint32_t
@@ -1045,12 +1150,18 @@ replay_thread_func(void* arg) {
         bool fast_mode = tvu_fast_mode();
         enum {
             SOL_TVU_RESTART_PROBE_PER_LOOP = 16,
-            SOL_TVU_REPLAY_CANDIDATE_SLOTS = MAX_TRACKED_SLOTS,
+            /* Keep parent-ready checks bounded under backlog. We track the
+             * lowest-N complete slots, which preserves strict min-slot replay
+             * ordering while avoiding expensive parent probes across all
+             * tracked slots every loop. */
+            SOL_TVU_REPLAY_CANDIDATE_SLOTS = 512,
         };
         sol_slot_t probe_slots[SOL_TVU_RESTART_PROBE_PER_LOOP];
         size_t probe_count = 0;
         sol_slot_t complete_slots[SOL_TVU_REPLAY_CANDIDATE_SLOTS];
         size_t complete_count = 0;
+        sol_slot_t complete_max_slot = 0;
+        size_t complete_max_idx = 0;
 
         pthread_mutex_lock(&tvu->slots_lock);
         /* Promote any slots waiting on a now-replayed parent. */
@@ -1070,9 +1181,12 @@ replay_thread_func(void* arg) {
             if (tvu->slots[i].status != SOL_SLOT_STATUS_COMPLETE) {
                 continue;
             }
-            if (complete_count < SOL_TVU_REPLAY_CANDIDATE_SLOTS) {
-                complete_slots[complete_count++] = tvu->slots[i].slot;
-            }
+            tvu_collect_smallest_slot_candidates(complete_slots,
+                                                 &complete_count,
+                                                 SOL_TVU_REPLAY_CANDIDATE_SLOTS,
+                                                 tvu->slots[i].slot,
+                                                 &complete_max_slot,
+                                                 &complete_max_idx);
         }
         if (complete_count == 0) {
             /* Best-effort restart probe: identify a small number of RECEIVING
@@ -2257,7 +2371,10 @@ sol_tvu_new(sol_blockstore_t* blockstore,
     tvu->repair = repair;
 
     uint32_t verify_threads =
-        tvu_pick_threads(tvu->config.shred_verify_threads, SOL_TVU_MAX_VERIFY_THREADS, 2);
+        tvu_pick_threads(tvu->config.shred_verify_threads,
+                         SOL_TVU_MAX_VERIFY_THREADS,
+                         2,
+                         TVU_THREAD_ROLE_VERIFY);
     tvu->shred_verify_thread_count = verify_threads;
     tvu->shred_verify_threads = sol_calloc(verify_threads, sizeof(pthread_t));
     if (!tvu->shred_verify_threads) {
@@ -2266,7 +2383,10 @@ sol_tvu_new(sol_blockstore_t* blockstore,
     }
 
     uint32_t replay_threads =
-        tvu_pick_threads(tvu->config.replay_threads, SOL_TVU_MAX_REPLAY_THREADS, 2);
+        tvu_pick_threads(tvu->config.replay_threads,
+                         SOL_TVU_MAX_REPLAY_THREADS,
+                         2,
+                         TVU_THREAD_ROLE_REPLAY);
     tvu->replay_thread_count = replay_threads;
     tvu->replay_threads = sol_calloc(replay_threads, sizeof(pthread_t));
     if (!tvu->replay_threads) {
@@ -2276,7 +2396,10 @@ sol_tvu_new(sol_blockstore_t* blockstore,
     }
 
     uint32_t repair_threads =
-        tvu_pick_threads(tvu->config.repair_threads, SOL_TVU_MAX_REPAIR_THREADS, 2);
+        tvu_pick_threads(tvu->config.repair_threads,
+                         SOL_TVU_MAX_REPAIR_THREADS,
+                         2,
+                         TVU_THREAD_ROLE_REPAIR);
     tvu->repair_thread_count = repair_threads;
     tvu->repair_threads = sol_calloc(repair_threads, sizeof(pthread_t));
     tvu->repair_thread_ctx = sol_calloc(repair_threads, sizeof(tvu_repair_thread_ctx_t));

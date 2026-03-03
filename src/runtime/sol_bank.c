@@ -6694,14 +6694,15 @@ tx_dag_min_batch(void) {
     size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v != 0u, 1)) return v;
 
-    /* DAG graph construction has non-trivial overhead. On big-core hosts we
-     * can profitably use DAG at smaller batch sizes to reduce wave barriers. */
+    /* DAG graph construction has non-trivial overhead. Keep a moderate floor on
+     * big-core hosts so scheduling work doesn't dominate execution on small
+     * batches. */
     size_t min_batch = 1024u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu >= 128) {
-        min_batch = 32u;
+        min_batch = 96u;
     } else if (ncpu >= 96) {
-        min_batch = 48u;
+        min_batch = 96u;
     } else if (ncpu >= 64) {
         min_batch = 128u;
     }
@@ -6718,6 +6719,61 @@ tx_dag_min_batch(void) {
     if (min_batch > 65536u) min_batch = 65536u;
     __atomic_store_n(&cached, min_batch, __ATOMIC_RELEASE);
     return min_batch;
+}
+
+static size_t
+tx_dag_edge_cap_limit(size_t tx_count) {
+    size_t limit = 0u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    size_t mul = 64u;
+    if (ncpu >= 128) {
+        mul = 128u;
+    } else if (ncpu >= 64) {
+        mul = 96u;
+    }
+
+    if (tx_count > 0u && tx_count <= (SIZE_MAX / mul)) {
+        limit = tx_count * mul;
+    } else {
+        limit = SIZE_MAX;
+    }
+
+    const char* env = getenv("SOL_TX_DAG_EDGE_CAP_LIMIT");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long long x = strtoull(env, &end, 10);
+        if (end != env && x > 0ull) {
+            limit = (size_t)x;
+        }
+    }
+
+    if (limit < 4096u) limit = 4096u;
+    /* Hard safety cap: 16M edges ~128 MiB across edge arrays. */
+    if (limit > (size_t)(1u << 24)) limit = (size_t)(1u << 24);
+    return limit;
+}
+
+static size_t
+tx_sched_lockset_reserve(size_t tx_count) {
+    /* Keep lock-set maps large enough to avoid repeated growth/rehash when
+     * replaying dense batches on large-core hosts. */
+    size_t reserve = 1024u;
+    size_t mul = 16u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        mul = 20u;
+    } else if (ncpu >= 64) {
+        mul = 18u;
+    }
+    if (tx_count > 0u && tx_count <= (SIZE_MAX / mul)) {
+        reserve = tx_count * mul;
+    } else if (tx_count > 0u) {
+        reserve = SIZE_MAX;
+    }
+
+    if (reserve < 1024u) reserve = 1024u;
+    if (reserve > (size_t)(1u << 22)) reserve = (size_t)(1u << 22);
+    return reserve;
 }
 
 static size_t
@@ -6747,11 +6803,11 @@ tx_worker_target(void) {
      * Replay latency is typically bounded by tx execution throughput, and
      * under-provisioning workers leaves CPUs idle while slots queue up. */
     if (workers >= 128u) {
-        workers = 112u;
+        workers = 96u;
     } else if (workers >= 96u) {
-        workers = 84u;
+        workers = 72u;
     } else if (workers >= 64u) {
-        workers = 56u;
+        workers = 48u;
     } else if (workers >= 48u) {
         workers = 32u;
     } else if (workers >= 24u) {
@@ -6808,9 +6864,9 @@ tx_pool_target_txs_per_worker(void) {
     size_t tx_per_worker = 8u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu >= 128) {
-        tx_per_worker = 2u;
+        tx_per_worker = 4u;
     } else if (ncpu >= 96) {
-        tx_per_worker = 3u;
+        tx_per_worker = 4u;
     } else if (ncpu >= 64) {
         tx_per_worker = 4u;
     } else if (ncpu >= 32) {
@@ -7004,8 +7060,8 @@ tx_pool_dag_pop_batch(void) {
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu > 0 && ncpu <= 16) pop = 64u;
     else if (ncpu > 0 && ncpu <= 32) pop = 32u;
-    else if (ncpu >= 128) pop = 2u;
-    else if (ncpu >= 64) pop = 3u;
+    else if (ncpu >= 128) pop = 16u;
+    else if (ncpu >= 64) pop = 8u;
 
     const char* env = getenv("SOL_TX_DAG_POP_BATCH");
     if (env && env[0] != '\0') {
@@ -8532,8 +8588,9 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
      * non-conflicting transactions in parallel. */
     tx_sched_scratch_t* sc = &g_tls_tx_sched_scratch;
 
-    if (!tx_sched_ensure_pubkey_map(&sc->batch_reads, sizeof(uint8_t), 1024u) ||
-        !tx_sched_ensure_pubkey_map(&sc->batch_writes, sizeof(uint8_t), 1024u)) {
+    size_t lockset_reserve = tx_sched_lockset_reserve(count);
+    if (!tx_sched_ensure_pubkey_map(&sc->batch_reads, sizeof(uint8_t), lockset_reserve) ||
+        !tx_sched_ensure_pubkey_map(&sc->batch_writes, sizeof(uint8_t), lockset_reserve)) {
         for (size_t i = 0; i < count; i++) {
             results[i] = sol_bank_process_transaction(bank, tx_ptrs[i]);
         }
@@ -8680,9 +8737,11 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	         * when the workload contains a few long-running txs that would otherwise
 	         * stall unrelated dependent chains. */
 	        if (use_dag) {
-	            size_t edge_cap = count * 32u;
-	            if (edge_cap < 1024u) edge_cap = 1024u;
-	            if (!tx_sched_ensure_dag(sc, count, edge_cap)) {
+                    size_t edge_cap = count * 32u;
+                    if (edge_cap < 1024u) edge_cap = 1024u;
+                    size_t edge_cap_limit = tx_dag_edge_cap_limit(count);
+                    if (edge_cap > edge_cap_limit) edge_cap = edge_cap_limit;
+                    if (!tx_sched_ensure_dag(sc, count, edge_cap)) {
 	                /* Allocation failed; fall back to the barriered wave scheduler. */
 	                use_dag = false;
 	            } else {
@@ -8750,11 +8809,38 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 		                            dag_exec_ns += bank_monotonic_ns() - _exec0; \
 		                        }                                                \
 		                        dag_segments++;                                  \
-		                        dag_edges_total += edge_len;                     \
-	                        TX_DAG_SEG_RESET();                              \
-	                    } while (0)
+	                        dag_edges_total += edge_len;                     \
+		                        TX_DAG_SEG_RESET();                              \
+		                    } while (0)
 
-	                for (size_t i = 0; i < count; i++) {
+#define TX_DAG_ENSURE_EDGE_CAP_OR_ABORT() do {                             \
+                                if (edge_len < edge_cap) break;             \
+                                if (edge_cap >= edge_cap_limit) {           \
+                                    dag_abort = true;                       \
+                                    break;                                  \
+                                }                                           \
+                                size_t new_cap = edge_cap * 2u;             \
+                                if (new_cap < edge_cap || new_cap > edge_cap_limit) { \
+                                    new_cap = edge_cap_limit;               \
+                                }                                           \
+                                uint32_t* new_to = sol_alloc(new_cap * sizeof(*new_to)); \
+                                uint32_t* new_next = sol_alloc(new_cap * sizeof(*new_next)); \
+                                if (!new_to || !new_next) {                 \
+                                    sol_free(new_to);                       \
+                                    sol_free(new_next);                     \
+                                    dag_abort = true;                       \
+                                    break;                                  \
+                                }                                           \
+                                memcpy(new_to, edge_to, edge_len * sizeof(*new_to)); \
+                                memcpy(new_next, edge_next, edge_len * sizeof(*new_next)); \
+                                sol_free(edge_to);                          \
+                                sol_free(edge_next);                        \
+                                edge_to = new_to;                           \
+                                edge_next = new_next;                       \
+                                edge_cap = new_cap;                         \
+                            } while (0)
+
+                    for (size_t i = 0; i < count; i++) {
 	                    const sol_transaction_t* tx = tx_ptrs[i];
 	                    if (!tx) continue;
 
@@ -8871,26 +8957,10 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	                        if (dep == 0u) continue;
 	                        uint32_t from = dep - 1u;
 
-	                        if (edge_len == edge_cap) {
-	                            size_t new_cap = edge_cap * 2u;
-	                            uint32_t* new_to = sol_alloc(new_cap * sizeof(*new_to));
-	                            uint32_t* new_next = sol_alloc(new_cap * sizeof(*new_next));
-	                            if (!new_to || !new_next) {
-	                                sol_free(new_to);
-	                                sol_free(new_next);
-	                                dag_abort = true;
-	                                break;
-	                            }
-	                            memcpy(new_to, edge_to, edge_len * sizeof(*new_to));
-	                            memcpy(new_next, edge_next, edge_len * sizeof(*new_next));
-	                            sol_free(edge_to);
-	                            sol_free(edge_next);
-	                            edge_to = new_to;
-	                            edge_next = new_next;
-	                            edge_cap = new_cap;
-	                        }
+                            TX_DAG_ENSURE_EDGE_CAP_OR_ABORT();
+                            if (dag_abort) break;
 
-	                        edge_to[edge_len] = to;
+                            edge_to[edge_len] = to;
 	                        edge_next[edge_len] = adj_head[from];
 	                        adj_head[from] = (uint32_t)edge_len;
 	                        edge_len++;
@@ -8928,25 +8998,9 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	                                (const tx_wave_last_t*)sol_pubkey_map_get(last_access, table);
 	                            if (last && last->last_write != 0u) {
 	                                uint32_t from = last->last_write - 1u;
-	                                if (edge_len == edge_cap) {
-	                                    size_t new_cap = edge_cap * 2u;
-	                                    uint32_t* new_to = sol_alloc(new_cap * sizeof(*new_to));
-	                                    uint32_t* new_next = sol_alloc(new_cap * sizeof(*new_next));
-	                                    if (!new_to || !new_next) {
-	                                        sol_free(new_to);
-	                                        sol_free(new_next);
-	                                        dag_abort = true;
-	                                        break;
-	                                    }
-	                                    memcpy(new_to, edge_to, edge_len * sizeof(*new_to));
-	                                    memcpy(new_next, edge_next, edge_len * sizeof(*new_next));
-	                                    sol_free(edge_to);
-	                                    sol_free(edge_next);
-	                                    edge_to = new_to;
-	                                    edge_next = new_next;
-	                                    edge_cap = new_cap;
-	                                }
-	                                edge_to[edge_len] = to;
+                                TX_DAG_ENSURE_EDGE_CAP_OR_ABORT();
+                                if (dag_abort) break;
+                                edge_to[edge_len] = to;
 	                                edge_next[edge_len] = adj_head[from];
 	                                adj_head[from] = (uint32_t)edge_len;
 	                                edge_len++;
@@ -8980,25 +9034,9 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	                            (const tx_wave_last_t*)sol_pubkey_map_get(last_access, key);
 	                        if (last && last->last_write != 0u) {
 	                            uint32_t from = last->last_write - 1u;
-	                            if (edge_len == edge_cap) {
-	                                size_t new_cap = edge_cap * 2u;
-	                                uint32_t* new_to = sol_alloc(new_cap * sizeof(*new_to));
-	                                uint32_t* new_next = sol_alloc(new_cap * sizeof(*new_next));
-	                                if (!new_to || !new_next) {
-	                                    sol_free(new_to);
-	                                    sol_free(new_next);
-	                                    dag_abort = true;
-	                                    break;
-	                                }
-	                                memcpy(new_to, edge_to, edge_len * sizeof(*new_to));
-	                                memcpy(new_next, edge_next, edge_len * sizeof(*new_next));
-	                                sol_free(edge_to);
-	                                sol_free(edge_next);
-	                                edge_to = new_to;
-	                                edge_next = new_next;
-	                                edge_cap = new_cap;
-	                            }
-	                            edge_to[edge_len] = to;
+                            TX_DAG_ENSURE_EDGE_CAP_OR_ABORT();
+                            if (dag_abort) break;
+                            edge_to[edge_len] = to;
 	                            edge_next[edge_len] = adj_head[from];
 	                            adj_head[from] = (uint32_t)edge_len;
 	                            edge_len++;
@@ -9072,8 +9110,9 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 
 #undef TX_DAG_FLUSH_EXEC
 #undef TX_DAG_SEG_RESET
-	                /* Clear last-access tracking for reuse next call. */
-	                sol_map_clear(last_access->inner);
+#undef TX_DAG_ENSURE_EDGE_CAP_OR_ABORT
+                /* Clear last-access tracking for reuse next call. */
+                sol_map_clear(last_access->inner);
 
 	                /* If we grew edge buffers during this run, keep them. */
 	                sc->dag_edge_to = edge_to;

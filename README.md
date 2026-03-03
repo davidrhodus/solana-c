@@ -76,7 +76,9 @@ bash ./scripts/run-mainnet-smoke.sh ledger.mainnet
 
 - `--fast-replay` skips transaction processing (fees/exec), shred/transaction signature verification, and tx index writes, and it may replay incomplete slots without full ticks to maximize catchup speed. This produces incorrect account state and is intended only for debugging or network-only ingestion.
 - Fast replay also defaults `SOL_FAST_REPLAY_FORCE_ADVANCE=1`, which forces slot advancement after any parsed block variant or any received shreds (even if replay fails) to keep catchup moving. Disable by setting `SOL_FAST_REPLAY_FORCE_ADVANCE=0`.
-- TVU thread counts default to auto-sizing when set to `0` (default): shred verification and replay scale to the online CPU count (min 2 on multi-core, cap 64), and repair scales similarly (cap 32).
+- TVU thread counts default to auto-sizing when set to `0` (default): shred verification/repair scale conservatively on large-core hosts, while replay uses a tighter default (about 8 threads on `>=64` cores) to reduce replay-lock contention. Override auto sizing with `SOL_TVU_SHRED_VERIFY_THREADS`, `SOL_TVU_REPLAY_THREADS`, and `SOL_TVU_REPAIR_THREADS`.
+- On large-core hosts, replay defaults bias toward lower scheduler contention: fewer tx workers per batch (`SOL_TX_PER_WORKER` default is higher), larger DAG ready-pop batches, lower replay verify worker count, and lower auto TVU thread counts.
+- `SOL_TX_DAG_EDGE_CAP_LIMIT` can cap DAG edge growth to prevent pathological scheduler build time on dense/conflicting batches (default is auto-sized with a hard safety cap).
 - When running without voting (e.g., `--no-voting`) or in fast replay, the validator periodically auto-advances the root based on `highest_replayed` to keep bank forks bounded.
 
 ## QUIC (TPU)
