@@ -459,43 +459,77 @@ tvu_pick_threads(uint32_t requested,
 }
 
 static void
+tvu_slot_maxheap_sift_up(sol_slot_t* heap, size_t heap_len, size_t idx) {
+    if (!heap || heap_len == 0 || idx >= heap_len) {
+        return;
+    }
+
+    while (idx > 0) {
+        size_t parent = (idx - 1u) / 2u;
+        if (heap[parent] >= heap[idx]) {
+            break;
+        }
+        sol_slot_t tmp = heap[parent];
+        heap[parent] = heap[idx];
+        heap[idx] = tmp;
+        idx = parent;
+    }
+}
+
+static void
+tvu_slot_maxheap_sift_down(sol_slot_t* heap, size_t heap_len, size_t idx) {
+    if (!heap || heap_len == 0 || idx >= heap_len) {
+        return;
+    }
+
+    for (;;) {
+        size_t left = idx * 2u + 1u;
+        if (left >= heap_len) {
+            break;
+        }
+
+        size_t right = left + 1u;
+        size_t largest = left;
+        if (right < heap_len && heap[right] > heap[left]) {
+            largest = right;
+        }
+
+        if (heap[idx] >= heap[largest]) {
+            break;
+        }
+
+        sol_slot_t tmp = heap[idx];
+        heap[idx] = heap[largest];
+        heap[largest] = tmp;
+        idx = largest;
+    }
+}
+
+static void
 tvu_collect_smallest_slot_candidates(sol_slot_t* slots,
                                      size_t* count,
                                      size_t cap,
-                                     sol_slot_t slot,
-                                     sol_slot_t* max_slot,
-                                     size_t* max_idx) {
-    if (!slots || !count || cap == 0 || !max_slot || !max_idx || slot == 0) {
+                                     sol_slot_t slot) {
+    if (!slots || !count || cap == 0 || slot == 0) {
         return;
     }
 
+    /* Maintain a bounded max-heap of the smallest `cap` slots seen so far.
+     * Root contains the current largest candidate. */
     if (*count < cap) {
         size_t idx = *count;
         slots[idx] = slot;
-        if (idx == 0 || slot > *max_slot) {
-            *max_slot = slot;
-            *max_idx = idx;
-        }
         (*count)++;
+        tvu_slot_maxheap_sift_up(slots, *count, idx);
         return;
     }
 
-    if (slot >= *max_slot) {
+    if (slot >= slots[0]) {
         return;
     }
 
-    slots[*max_idx] = slot;
-
-    sol_slot_t new_max = slots[0];
-    size_t new_max_idx = 0;
-    for (size_t i = 1; i < cap; i++) {
-        if (slots[i] > new_max) {
-            new_max = slots[i];
-            new_max_idx = i;
-        }
-    }
-    *max_slot = new_max;
-    *max_idx = new_max_idx;
+    slots[0] = slot;
+    tvu_slot_maxheap_sift_down(slots, *count, 0);
 }
 
 static uint32_t
@@ -1313,8 +1347,6 @@ replay_thread_func(void* arg) {
         size_t probe_count = 0;
         sol_slot_t complete_slots[SOL_TVU_REPLAY_CANDIDATE_SLOTS];
         size_t complete_count = 0;
-        sol_slot_t complete_max_slot = 0;
-        size_t complete_max_idx = 0;
 
         pthread_mutex_lock(&tvu->slots_lock);
         /* Promote any slots waiting on a now-replayed parent. */
@@ -1337,9 +1369,7 @@ replay_thread_func(void* arg) {
             tvu_collect_smallest_slot_candidates(complete_slots,
                                                  &complete_count,
                                                  SOL_TVU_REPLAY_CANDIDATE_SLOTS,
-                                                 tvu->slots[i].slot,
-                                                 &complete_max_slot,
-                                                 &complete_max_idx);
+                                                 tvu->slots[i].slot);
         }
         if (complete_count == 0) {
             /* Best-effort restart probe: identify a small number of RECEIVING
