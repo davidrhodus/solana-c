@@ -5782,10 +5782,13 @@ validator_maybe_log_vote_hash_mismatch(validator_t* v,
 
 typedef struct {
     bool        enabled;
+    bool        adaptive_growth;
     uint64_t    period_ns;
     sol_slot_t  high_slots;
     sol_slot_t  severe_slots;
     sol_slot_t  clear_slots;
+    sol_slot_t  high_growth_slots;
+    sol_slot_t  severe_growth_slots;
     uint32_t    normal_rps;
     uint32_t    high_rps;
     uint32_t    severe_rps;
@@ -5816,14 +5819,34 @@ validator_counter_delta_u64(uint64_t current, uint64_t previous) {
     return (current >= previous) ? (current - previous) : current;
 }
 
+static int64_t
+validator_slot_delta_s64(sol_slot_t cur, sol_slot_t prev) {
+    if (cur >= prev) {
+        uint64_t diff = (uint64_t)(cur - prev);
+        if (diff > (uint64_t)INT64_MAX) {
+            return INT64_MAX;
+        }
+        return (int64_t)diff;
+    }
+
+    uint64_t diff = (uint64_t)(prev - cur);
+    if (diff > (uint64_t)INT64_MAX) {
+        return INT64_MIN;
+    }
+    return -(int64_t)diff;
+}
+
 static validator_rpc_backpressure_config_t
 validator_rpc_backpressure_config(void) {
     validator_rpc_backpressure_config_t cfg = {
         .enabled = true,
+        .adaptive_growth = true,
         .period_ns = 1000ULL * 1000ULL * 1000ULL, /* 1s */
         .high_slots = 256u,
         .severe_slots = 1024u,
         .clear_slots = 128u,
+        .high_growth_slots = 32u,
+        .severe_growth_slots = 96u,
         .normal_rps = 0u,
         .high_rps = 500u,
         .severe_rps = 150u,
@@ -5835,6 +5858,9 @@ validator_rpc_backpressure_config(void) {
     uint64_t parsed = 0;
     if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE", &parsed)) {
         cfg.enabled = (parsed != 0);
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_ADAPTIVE_GROWTH", &parsed)) {
+        cfg.adaptive_growth = (parsed != 0);
     }
     if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_PERIOD_MS", &parsed)) {
         if (parsed < 100u) parsed = 100u;
@@ -5851,6 +5877,12 @@ validator_rpc_backpressure_config(void) {
     }
     if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_CLEAR_SLOTS", &parsed)) {
         cfg.clear_slots = (sol_slot_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_HIGH_GROWTH_SLOTS", &parsed)) {
+        cfg.high_growth_slots = (sol_slot_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_SEVERE_GROWTH_SLOTS", &parsed)) {
+        cfg.severe_growth_slots = (sol_slot_t)parsed;
     }
     if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_NORMAL_RPS", &parsed)) {
         if (parsed > UINT32_MAX) parsed = UINT32_MAX;
@@ -5886,17 +5918,46 @@ validator_rpc_backpressure_config(void) {
     if (cfg.clear_slots > cfg.high_slots) {
         cfg.clear_slots = cfg.high_slots;
     }
+    if (cfg.high_growth_slots < 1u) {
+        cfg.high_growth_slots = 1u;
+    }
+    if (cfg.severe_growth_slots < cfg.high_growth_slots) {
+        cfg.severe_growth_slots = cfg.high_growth_slots;
+    }
 
     return cfg;
 }
 
 static uint8_t
 validator_rpc_backpressure_target_mode(sol_slot_t lag,
+                                       int64_t lag_delta,
                                        uint8_t current_mode,
                                        const validator_rpc_backpressure_config_t* cfg) {
     if (!cfg || !cfg->enabled) return 0;
-    if (lag >= cfg->severe_slots) return 2;
-    if (lag >= cfg->high_slots) return 1;
+    bool severe_by_lag = lag >= cfg->severe_slots;
+    bool high_by_lag = lag >= cfg->high_slots;
+
+    bool high_by_growth = false;
+    bool severe_by_growth = false;
+    if (cfg->adaptive_growth && lag_delta > 0) {
+        int64_t high_growth = (int64_t)cfg->high_growth_slots;
+        int64_t severe_growth = (int64_t)cfg->severe_growth_slots;
+
+        if (lag >= cfg->clear_slots && lag_delta >= high_growth) {
+            high_by_growth = true;
+        }
+
+        sol_slot_t severe_floor = cfg->high_slots / 2u;
+        if (severe_floor < cfg->clear_slots) {
+            severe_floor = cfg->clear_slots;
+        }
+        if (lag >= severe_floor && lag_delta >= severe_growth) {
+            severe_by_growth = true;
+        }
+    }
+
+    if (severe_by_lag || severe_by_growth) return 2;
+    if (high_by_lag || high_by_growth) return 1;
     if (lag <= cfg->clear_slots) return 0;
     return current_mode;
 }
@@ -5906,6 +5967,7 @@ validator_rpc_backpressure_apply(validator_t* v,
                                  const validator_rpc_backpressure_config_t* cfg,
                                  uint8_t mode,
                                  sol_slot_t lag,
+                                 int64_t lag_delta,
                                  sol_slot_t highest_blockstore,
                                  sol_slot_t highest_replayed) {
     if (!v || !v->rpc || !cfg) return;
@@ -5928,10 +5990,11 @@ validator_rpc_backpressure_apply(validator_t* v,
     sol_rpc_set_max_connections(v->rpc, max_conn);
     sol_rpc_set_backpressure_mode(v->rpc, mode);
 
-    sol_log_info("RPC backpressure mode=%s lag=%lu blockstore_highest=%lu replayed=%lu "
+    sol_log_info("RPC backpressure mode=%s lag=%lu lag_delta=%ld blockstore_highest=%lu replayed=%lu "
                  "rate_limit_rps=%u max_conn=%lu",
                  mode_name,
                  (unsigned long)lag,
+                 (long)lag_delta,
                  (unsigned long)highest_blockstore,
                  (unsigned long)highest_replayed,
                  (unsigned)rps,
@@ -5953,6 +6016,8 @@ validator_run(validator_t* v) {
     bool dev_halt_logged = false;
     bool rpc_backpressure_cfg_logged = false;
     uint8_t rpc_backpressure_mode = 0;
+    bool rpc_backpressure_prev_lag_valid = false;
+    sol_slot_t rpc_backpressure_prev_lag = 0;
     validator_rpc_backpressure_config_t rpc_backpressure_cfg = {0};
     sol_rpc_backpressure_stats_t last_rpc_bp_stats = {0};
     const uint64_t stats_period_ns = 10ULL * 1000ULL * 1000ULL * 1000ULL;
@@ -6001,7 +6066,7 @@ validator_run(validator_t* v) {
 
     rpc_backpressure_cfg = validator_rpc_backpressure_config();
     if (v->rpc && rpc_backpressure_cfg.enabled) {
-        validator_rpc_backpressure_apply(v, &rpc_backpressure_cfg, 0u, 0u, 0u, 0u);
+        validator_rpc_backpressure_apply(v, &rpc_backpressure_cfg, 0u, 0u, 0, 0u, 0u);
     }
 
     while (!g_shutdown) {
@@ -6055,12 +6120,16 @@ validator_run(validator_t* v) {
             if (!rpc_backpressure_cfg_logged) {
                 rpc_backpressure_cfg_logged = true;
                 sol_log_info("RPC backpressure config: period_ms=%lu high_slots=%lu severe_slots=%lu "
-                             "clear_slots=%lu normal_rps=%u high_rps=%u severe_rps=%u "
+                             "clear_slots=%lu adaptive_growth=%d high_growth_slots=%lu severe_growth_slots=%lu "
+                             "normal_rps=%u high_rps=%u severe_rps=%u "
                              "normal_max_conn=%lu high_max_conn=%lu severe_max_conn=%lu",
                              (unsigned long)(rpc_backpressure_cfg.period_ns / 1000000ULL),
                              (unsigned long)rpc_backpressure_cfg.high_slots,
                              (unsigned long)rpc_backpressure_cfg.severe_slots,
                              (unsigned long)rpc_backpressure_cfg.clear_slots,
+                             rpc_backpressure_cfg.adaptive_growth ? 1 : 0,
+                             (unsigned long)rpc_backpressure_cfg.high_growth_slots,
+                             (unsigned long)rpc_backpressure_cfg.severe_growth_slots,
                              (unsigned)rpc_backpressure_cfg.normal_rps,
                              (unsigned)rpc_backpressure_cfg.high_rps,
                              (unsigned)rpc_backpressure_cfg.severe_rps,
@@ -6078,9 +6147,17 @@ validator_run(validator_t* v) {
                 sol_slot_t replay_lag = highest_blockstore > highest_replayed
                     ? (highest_blockstore - highest_replayed)
                     : 0;
+                int64_t replay_lag_delta = 0;
+                if (rpc_backpressure_prev_lag_valid) {
+                    replay_lag_delta =
+                        validator_slot_delta_s64(replay_lag, rpc_backpressure_prev_lag);
+                }
+                rpc_backpressure_prev_lag = replay_lag;
+                rpc_backpressure_prev_lag_valid = true;
 
                 uint8_t target_mode =
                     validator_rpc_backpressure_target_mode(replay_lag,
+                                                           replay_lag_delta,
                                                            rpc_backpressure_mode,
                                                            &rpc_backpressure_cfg);
                 if (target_mode != rpc_backpressure_mode) {
@@ -6088,6 +6165,7 @@ validator_run(validator_t* v) {
                                                      &rpc_backpressure_cfg,
                                                      target_mode,
                                                      replay_lag,
+                                                     replay_lag_delta,
                                                      highest_blockstore,
                                                      highest_replayed);
                     rpc_backpressure_mode = target_mode;

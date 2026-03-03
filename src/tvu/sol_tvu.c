@@ -587,6 +587,159 @@ tvu_max_shred_ahead_slots(void) {
     return (sol_slot_t)cached;
 }
 
+static size_t
+tvu_replay_parent_probe_limit(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (size_t)cached;
+    }
+
+    /* Parent-ready checks can dominate replay-loop CPU under backlog. Probe
+     * only a bounded number of lowest complete slots per loop iteration. */
+    const char* env = getenv("SOL_TVU_REPLAY_PARENT_PROBE_LIMIT");
+    long v = 64; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 512) {
+        v = 512;
+    }
+    cached = v;
+    return (size_t)cached;
+}
+
+static sol_slot_t
+tvu_replay_parent_probe_high_lag(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* When replay lag is above this threshold, reduce parent-ready probes
+     * aggressively to prioritize replay execution throughput. Set to 0 to
+     * disable this reduction tier. */
+    const char* env = getenv("SOL_TVU_REPLAY_PARENT_PROBE_HIGH_LAG");
+    long v = 256; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_replay_parent_probe_severe_lag(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* When replay lag is above this threshold, skip parent-ready probes and
+     * replay strictly by lowest complete slot to avoid scheduler overhead.
+     * Set to 0 to disable severe-tier probe skipping. */
+    const char* env = getenv("SOL_TVU_REPLAY_PARENT_PROBE_SEVERE_LAG");
+    long v = 1024; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+
+    long high = (long)tvu_replay_parent_probe_high_lag();
+    if (v != 0 && high != 0 && v < high) {
+        v = high;
+    }
+
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static size_t
+tvu_replay_parent_probe_budget(sol_slot_t replay_lag, size_t complete_count) {
+    size_t budget = tvu_replay_parent_probe_limit();
+    if (budget == 0 || complete_count == 0) {
+        return 0;
+    }
+    if (budget > complete_count) {
+        budget = complete_count;
+    }
+
+    sol_slot_t severe_lag = tvu_replay_parent_probe_severe_lag();
+    if (severe_lag != 0 && replay_lag >= severe_lag) {
+        return 0;
+    }
+
+    sol_slot_t high_lag = tvu_replay_parent_probe_high_lag();
+    if (high_lag != 0 && replay_lag >= high_lag) {
+        const size_t reduced_budget = 16u;
+        if (budget > reduced_budget) {
+            budget = reduced_budget;
+        }
+    }
+
+    return budget;
+}
+
+static bool
+tvu_pick_smallest_unprobed_slot(const sol_slot_t* complete_slots,
+                                size_t complete_count,
+                                const bool* probed,
+                                sol_slot_t* out_slot,
+                                size_t* out_idx) {
+    if (!complete_slots || !probed || !out_slot || !out_idx || complete_count == 0) {
+        return false;
+    }
+
+    sol_slot_t best = 0;
+    size_t best_idx = 0;
+    bool found = false;
+    for (size_t i = 0; i < complete_count; i++) {
+        if (probed[i]) continue;
+        sol_slot_t s = complete_slots[i];
+        if (s == 0) continue;
+        if (!found || s < best) {
+            best = s;
+            best_idx = i;
+            found = true;
+        }
+    }
+
+    if (!found) {
+        return false;
+    }
+    *out_slot = best;
+    *out_idx = best_idx;
+    return true;
+}
+
 /*
  * Find or create slot tracker
  */
@@ -1215,9 +1368,40 @@ replay_thread_func(void* arg) {
                 if (best_any == 0 || s < best_any) {
                     best_any = s;
                 }
-                if (tvu->replay && sol_replay_parent_ready(tvu->replay, s, NULL)) {
-                    if (best_parent_ready == 0 || s < best_parent_ready) {
-                        best_parent_ready = s;
+            }
+
+            if (best_any != 0 && tvu->replay) {
+                sol_slot_t replay_lag = 0;
+                if (tvu->blockstore) {
+                    sol_slot_t highest_blockstore = sol_blockstore_highest_slot(tvu->blockstore);
+                    sol_slot_t highest_replayed = sol_replay_highest_replayed_slot(tvu->replay);
+                    replay_lag = highest_blockstore > highest_replayed
+                        ? (highest_blockstore - highest_replayed)
+                        : 0;
+                }
+
+                size_t parent_probe_budget =
+                    tvu_replay_parent_probe_budget(replay_lag, complete_count);
+                if (parent_probe_budget > 0) {
+                    bool probed[SOL_TVU_REPLAY_CANDIDATE_SLOTS];
+                    memset(probed, 0, sizeof(probed));
+
+                    for (size_t probe_i = 0; probe_i < parent_probe_budget; probe_i++) {
+                        sol_slot_t probe_slot = 0;
+                        size_t probe_idx = 0;
+                        if (!tvu_pick_smallest_unprobed_slot(complete_slots,
+                                                             complete_count,
+                                                             probed,
+                                                             &probe_slot,
+                                                             &probe_idx)) {
+                            break;
+                        }
+
+                        probed[probe_idx] = true;
+                        if (sol_replay_parent_ready(tvu->replay, probe_slot, NULL)) {
+                            best_parent_ready = probe_slot;
+                            break;
+                        }
                     }
                 }
             }
