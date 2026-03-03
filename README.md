@@ -47,6 +47,10 @@ IDENTITY_PATH=/path/to/identity.json \
 VOTE_ACCOUNT=/path/to/vote-account.json \
 bash ./scripts/run-mainnet-rpc-voting.sh ledger.mainnet
 # To expose RPC externally, set RPC_BIND=0.0.0.0 (and firewall/allowlist it).
+
+# Canary gate (health + RPC smoke + sync/replay soak)
+LOG_FILE=ledger.mainnet/validator.log \
+bash ./scripts/run-mainnet-canary-gate.sh 3600
 ```
 
 ## Snapshots (bootstrap)
