@@ -79,6 +79,7 @@ bash ./scripts/run-mainnet-smoke.sh ledger.mainnet
 - TVU thread counts default to auto-sizing when set to `0` (default): shred verification/repair scale conservatively on large-core hosts, while replay uses a tighter default (about 8 threads on `>=64` cores) to reduce replay-lock contention. Override auto sizing with `SOL_TVU_SHRED_VERIFY_THREADS`, `SOL_TVU_REPLAY_THREADS`, and `SOL_TVU_REPAIR_THREADS`.
 - On large-core hosts, replay defaults bias toward lower scheduler contention: fewer tx workers per batch (`SOL_TX_PER_WORKER` default is higher), larger DAG ready-pop batches, lower replay verify worker count, and lower auto TVU thread counts.
 - `SOL_TX_DAG_EDGE_CAP_LIMIT` can cap DAG edge growth to prevent pathological scheduler build time on dense/conflicting batches (default is auto-sized with a hard safety cap).
+- Runtime RPC backpressure is enabled by default for combined RPC+voting nodes: when `blockstore_highest - highest_replayed` grows, RPC is throttled automatically to protect replay/voting (`SOL_RPC_BACKPRESSURE_*` envs: `HIGH_SLOTS`, `SEVERE_SLOTS`, `CLEAR_SLOTS`, `HIGH_RPS`, `SEVERE_RPS`, `HIGH_MAX_CONN`, `SEVERE_MAX_CONN`; set `SOL_RPC_BACKPRESSURE=0` to disable).
 - When running without voting (e.g., `--no-voting`) or in fast replay, the validator periodically auto-advances the root based on `highest_replayed` to keep bank forks bounded.
 
 ## QUIC (TPU)

@@ -231,6 +231,53 @@ TEST(rpc_rate_limiting) {
     sol_rpc_destroy(rpc);
 }
 
+TEST(rpc_dynamic_rate_limit) {
+    sol_rpc_t* rpc = sol_rpc_new(NULL, NULL);
+    ASSERT(rpc != NULL);
+
+    const char* req = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getVersion\"}";
+
+    sol_json_builder_t* b1 = sol_json_builder_new(512);
+    ASSERT(b1 != NULL);
+    sol_rpc_handle_request_json(rpc, req, strlen(req), b1);
+    const char* resp1 = sol_json_builder_str(b1);
+    ASSERT(resp1 != NULL);
+    ASSERT(strstr(resp1, "\"result\"") != NULL);
+    sol_json_builder_destroy(b1);
+
+    sol_rpc_set_rate_limit(rpc, 1u, 1u);
+
+    sol_json_builder_t* b2 = sol_json_builder_new(512);
+    ASSERT(b2 != NULL);
+    sol_rpc_handle_request_json(rpc, req, strlen(req), b2);
+    const char* resp2 = sol_json_builder_str(b2);
+    ASSERT(resp2 != NULL);
+    ASSERT(strstr(resp2, "\"result\"") != NULL);
+    sol_json_builder_destroy(b2);
+
+    sol_json_builder_t* b3 = sol_json_builder_new(512);
+    ASSERT(b3 != NULL);
+    sol_rpc_handle_request_json(rpc, req, strlen(req), b3);
+    const char* resp3 = sol_json_builder_str(b3);
+    ASSERT(resp3 != NULL);
+    ASSERT(strstr(resp3, "\"error\"") != NULL);
+    ASSERT(strstr(resp3, "\"code\":-32020") != NULL);
+    sol_json_builder_destroy(b3);
+
+    sol_rpc_set_rate_limit(rpc, 0u, 0u);
+    sol_rpc_set_max_connections(rpc, 32u);
+
+    sol_json_builder_t* b4 = sol_json_builder_new(512);
+    ASSERT(b4 != NULL);
+    sol_rpc_handle_request_json(rpc, req, strlen(req), b4);
+    const char* resp4 = sol_json_builder_str(b4);
+    ASSERT(resp4 != NULL);
+    ASSERT(strstr(resp4, "\"result\"") != NULL);
+    sol_json_builder_destroy(b4);
+
+    sol_rpc_destroy(rpc);
+}
+
 static size_t
 test_base64_encode(const uint8_t* input, size_t input_len, char* output, size_t output_max) {
     static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -569,6 +616,7 @@ int main(void) {
     RUN_TEST(rpc_default_config);
     RUN_TEST(rpc_stats);
     RUN_TEST(rpc_rate_limiting);
+    RUN_TEST(rpc_dynamic_rate_limit);
     RUN_TEST(rpc_send_transaction_invokes_callback);
     RUN_TEST(rpc_get_health_uses_callback);
     RUN_TEST(rpc_get_epoch_schedule);

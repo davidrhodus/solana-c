@@ -98,6 +98,7 @@ typedef struct {
  */
 struct sol_rpc {
     sol_rpc_config_t        config;
+    size_t                  max_connections_runtime;
     sol_bank_forks_t*       bank_forks;
     sol_blockstore_t*       blockstore;
     struct sol_gossip*      gossip;
@@ -132,12 +133,31 @@ struct sol_rpc {
     pthread_mutex_t         ws_lock;
 
     /* Rate limiting (global token bucket) */
+    pthread_mutex_t         rate_lock;
+    uint32_t                rate_limit_rps_runtime;
+    uint32_t                rate_limit_burst_runtime;
     uint64_t                rate_last_ms;
     uint64_t                rate_tokens_milli;  /* tokens * 1000 */
 
     /* Stats */
     sol_rpc_stats_t         stats;
 };
+
+static void
+rpc_rate_limit_reset_locked(sol_rpc_t* rpc, uint32_t rps, uint32_t burst) {
+    if (!rpc) return;
+
+    if (rps == 0) {
+        burst = 0;
+    } else if (burst == 0) {
+        burst = rps;
+    }
+
+    rpc->rate_limit_rps_runtime = rps;
+    rpc->rate_limit_burst_runtime = burst;
+    rpc->rate_last_ms = rpc_now_ms();
+    rpc->rate_tokens_milli = (uint64_t)burst * 1000ULL;
+}
 
 static inline sol_bank_forks_t*
 rpc_bank_forks(const sol_rpc_t* rpc) {
@@ -184,12 +204,15 @@ static bool
 rpc_rate_limit_allow(sol_rpc_t* rpc) {
     if (!rpc) return true;
 
-    uint32_t rps = rpc->config.rate_limit_rps;
+    pthread_mutex_lock(&rpc->rate_lock);
+
+    uint32_t rps = rpc->rate_limit_rps_runtime;
     if (rps == 0) {
+        pthread_mutex_unlock(&rpc->rate_lock);
         return true;
     }
 
-    uint32_t burst = rpc->config.rate_limit_burst;
+    uint32_t burst = rpc->rate_limit_burst_runtime;
     if (burst == 0) {
         burst = rps;
     }
@@ -211,10 +234,12 @@ rpc_rate_limit_allow(sol_rpc_t* rpc) {
     }
 
     if (rpc->rate_tokens_milli < 1000ULL) {
+        pthread_mutex_unlock(&rpc->rate_lock);
         return false;
     }
 
     rpc->rate_tokens_milli -= 1000ULL;
+    pthread_mutex_unlock(&rpc->rate_lock);
     return true;
 }
 
@@ -4329,7 +4354,7 @@ accept_thread_fn(void* arg) {
             }
         }
 
-        size_t max_conn = rpc->config.max_connections;
+        size_t max_conn = __atomic_load_n(&rpc->max_connections_runtime, __ATOMIC_ACQUIRE);
         if (max_conn > 0) {
             uint64_t active = __atomic_load_n(&rpc->stats.active_connections, __ATOMIC_RELAXED);
             if (active >= (uint64_t)max_conn) {
@@ -4984,19 +5009,17 @@ sol_rpc_new(sol_bank_forks_t* bank_forks, const sol_rpc_config_t* config) {
         rpc->config = (sol_rpc_config_t)SOL_RPC_CONFIG_DEFAULT;
     }
 
+    rpc->max_connections_runtime = rpc->config.max_connections;
     rpc->bank_forks = bank_forks;
     rpc->listen_fd = -1;
     rpc->ws_listen_fd = -1;
     rpc->ws_next_sub_id = 1;
     pthread_mutex_init(&rpc->lock, NULL);
     pthread_mutex_init(&rpc->ws_lock, NULL);
+    pthread_mutex_init(&rpc->rate_lock, NULL);
 
     /* Normalize and initialize rate limiter */
-    if (rpc->config.rate_limit_rps > 0 && rpc->config.rate_limit_burst == 0) {
-        rpc->config.rate_limit_burst = rpc->config.rate_limit_rps;
-    }
-    rpc->rate_last_ms = rpc_now_ms();
-    rpc->rate_tokens_milli = (uint64_t)rpc->config.rate_limit_burst * 1000ULL;
+    rpc_rate_limit_reset_locked(rpc, rpc->config.rate_limit_rps, rpc->config.rate_limit_burst);
 
     return rpc;
 }
@@ -5024,6 +5047,7 @@ sol_rpc_destroy(sol_rpc_t* rpc) {
 
     pthread_mutex_destroy(&rpc->lock);
     pthread_mutex_destroy(&rpc->ws_lock);
+    pthread_mutex_destroy(&rpc->rate_lock);
     sol_free(rpc);
 }
 
@@ -5287,4 +5311,19 @@ sol_rpc_set_health_callback(sol_rpc_t* rpc,
         rpc->health_callback = callback;
         rpc->health_callback_ctx = callback_ctx;
     }
+}
+
+void
+sol_rpc_set_rate_limit(sol_rpc_t* rpc, uint32_t rate_limit_rps, uint32_t rate_limit_burst) {
+    if (!rpc) return;
+
+    pthread_mutex_lock(&rpc->rate_lock);
+    rpc_rate_limit_reset_locked(rpc, rate_limit_rps, rate_limit_burst);
+    pthread_mutex_unlock(&rpc->rate_lock);
+}
+
+void
+sol_rpc_set_max_connections(sol_rpc_t* rpc, size_t max_connections) {
+    if (!rpc) return;
+    __atomic_store_n(&rpc->max_connections_runtime, max_connections, __ATOMIC_RELEASE);
 }

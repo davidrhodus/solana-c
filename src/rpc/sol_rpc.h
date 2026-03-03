@@ -266,6 +266,28 @@ void sol_rpc_set_health_callback(
 );
 
 /*
+ * Update global JSON-RPC rate limits at runtime.
+ *
+ * @param rate_limit_rps    Requests per second (0 disables rate limiting)
+ * @param rate_limit_burst  Burst tokens (0 = auto/based on rps)
+ */
+void sol_rpc_set_rate_limit(
+    sol_rpc_t*      rpc,
+    uint32_t        rate_limit_rps,
+    uint32_t        rate_limit_burst
+);
+
+/*
+ * Update max concurrent HTTP connections at runtime.
+ *
+ * @param max_connections   Max active HTTP client connections (0 disables cap)
+ */
+void sol_rpc_set_max_connections(
+    sol_rpc_t*  rpc,
+    size_t      max_connections
+);
+
+/*
  * WebSocket subscription notifications
  *
  * These functions notify subscribed clients of state changes.

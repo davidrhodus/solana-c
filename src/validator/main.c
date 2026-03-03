@@ -5773,6 +5773,158 @@ validator_maybe_log_vote_hash_mismatch(validator_t* v,
                  votes_buf[0] ? votes_buf : "-");
 }
 
+typedef struct {
+    bool        enabled;
+    uint64_t    period_ns;
+    sol_slot_t  high_slots;
+    sol_slot_t  severe_slots;
+    sol_slot_t  clear_slots;
+    uint32_t    normal_rps;
+    uint32_t    high_rps;
+    uint32_t    severe_rps;
+    size_t      normal_max_conn;
+    size_t      high_max_conn;
+    size_t      severe_max_conn;
+} validator_rpc_backpressure_config_t;
+
+static bool
+validator_parse_env_u64(const char* name, uint64_t* out) {
+    if (!name || !out) return false;
+    const char* env = getenv(name);
+    if (!env || env[0] == '\0') return false;
+
+    errno = 0;
+    char* end = NULL;
+    unsigned long long parsed = strtoull(env, &end, 10);
+    if (errno != 0 || !end || end == env) return false;
+    while (*end && isspace((unsigned char)*end)) end++;
+    if (*end != '\0') return false;
+
+    *out = (uint64_t)parsed;
+    return true;
+}
+
+static validator_rpc_backpressure_config_t
+validator_rpc_backpressure_config(void) {
+    validator_rpc_backpressure_config_t cfg = {
+        .enabled = true,
+        .period_ns = 1000ULL * 1000ULL * 1000ULL, /* 1s */
+        .high_slots = 256u,
+        .severe_slots = 1024u,
+        .clear_slots = 128u,
+        .normal_rps = 0u,
+        .high_rps = 500u,
+        .severe_rps = 150u,
+        .normal_max_conn = 256u,
+        .high_max_conn = 128u,
+        .severe_max_conn = 64u,
+    };
+
+    uint64_t parsed = 0;
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE", &parsed)) {
+        cfg.enabled = (parsed != 0);
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_PERIOD_MS", &parsed)) {
+        if (parsed < 100u) parsed = 100u;
+        if (parsed > 60000u) parsed = 60000u;
+        cfg.period_ns = parsed * 1000ULL * 1000ULL;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_HIGH_SLOTS", &parsed)) {
+        if (parsed < 16u) parsed = 16u;
+        cfg.high_slots = (sol_slot_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_SEVERE_SLOTS", &parsed)) {
+        if (parsed < 32u) parsed = 32u;
+        cfg.severe_slots = (sol_slot_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_CLEAR_SLOTS", &parsed)) {
+        cfg.clear_slots = (sol_slot_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_NORMAL_RPS", &parsed)) {
+        if (parsed > UINT32_MAX) parsed = UINT32_MAX;
+        cfg.normal_rps = (uint32_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_HIGH_RPS", &parsed)) {
+        if (parsed > UINT32_MAX) parsed = UINT32_MAX;
+        cfg.high_rps = (uint32_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_SEVERE_RPS", &parsed)) {
+        if (parsed > UINT32_MAX) parsed = UINT32_MAX;
+        cfg.severe_rps = (uint32_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_NORMAL_MAX_CONN", &parsed)) {
+        if (parsed > SIZE_MAX) parsed = SIZE_MAX;
+        cfg.normal_max_conn = (size_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_HIGH_MAX_CONN", &parsed)) {
+        if (parsed > SIZE_MAX) parsed = SIZE_MAX;
+        cfg.high_max_conn = (size_t)parsed;
+    }
+    if (validator_parse_env_u64("SOL_RPC_BACKPRESSURE_SEVERE_MAX_CONN", &parsed)) {
+        if (parsed > SIZE_MAX) parsed = SIZE_MAX;
+        cfg.severe_max_conn = (size_t)parsed;
+    }
+
+    if (cfg.severe_slots <= cfg.high_slots) {
+        cfg.severe_slots = cfg.high_slots + 1u;
+    }
+    if (cfg.clear_slots >= cfg.high_slots) {
+        cfg.clear_slots = cfg.high_slots / 2u;
+    }
+    if (cfg.clear_slots > cfg.high_slots) {
+        cfg.clear_slots = cfg.high_slots;
+    }
+
+    return cfg;
+}
+
+static uint8_t
+validator_rpc_backpressure_target_mode(sol_slot_t lag,
+                                       uint8_t current_mode,
+                                       const validator_rpc_backpressure_config_t* cfg) {
+    if (!cfg || !cfg->enabled) return 0;
+    if (lag >= cfg->severe_slots) return 2;
+    if (lag >= cfg->high_slots) return 1;
+    if (lag <= cfg->clear_slots) return 0;
+    return current_mode;
+}
+
+static void
+validator_rpc_backpressure_apply(validator_t* v,
+                                 const validator_rpc_backpressure_config_t* cfg,
+                                 uint8_t mode,
+                                 sol_slot_t lag,
+                                 sol_slot_t highest_blockstore,
+                                 sol_slot_t highest_replayed) {
+    if (!v || !v->rpc || !cfg) return;
+
+    uint32_t rps = cfg->normal_rps;
+    size_t max_conn = cfg->normal_max_conn;
+    const char* mode_name = "normal";
+
+    if (mode == 2u) {
+        rps = cfg->severe_rps;
+        max_conn = cfg->severe_max_conn;
+        mode_name = "severe";
+    } else if (mode == 1u) {
+        rps = cfg->high_rps;
+        max_conn = cfg->high_max_conn;
+        mode_name = "high";
+    }
+
+    sol_rpc_set_rate_limit(v->rpc, rps, 0u);
+    sol_rpc_set_max_connections(v->rpc, max_conn);
+
+    sol_log_info("RPC backpressure mode=%s lag=%lu blockstore_highest=%lu replayed=%lu "
+                 "rate_limit_rps=%u max_conn=%lu",
+                 mode_name,
+                 (unsigned long)lag,
+                 (unsigned long)highest_blockstore,
+                 (unsigned long)highest_replayed,
+                 (unsigned)rps,
+                 (unsigned long)max_conn);
+}
+
 /*
  * Main validator loop
  */
@@ -5784,7 +5936,11 @@ validator_run(validator_t* v) {
     uint64_t last_stats_ns = 0;
     uint64_t last_root_ns = 0;
     uint64_t last_dev_halt_check_ns = 0;
+    uint64_t last_rpc_backpressure_ns = 0;
     bool dev_halt_logged = false;
+    bool rpc_backpressure_cfg_logged = false;
+    uint8_t rpc_backpressure_mode = 0;
+    validator_rpc_backpressure_config_t rpc_backpressure_cfg = {0};
     const uint64_t stats_period_ns = 10ULL * 1000ULL * 1000ULL * 1000ULL;
     const uint64_t root_period_ns = 1ULL * 1000ULL * 1000ULL * 1000ULL;
     uint64_t root_purge_period_ns = 15ULL * 1000ULL * 1000ULL * 1000ULL; /* 15s */
@@ -5828,6 +5984,11 @@ validator_run(validator_t* v) {
                  getenv("SOL_ROOT_PURGE_PERIOD_MS") || getenv("SOL_ROOT_PURGE_STEP")
                      ? " (env override)"
                      : "");
+
+    rpc_backpressure_cfg = validator_rpc_backpressure_config();
+    if (v->rpc && rpc_backpressure_cfg.enabled) {
+        validator_rpc_backpressure_apply(v, &rpc_backpressure_cfg, 0u, 0u, 0u, 0u);
+    }
 
     while (!g_shutdown) {
         uint64_t now_ns = monotonic_time_ns();
@@ -5875,6 +6036,50 @@ validator_run(validator_t* v) {
         /* Keep leader schedule populated for upcoming catchup slots. */
         validator_maybe_refresh_rpc_leader_schedule(v);
         validator_maybe_update_tpu_forwarding(v, now_ns);
+
+        if (v->rpc && v->replay && v->blockstore && rpc_backpressure_cfg.enabled) {
+            if (!rpc_backpressure_cfg_logged) {
+                rpc_backpressure_cfg_logged = true;
+                sol_log_info("RPC backpressure config: period_ms=%lu high_slots=%lu severe_slots=%lu "
+                             "clear_slots=%lu normal_rps=%u high_rps=%u severe_rps=%u "
+                             "normal_max_conn=%lu high_max_conn=%lu severe_max_conn=%lu",
+                             (unsigned long)(rpc_backpressure_cfg.period_ns / 1000000ULL),
+                             (unsigned long)rpc_backpressure_cfg.high_slots,
+                             (unsigned long)rpc_backpressure_cfg.severe_slots,
+                             (unsigned long)rpc_backpressure_cfg.clear_slots,
+                             (unsigned)rpc_backpressure_cfg.normal_rps,
+                             (unsigned)rpc_backpressure_cfg.high_rps,
+                             (unsigned)rpc_backpressure_cfg.severe_rps,
+                             (unsigned long)rpc_backpressure_cfg.normal_max_conn,
+                             (unsigned long)rpc_backpressure_cfg.high_max_conn,
+                             (unsigned long)rpc_backpressure_cfg.severe_max_conn);
+            }
+
+            if (last_rpc_backpressure_ns == 0 ||
+                (now_ns - last_rpc_backpressure_ns) >= rpc_backpressure_cfg.period_ns) {
+                last_rpc_backpressure_ns = now_ns;
+
+                sol_slot_t highest_blockstore = sol_blockstore_highest_slot(v->blockstore);
+                sol_slot_t highest_replayed = sol_replay_highest_replayed_slot(v->replay);
+                sol_slot_t replay_lag = highest_blockstore > highest_replayed
+                    ? (highest_blockstore - highest_replayed)
+                    : 0;
+
+                uint8_t target_mode =
+                    validator_rpc_backpressure_target_mode(replay_lag,
+                                                           rpc_backpressure_mode,
+                                                           &rpc_backpressure_cfg);
+                if (target_mode != rpc_backpressure_mode) {
+                    validator_rpc_backpressure_apply(v,
+                                                     &rpc_backpressure_cfg,
+                                                     target_mode,
+                                                     replay_lag,
+                                                     highest_blockstore,
+                                                     highest_replayed);
+                    rpc_backpressure_mode = target_mode;
+                }
+            }
+        }
 
         /* Non-voting or fast-replay mode: advance root based on replay progress
          * so bank_forks doesn't grow without bound. */
