@@ -133,6 +133,30 @@ sudo systemctl status solana-validator
 journalctl -u solana-validator -f
 ```
 
+### Systemd Service (Mainnet RPC+Voting Canary)
+
+Use the dedicated canary profile service when running one combined RPC+voting
+node and you want replay-protective defaults from
+`scripts/run-mainnet-rpc-voting.sh`.
+
+```bash
+# Install env file + unit
+sudo bash ./scripts/install-mainnet-rpc-voting-service.sh
+
+# Edit required keys/paths
+sudo editor /etc/solana-c/mainnet-rpc-voting.env
+
+# Start
+sudo systemctl daemon-reload
+sudo systemctl enable --now solana-validator-rpc-voting
+sudo journalctl -u solana-validator-rpc-voting -f
+```
+
+Required env values in `/etc/solana-c/mainnet-rpc-voting.env`:
+
+- `IDENTITY_PATH`
+- `VOTE_ACCOUNT`
+
 ### Docker Compose
 
 ```bash

@@ -51,6 +51,13 @@ bash ./scripts/run-mainnet-rpc-voting.sh ledger.mainnet
 # Canary gate (health + RPC smoke + sync/replay soak)
 LOG_FILE=ledger.mainnet/validator.log \
 bash ./scripts/run-mainnet-canary-gate.sh 3600
+
+# Optional: install dedicated systemd unit for RPC+voting canary
+sudo bash ./scripts/install-mainnet-rpc-voting-service.sh
+sudo editor /etc/solana-c/mainnet-rpc-voting.env
+sudo systemctl daemon-reload
+sudo systemctl enable --now solana-validator-rpc-voting
+sudo journalctl -u solana-validator-rpc-voting -f
 ```
 
 ## Snapshots (bootstrap)

@@ -1,0 +1,37 @@
+[Unit]
+Description=Solana C Mainnet RPC+Voting Canary
+Documentation=https://github.com/solana-c/solana-c
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solana
+Group=solana
+WorkingDirectory=/home/ubuntu/solana-c
+EnvironmentFile=/etc/solana-c/mainnet-rpc-voting.env
+ExecStart=/home/ubuntu/solana-c/scripts/run-mainnet-rpc-voting.sh ${LEDGER_DIR}
+
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=0
+TimeoutStopSec=90
+
+LimitNOFILE=1000000
+LimitNPROC=65535
+LimitMEMLOCK=infinity
+TasksMax=infinity
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+RestrictSUIDSGID=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solana-c-rpc-voting
+
+[Install]
+WantedBy=multi-user.target
