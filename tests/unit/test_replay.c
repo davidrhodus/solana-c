@@ -869,6 +869,100 @@ TEST(replay_start_hash_mismatch_not_dead) {
     sol_entry_cleanup(&entry);
 }
 
+TEST(replay_parent_ready_requires_available_parent) {
+    sol_bank_t* root = sol_bank_new(0, NULL, NULL, NULL);
+    TEST_ASSERT_NOT_NULL(root);
+
+    sol_bank_forks_t* forks = sol_bank_forks_new(root, NULL);
+    TEST_ASSERT_NOT_NULL(forks);
+
+    sol_blockstore_t* blockstore = sol_blockstore_new(NULL);
+    TEST_ASSERT_NOT_NULL(blockstore);
+
+    /* Insert an otherwise complete slot=2 block whose parent slot is 1. */
+    sol_shred_t shred;
+    uint8_t raw[1024];
+    size_t raw_len = 0;
+    create_mock_shred(&shred, raw, &raw_len, 2, 0, true);
+    TEST_ASSERT_EQ(sol_blockstore_insert_shred(blockstore, &shred, raw, raw_len), SOL_OK);
+    TEST_ASSERT(sol_blockstore_is_slot_complete(blockstore, 2));
+
+    sol_replay_t* replay = sol_replay_new(forks, blockstore, NULL);
+    TEST_ASSERT_NOT_NULL(replay);
+
+    sol_slot_t parent_slot = 0;
+    TEST_ASSERT(!sol_replay_parent_ready(replay, 2, &parent_slot));
+    TEST_ASSERT_EQ(parent_slot, 1);
+
+    sol_bank_t* bank1 = sol_bank_forks_new_from_parent(forks, 0, 1);
+    TEST_ASSERT_NOT_NULL(bank1);
+    TEST_ASSERT_EQ(sol_bank_forks_freeze(forks, 1), SOL_OK);
+
+    TEST_ASSERT(sol_replay_parent_ready(replay, 2, &parent_slot));
+    TEST_ASSERT_EQ(parent_slot, 1);
+
+    sol_replay_destroy(replay);
+    sol_blockstore_destroy(blockstore);
+    sol_bank_forks_destroy(forks);
+}
+
+TEST(replay_prewarm_slot_parses_valid_slot) {
+    sol_bank_config_t bank_cfg = SOL_BANK_CONFIG_DEFAULT;
+    bank_cfg.ticks_per_slot = 1;
+    bank_cfg.hashes_per_tick = 1;
+
+    sol_bank_t* root = sol_bank_new(0, NULL, NULL, &bank_cfg);
+    TEST_ASSERT_NOT_NULL(root);
+
+    sol_bank_forks_t* forks = sol_bank_forks_new(root, NULL);
+    TEST_ASSERT_NOT_NULL(forks);
+
+    sol_blockstore_t* blockstore = sol_blockstore_new(NULL);
+    TEST_ASSERT_NOT_NULL(blockstore);
+
+    sol_entry_t entry;
+    sol_entry_init(&entry);
+    entry.num_hashes = 1;
+    entry.num_transactions = 0;
+    const sol_hash_t* start_hash = sol_bank_blockhash(root);
+    TEST_ASSERT_NOT_NULL(start_hash);
+    sol_entry_compute_hash(&entry, start_hash, &entry.hash);
+
+    uint8_t entry_buf[256];
+    size_t entry_len = 0;
+    TEST_ASSERT_EQ(sol_entry_serialize(&entry, entry_buf, sizeof(entry_buf), &entry_len), SOL_OK);
+
+    uint8_t payload[512];
+    size_t payload_len = 0;
+    uint64_t entry_count = 1;
+    memcpy(payload + payload_len, &entry_count, 8);
+    payload_len += 8;
+    memcpy(payload + payload_len, entry_buf, entry_len);
+    payload_len += entry_len;
+
+    uint8_t raw[1024];
+    size_t raw_len = build_mock_legacy_data_shred(raw, sizeof(raw),
+                                                  1, 0, 0, 0,
+                                                  SOL_SHRED_FLAG_LAST_IN_SLOT,
+                                                  payload, payload_len);
+    TEST_ASSERT(raw_len > 0);
+
+    sol_shred_t shred;
+    TEST_ASSERT_EQ(sol_shred_parse(&shred, raw, raw_len), SOL_OK);
+    TEST_ASSERT_EQ(sol_blockstore_insert_shred(blockstore, &shred, raw, raw_len), SOL_OK);
+    TEST_ASSERT(sol_blockstore_is_slot_complete(blockstore, 1));
+
+    sol_replay_t* replay = sol_replay_new(forks, blockstore, NULL);
+    TEST_ASSERT_NOT_NULL(replay);
+    TEST_ASSERT(sol_replay_prewarm_slot(replay, 1));
+    TEST_ASSERT(!sol_replay_prewarm_slot(replay, 999999));
+
+    sol_replay_destroy(replay);
+    sol_blockstore_destroy(blockstore);
+    sol_bank_forks_destroy(forks);
+    sol_entry_cleanup(&entry);
+}
+
 /*
  * Null handling tests
  */
@@ -922,6 +1016,8 @@ static test_case_t replay_tests[] = {
     TEST_CASE(replay_reattempts_when_new_variants_arrive),
     TEST_CASE(replay_incomplete_ticks_not_dead),
     TEST_CASE(replay_start_hash_mismatch_not_dead),
+    TEST_CASE(replay_parent_ready_requires_available_parent),
+    TEST_CASE(replay_prewarm_slot_parses_valid_slot),
     /* Null handling */
     TEST_CASE(replay_null_handling),
 };

@@ -87,6 +87,11 @@ typedef struct {
  */
 typedef struct sol_bank sol_bank_t;
 
+typedef struct {
+    uint64_t    tx_exec_ns; /* tx scheduling + execution + tx-status writeback */
+    uint64_t    poh_ns;     /* PoH/tick advancement over batch entries */
+} sol_bank_process_entries_timing_t;
+
 /*
  * Create a new bank for a slot
  */
@@ -504,6 +509,15 @@ sol_err_t sol_bank_process_entry(
 sol_err_t sol_bank_process_entries(
     sol_bank_t*                 bank,
     const sol_entry_batch_t*    batch
+);
+
+/*
+ * Process entry batch with optional stage timing.
+ */
+sol_err_t sol_bank_process_entries_ex(
+    sol_bank_t*                             bank,
+    const sol_entry_batch_t*                batch,
+    sol_bank_process_entries_timing_t*      timing
 );
 
 /*

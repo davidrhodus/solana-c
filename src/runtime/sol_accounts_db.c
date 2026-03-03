@@ -126,6 +126,7 @@ struct sol_accounts_db {
     size_t                      appendvec_open_fds;
     size_t                      appendvec_open_fds_limit;
     int                         appendvec_fd_cache_warned;
+    size_t                      appendvec_fd_evict_cursor;
 
     /* Optional in-memory index for AppendVec storage (pubkey -> ref). */
     sol_appendvec_index_t*       appendvec_index;
@@ -147,7 +148,7 @@ struct sol_accounts_db {
     pthread_rwlock_t            lock;
 };
 
-#define SOL_ACCOUNTS_DB_MAX_STRIPES 1024u
+#define SOL_ACCOUNTS_DB_MAX_STRIPES 8192u
 
 static inline size_t
 floor_pow2_size(size_t x) {
@@ -1540,7 +1541,8 @@ appendvec_open_fd_limit(void) {
     const size_t default_limit = 262144u;
     const size_t min_limit = 256u;
     const size_t max_limit = 1048576u;
-    const size_t headroom = 1024u;
+    const size_t min_headroom = 128u;
+    const size_t max_headroom = 8192u;
 
     size_t limit = default_limit;
 
@@ -1558,8 +1560,19 @@ appendvec_open_fd_limit(void) {
 
     struct rlimit rl;
     if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
-        if ((size_t)rl.rlim_cur > headroom) {
-            size_t max_safe = (size_t)rl.rlim_cur - headroom;
+        size_t cur = (size_t)rl.rlim_cur;
+        /* On low ulimit hosts, reserve a much larger fraction so RPC/gossip
+         * sockets don't hit EMFILE during replay bootstrap. */
+        size_t headroom = (cur < 16384u) ? (cur / 2u) : (cur / 8u);
+        if (headroom < min_headroom) headroom = min_headroom;
+        if (headroom > max_headroom) headroom = max_headroom;
+
+        if (cur > min_limit && headroom + min_limit >= cur) {
+            headroom = cur - min_limit;
+        }
+
+        if (cur > headroom) {
+            size_t max_safe = cur - headroom;
             if (limit > max_safe) limit = max_safe;
         } else {
             limit = min_limit;
@@ -1568,6 +1581,36 @@ appendvec_open_fd_limit(void) {
 
     if (limit < min_limit) limit = min_limit;
     return limit;
+}
+
+static int
+appendvec_evict_one_fd_locked(sol_accounts_db_t* db,
+                              uint64_t avoid_file_key) {
+    if (!db || !db->appendvec_files || db->appendvec_open_fds == 0) return -1;
+
+    sol_map_t* files = db->appendvec_files;
+    size_t cap = files->capacity;
+    if (cap == 0) return -1;
+
+    size_t idx = db->appendvec_fd_evict_cursor % cap;
+    for (size_t scanned = 0; scanned < cap; scanned++) {
+        if (files->ctrl[idx] & SOL_MAP_OCCUPIED) {
+            uint64_t* keyp = (uint64_t*)((char*)files->keys + idx * files->key_size);
+            appendvec_file_t** valp =
+                (appendvec_file_t**)((char*)files->vals + idx * files->val_size);
+            appendvec_file_t* f = valp ? *valp : NULL;
+            if (f && f->fd >= 0 && !f->writable && *keyp != avoid_file_key) {
+                int fd = f->fd;
+                f->fd = -1;
+                if (db->appendvec_open_fds > 0) db->appendvec_open_fds--;
+                db->appendvec_fd_evict_cursor = (idx + 1u) % cap;
+                return fd;
+            }
+        }
+        idx = (idx + 1u) % cap;
+    }
+
+    return -1;
 }
 
 static sol_err_t
@@ -1621,6 +1664,7 @@ appendvec_get_fd(sol_accounts_db_t* db,
     }
 
     int old_fd_to_close = -1;
+    int evicted_fd_to_close = -1;
 
     pthread_rwlock_wrlock(&db->appendvec_lock);
 
@@ -1647,6 +1691,12 @@ appendvec_get_fd(sol_accounts_db_t* db,
     if (!had_open_fd &&
         db->appendvec_open_fds_limit > 0 &&
         db->appendvec_open_fds >= db->appendvec_open_fds_limit) {
+        evicted_fd_to_close = appendvec_evict_one_fd_locked(db, file_key);
+    }
+
+    if (!had_open_fd &&
+        db->appendvec_open_fds_limit > 0 &&
+        db->appendvec_open_fds >= db->appendvec_open_fds_limit) {
         if (!db->appendvec_fd_cache_warned) {
             db->appendvec_fd_cache_warned = 1;
             sol_log_warn("AppendVec FD cache limit reached (%zu); using ephemeral opens",
@@ -1656,6 +1706,7 @@ appendvec_get_fd(sol_accounts_db_t* db,
             appendvec_file_t* f = sol_calloc(1, sizeof(*f));
             if (!f) {
                 pthread_rwlock_unlock(&db->appendvec_lock);
+                if (evicted_fd_to_close >= 0) close(evicted_fd_to_close);
                 close(fd);
                 return SOL_ERR_NOMEM;
             }
@@ -1671,6 +1722,7 @@ appendvec_get_fd(sol_accounts_db_t* db,
             if (!slot) {
                 sol_free(f);
                 pthread_rwlock_unlock(&db->appendvec_lock);
+                if (evicted_fd_to_close >= 0) close(evicted_fd_to_close);
                 close(fd);
                 return SOL_ERR_NOMEM;
             }
@@ -1682,6 +1734,7 @@ appendvec_get_fd(sol_accounts_db_t* db,
         if (out_ephemeral) *out_ephemeral = true;
         if (out_file) *out_file = cur;
         pthread_rwlock_unlock(&db->appendvec_lock);
+        if (evicted_fd_to_close >= 0) close(evicted_fd_to_close);
         return SOL_OK;
     }
 
@@ -1689,6 +1742,7 @@ appendvec_get_fd(sol_accounts_db_t* db,
         appendvec_file_t* f = sol_calloc(1, sizeof(*f));
         if (!f) {
             pthread_rwlock_unlock(&db->appendvec_lock);
+            if (evicted_fd_to_close >= 0) close(evicted_fd_to_close);
             close(fd);
             return SOL_ERR_NOMEM;
         }
@@ -1705,6 +1759,7 @@ appendvec_get_fd(sol_accounts_db_t* db,
         if (!slot) {
             sol_free(f);
             pthread_rwlock_unlock(&db->appendvec_lock);
+            if (evicted_fd_to_close >= 0) close(evicted_fd_to_close);
             close(fd);
             return SOL_ERR_NOMEM;
         }
@@ -1733,6 +1788,9 @@ appendvec_get_fd(sol_accounts_db_t* db,
 
     if (old_fd_to_close >= 0) {
         close(old_fd_to_close);
+    }
+    if (evicted_fd_to_close >= 0) {
+        close(evicted_fd_to_close);
     }
 
     return SOL_OK;
@@ -3087,6 +3145,7 @@ sol_accounts_db_new(const sol_accounts_db_config_t* config) {
             db->appendvec_open_fds = 0;
             db->appendvec_open_fds_limit = appendvec_open_fd_limit();
             db->appendvec_fd_cache_warned = 0;
+            db->appendvec_fd_evict_cursor = 0;
 
             if (!db->config.quiet) {
                 sol_log_info("AccountsDB using AppendVec backend (dir=%s, index=%s)",
@@ -3159,7 +3218,10 @@ sol_accounts_db_new(const sol_accounts_db_config_t* config) {
         long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
         if (ncpu < 1) ncpu = 1;
 
-        size_t stripes = (size_t)ncpu * 4u;
+        /* Heavy replay runs many concurrent account reads/writes. A larger
+         * stripe count materially lowers hot-bucket lock contention on
+         * high-core hosts. */
+        size_t stripes = (size_t)ncpu * 16u;
         if (stripes > SOL_ACCOUNTS_DB_MAX_STRIPES) stripes = SOL_ACCOUNTS_DB_MAX_STRIPES;
         stripes = floor_pow2_size(stripes);
         if (stripes == 0) stripes = 1;
@@ -3814,6 +3876,7 @@ sol_accounts_db_store(sol_accounts_db_t* db, const sol_pubkey_t* pubkey,
 sol_err_t
 sol_accounts_db_fixup_builtin_program_accounts(sol_accounts_db_t* db) {
     if (!db) return SOL_ERR_INVAL;
+    uint64_t fixup_t0_ms = monotonic_ms();
 
     /* System Program: canonical metadata+data per Agave mainnet. */
     static const uint8_t system_program_data[] = "solana_system_program";
@@ -3852,6 +3915,19 @@ sol_accounts_db_fixup_builtin_program_accounts(sol_accounts_db_t* db) {
     }
     sol_log_warn("fixup_builtin: Applying System Program fix");
 
+    if (db->config.storage_type == SOL_ACCOUNTS_STORAGE_APPENDVEC && db->appendvec_index) {
+        sol_appendvec_index_val_t v = {0};
+        if (sol_appendvec_index_get(db->appendvec_index, &SOL_SYSTEM_PROGRAM_ID, &v)) {
+            sol_log_info("fixup_builtin: pre-store appendvec ref slot=%lu file=%lu off=%lu lamports=%lu",
+                         (unsigned long)v.slot,
+                         (unsigned long)v.file_key,
+                         (unsigned long)v.record_offset,
+                         (unsigned long)v.lamports);
+        } else {
+            sol_log_info("fixup_builtin: pre-store appendvec ref missing");
+        }
+    }
+
     sol_account_t* fixed = sol_account_new(1, system_program_data_len, &SOL_NATIVE_LOADER_ID);
     if (!fixed) {
         return SOL_ERR_NOMEM;
@@ -3860,21 +3936,37 @@ sol_accounts_db_fixup_builtin_program_accounts(sol_accounts_db_t* db) {
     fixed->meta.executable = true;
     fixed->meta.rent_epoch = UINT64_MAX;
 
+    uint64_t store_t0_ms = monotonic_ms();
     sol_err_t err = sol_accounts_db_store(db, &SOL_SYSTEM_PROGRAM_ID, fixed);
+    uint64_t store_dt_ms = monotonic_ms() - store_t0_ms;
     sol_account_destroy(fixed);
 
+    if (err != SOL_OK) {
+        sol_log_error("fixup_builtin: store failed after %lums: %s",
+                      (unsigned long)store_dt_ms,
+                      sol_err_str(err));
+        return err;
+    }
+    sol_log_info("fixup_builtin: store completed in %lums (total=%lums)",
+                 (unsigned long)store_dt_ms,
+                 (unsigned long)(monotonic_ms() - fixup_t0_ms));
+
     /* Verify the fix took effect */
-    if (err == SOL_OK) {
-        sol_account_t* verify = sol_accounts_db_load(db, &SOL_SYSTEM_PROGRAM_ID);
-        if (!verify) {
-            sol_log_error("fixup_builtin: System Program STILL NOT FOUND after store!");
-        } else {
-            sol_log_info("fixup_builtin: Verified System Program after fix: lamports=%lu exec=%d data_len=%lu",
-                         (unsigned long)verify->meta.lamports,
-                         (int)verify->meta.executable,
-                         (unsigned long)verify->meta.data_len);
-            sol_account_destroy(verify);
-        }
+    uint64_t verify_t0_ms = monotonic_ms();
+    sol_account_t* verify = sol_accounts_db_load(db, &SOL_SYSTEM_PROGRAM_ID);
+    uint64_t verify_dt_ms = monotonic_ms() - verify_t0_ms;
+    if (!verify) {
+        sol_log_error("fixup_builtin: System Program STILL NOT FOUND after store! (verify=%lums total=%lums)",
+                      (unsigned long)verify_dt_ms,
+                      (unsigned long)(monotonic_ms() - fixup_t0_ms));
+    } else {
+        sol_log_info("fixup_builtin: Verified System Program after fix: lamports=%lu exec=%d data_len=%lu (verify=%lums total=%lums)",
+                     (unsigned long)verify->meta.lamports,
+                     (int)verify->meta.executable,
+                     (unsigned long)verify->meta.data_len,
+                     (unsigned long)verify_dt_ms,
+                     (unsigned long)(monotonic_ms() - fixup_t0_ms));
+        sol_account_destroy(verify);
     }
 
     return err;

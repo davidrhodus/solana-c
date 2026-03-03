@@ -23,11 +23,11 @@ enum {
     SOL_REPAIR_SLOT_PEER_CACHE_SIZE = 2048, /* power of two */
     SOL_REPAIR_SLOT_PEER_TTL_MS = 30 * 1000,
     /* Best-effort hedge fanout for tail-latency sensitive catchup. */
-    SOL_REPAIR_MAX_FANOUT = 32,
+    SOL_REPAIR_MAX_FANOUT = 64,
     /* Throttle timeout scans in sol_repair_run_once. Scanning the full pending
      * table every main-loop iteration is expensive and can cause packet drops
      * under high repair rates. */
-    SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS = 10,
+    SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS = 2,
 };
 
 typedef struct {
@@ -116,6 +116,7 @@ struct sol_repair {
     /* Pending requests */
     sol_repair_pending_t* pending;
     size_t              pending_count;
+    size_t              pending_scan_cursor;
     pthread_mutex_t     pending_lock;
 
     /* Nonce -> pending index map (open addressing). Protected by pending_lock. */
@@ -530,8 +531,26 @@ slot_peer_cache_update_locked(sol_repair_t* repair,
  */
 static sol_repair_pending_t*
 find_free_pending(sol_repair_t* repair) {
-    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
+    if (!repair || !repair->pending) {
+        return NULL;
+    }
+    size_t cap = repair->config.max_pending_requests;
+    if (cap == 0u) {
+        return NULL;
+    }
+
+    size_t start = repair->pending_scan_cursor;
+    if (start >= cap) {
+        start = 0u;
+    }
+
+    for (size_t n = 0; n < cap; n++) {
+        size_t i = start + n;
+        if (i >= cap) {
+            i -= cap;
+        }
         if (!repair->pending[i].active) {
+            repair->pending_scan_cursor = (i + 1u < cap) ? (i + 1u) : 0u;
             return &repair->pending[i];
         }
     }
@@ -1059,7 +1078,7 @@ process_timeouts(sol_repair_t* repair) {
      * too small, we risk "retrying" a request (updating sent_time/retries) but
      * not actually sending it, which stalls repair. Keep this large enough to
      * make forward progress per timeout scan. */
-    enum { SOL_REPAIR_TIMEOUT_SEND_MAX = 4096 };
+    enum { SOL_REPAIR_TIMEOUT_SEND_MAX = 32768 };
     sol_repair_send_action_t actions[SOL_REPAIR_TIMEOUT_SEND_MAX];
     size_t action_len = 0;
 
@@ -1337,6 +1356,12 @@ pending_deactivate_locked(sol_repair_t* repair, sol_repair_pending_t* pending) {
     req_map_del_locked(repair, pending->type, pending->slot, pending->shred_index);
     nonce_map_del_locked(repair, pending->nonce);
     pending->active = false;
+    if (pending_ptr_is_tracked(repair, pending)) {
+        size_t idx = (size_t)(pending - repair->pending);
+        if (idx < repair->config.max_pending_requests) {
+            repair->pending_scan_cursor = idx;
+        }
+    }
     if (repair->pending_count > 0) {
         repair->pending_count--;
     }
@@ -1723,20 +1748,22 @@ process_response(sol_repair_t* repair, const uint8_t* data, size_t len,
         /* Treat any valid response as a "warm" signal for ping-cache gating. */
         mark_peer_warm(repair, &pending->peer_pubkey);
 
-        bool type_ok = true;
+        bool type_mismatch = false;
         if (pending->type == SOL_REPAIR_SHRED) {
-            type_ok = (pending->is_data == shred_is_data);
+            type_mismatch = (pending->is_data != shred_is_data);
         }
 
-        if (type_ok) {
-            uint64_t now_ms = sol_gossip_now_ms();
-            slot_peer_cache_update_locked(repair, shred.slot, &pending->peer, &pending->peer_pubkey, now_ms);
-            pending_deactivate_locked(repair, pending);
+        /* WindowIndex responses are keyed by slot/index, but peers may return
+         * either data or coding shreds for that index. Keep type mismatch as a
+         * diagnostic signal, but always clear the pending request so catchup can
+         * continue issuing fresh fanout requests for the remaining gap. */
+        uint64_t now_ms = sol_gossip_now_ms();
+        slot_peer_cache_update_locked(repair, shred.slot, &pending->peer, &pending->peer_pubkey, now_ms);
+        pending_deactivate_locked(repair, pending);
+        pending_satisfied = true;
+        if (!type_mismatch) {
             (void)__atomic_fetch_add(&repair->stats.shreds_repaired, 1u, __ATOMIC_RELAXED);
-            pending_satisfied = true;
         } else {
-            /* We got a shred for the right slot/index but of the wrong type. Do
-             * not deactivate the pending entry so we can keep retrying. */
             (void)__atomic_fetch_add(&repair->stats.duplicates, 1u, __ATOMIC_RELAXED);
         }
     } else {
@@ -1985,6 +2012,7 @@ sol_repair_new(const sol_repair_config_t* config,
     if (repair->nonce_counter == 0) {
         repair->nonce_counter = 1;
     }
+    repair->pending_scan_cursor = 0;
 
     /* Allocate pending requests */
     repair->pending = sol_calloc(
@@ -2176,7 +2204,7 @@ sol_repair_run_once(sol_repair_t* repair, uint32_t timeout_ms) {
     }
 
     /* Drain repair socket (responses). */
-    enum { SOL_REPAIR_RECV_BUDGET = 32768 };
+    enum { SOL_REPAIR_RECV_BUDGET = 65536 };
     {
         size_t received = 0;
         sol_udp_pkt_t pkts[SOL_NET_BATCH_SIZE];
@@ -2219,11 +2247,10 @@ sol_repair_run_once(sol_repair_t* repair, uint32_t timeout_ms) {
     size_t pending_count = sol_repair_pending_count(repair);
     /* When pending is large, retries must be driven frequently to avoid
      * multi-second stalls on a small number of missing shreds. */
-    uint64_t interval_ms = (uint64_t)(repair->config.request_timeout_ms / 2u);
-    if (pending_count > 1024u) {
-        interval_ms = (uint64_t)SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS;
-    } else if (interval_ms < (uint64_t)SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS) {
-        interval_ms = (uint64_t)SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS;
+    uint64_t interval_ms = (uint64_t)SOL_REPAIR_TIMEOUT_CHECK_MIN_INTERVAL_MS;
+    if (pending_count > 0u && pending_count <= 256u) {
+        /* Last-gap catchup is extremely sensitive to timeout scan cadence. */
+        interval_ms = 1u;
     }
     if (pending_count > 0 &&
         (repair->last_timeout_check_ms == 0 || (now_ms - repair->last_timeout_check_ms) >= interval_ms)) {
@@ -2281,6 +2308,7 @@ sol_repair_request_shred(sol_repair_t* repair, sol_slot_t slot,
     pending->sent_time = sol_gossip_now_ms();
     pending->retries = 0;
     pending->hedge_retry_mark = UINT32_MAX;
+    pending->last_hedge_sent_time = 0;
     pending->active = true;
     repair->pending_count++;
 
@@ -2318,7 +2346,13 @@ sol_repair_request_shred_fanout(sol_repair_t* repair, sol_slot_t slot,
         fanout = (uint32_t)SOL_REPAIR_MAX_FANOUT;
     }
 
-    enum { SOL_REPAIR_HEDGE_DELAY_MS = 5 };
+    enum {
+        /* Keep first hedge fast, but avoid flooding duplicate responses. */
+        SOL_REPAIR_HEDGE_DELAY_MS = 3,
+        /* For high-fanout "last gap" repair, allow repeated hedge bursts,
+         * but keep enough spacing to prevent socket-queue saturation. */
+        SOL_REPAIR_HEDGE_BURST_MIN_INTERVAL_MS = 15,
+    };
 
     uint64_t now_ms = sol_gossip_now_ms();
     bool created = false;
@@ -2353,6 +2387,7 @@ sol_repair_request_shred_fanout(sol_repair_t* repair, sol_slot_t slot,
         pending->sent_time = now_ms;
         pending->retries = 0;
         pending->hedge_retry_mark = UINT32_MAX;
+        pending->last_hedge_sent_time = 0;
         pending->active = true;
         repair->pending_count++;
 
@@ -2375,13 +2410,27 @@ sol_repair_request_shred_fanout(sol_repair_t* repair, sol_slot_t slot,
     (void)ensure_nonce_tracked_locked(repair, pending);
 
     if (!created) {
-        /* Rate limit hedges to once per retry attempt. */
-        if (pending->hedge_retry_mark == pending->retries) {
+        uint64_t since_send_ms =
+            (now_ms >= pending->sent_time) ? (now_ms - pending->sent_time) : 0u;
+        uint64_t since_hedge_ms =
+            (pending->last_hedge_sent_time != 0u && now_ms >= pending->last_hedge_sent_time)
+                ? (now_ms - pending->last_hedge_sent_time)
+                : UINT64_MAX;
+        bool high_fanout_burst = (fanout >= 24u);
+
+        /* Normal mode: once per retry.
+         *
+         * High-fanout mode (critical tail catchup): permit periodic hedge bursts
+         * within a retry window, bounded by a short minimum interval. */
+        if (!high_fanout_burst && pending->hedge_retry_mark == pending->retries) {
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
-        /* Don't hedge immediately after a (re)send. */
-        if (now_ms >= pending->sent_time && (now_ms - pending->sent_time) < SOL_REPAIR_HEDGE_DELAY_MS) {
+        if (since_send_ms < SOL_REPAIR_HEDGE_DELAY_MS) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_OK;
+        }
+        if (high_fanout_burst && since_hedge_ms < SOL_REPAIR_HEDGE_BURST_MIN_INTERVAL_MS) {
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
@@ -2413,6 +2462,7 @@ sol_repair_request_shred_fanout(sol_repair_t* repair, sol_slot_t slot,
     }
 
     pending->hedge_retry_mark = pending->retries;
+    pending->last_hedge_sent_time = now_ms;
     pthread_mutex_unlock(&repair->pending_lock);
 
     if (send_primary) {
@@ -2448,10 +2498,15 @@ sol_repair_request_highest_fanout(sol_repair_t* repair, sol_slot_t slot,
         fanout = (uint32_t)SOL_REPAIR_MAX_FANOUT;
     }
 
-    enum { SOL_REPAIR_HEDGE_DELAY_MS = 5 };
+    enum {
+        /* Keep first hedge fast, but avoid flooding duplicate responses. */
+        SOL_REPAIR_HEDGE_DELAY_MS = 3,
+        SOL_REPAIR_HEDGE_BURST_MIN_INTERVAL_MS = 15,
+    };
 
     uint64_t now_ms = sol_gossip_now_ms();
     bool created = false;
+    bool index_advanced = false;
 
     sol_repair_pending_t primary_snap;
     bool send_primary = false;
@@ -2482,6 +2537,7 @@ sol_repair_request_highest_fanout(sol_repair_t* repair, sol_slot_t slot,
         pending->sent_time = now_ms;
         pending->retries = 0;
         pending->hedge_retry_mark = UINT32_MAX;
+        pending->last_hedge_sent_time = 0;
         pending->active = true;
         repair->pending_count++;
 
@@ -2493,6 +2549,18 @@ sol_repair_request_highest_fanout(sol_repair_t* repair, sol_slot_t slot,
 
         created = true;
         now_ms = sol_gossip_now_ms();
+    } else if (shred_index > pending->shred_index) {
+        /* Keep HighestWindowIndex requests moving forward as slot metadata
+         * advances. Reusing a stale lower index can repeatedly return already
+         * known shreds and stall catchup on tail gaps. */
+        pending->shred_index = shred_index;
+        pending->sent_time = now_ms;
+        pending->hedge_retry_mark = UINT32_MAX;
+        pending->last_hedge_sent_time = 0;
+        primary_snap = *pending;
+        tracked = pending;
+        send_primary = true;
+        index_advanced = true;
     }
 
     if (!pending->active || pending->type != SOL_REPAIR_HIGHEST_SHRED) {
@@ -2502,14 +2570,24 @@ sol_repair_request_highest_fanout(sol_repair_t* repair, sol_slot_t slot,
 
     (void)ensure_nonce_tracked_locked(repair, pending);
 
-    if (!created) {
-        /* Rate limit hedges to once per retry attempt. */
-        if (pending->hedge_retry_mark == pending->retries) {
+    if (!created && !index_advanced) {
+        uint64_t since_send_ms =
+            (now_ms >= pending->sent_time) ? (now_ms - pending->sent_time) : 0u;
+        uint64_t since_hedge_ms =
+            (pending->last_hedge_sent_time != 0u && now_ms >= pending->last_hedge_sent_time)
+                ? (now_ms - pending->last_hedge_sent_time)
+                : UINT64_MAX;
+        bool high_fanout_burst = (fanout >= 24u);
+
+        if (!high_fanout_burst && pending->hedge_retry_mark == pending->retries) {
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
-        /* Don't hedge immediately after a (re)send. */
-        if (now_ms >= pending->sent_time && (now_ms - pending->sent_time) < SOL_REPAIR_HEDGE_DELAY_MS) {
+        if (since_send_ms < SOL_REPAIR_HEDGE_DELAY_MS) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_OK;
+        }
+        if (high_fanout_burst && since_hedge_ms < SOL_REPAIR_HEDGE_BURST_MIN_INTERVAL_MS) {
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
@@ -2541,6 +2619,7 @@ sol_repair_request_highest_fanout(sol_repair_t* repair, sol_slot_t slot,
     }
 
     pending->hedge_retry_mark = pending->retries;
+    pending->last_hedge_sent_time = now_ms;
     pthread_mutex_unlock(&repair->pending_lock);
 
     if (send_primary) {
@@ -2571,9 +2650,31 @@ sol_repair_request_highest(sol_repair_t* repair, sol_slot_t slot, uint64_t shred
 
     pthread_mutex_lock(&repair->pending_lock);
 
-    if (find_pending_slot_only(repair, SOL_REPAIR_HIGHEST_SHRED, slot)) {
+    sol_repair_pending_t* existing = find_pending_slot_only(repair, SOL_REPAIR_HIGHEST_SHRED, slot);
+    if (existing) {
+        if (shred_index <= existing->shred_index) {
+            pthread_mutex_unlock(&repair->pending_lock);
+            return SOL_OK;
+        }
+        /* Advance the tracked highest index so we don't keep polling an older
+         * frontier after new shreds are observed for the slot. */
+        existing->shred_index = shred_index;
+        existing->sent_time = sol_gossip_now_ms();
+        existing->hedge_retry_mark = UINT32_MAX;
+        existing->last_hedge_sent_time = 0;
+        (void)ensure_nonce_tracked_locked(repair, existing);
+        snap = *existing;
+        tracked = existing;
         pthread_mutex_unlock(&repair->pending_lock);
-        return SOL_OK;
+        sol_err_t err = send_repair_request_unlocked_pending(repair, &snap);
+        if (err != SOL_OK && tracked) {
+            pthread_mutex_lock(&repair->pending_lock);
+            if (tracked->active && tracked->nonce == snap.nonce) {
+                pending_deactivate_locked(repair, tracked);
+            }
+            pthread_mutex_unlock(&repair->pending_lock);
+        }
+        return err;
     }
 
     sol_repair_pending_t* pending = find_pending_slot(repair, SOL_REPAIR_HIGHEST_SHRED);
@@ -2594,6 +2695,7 @@ sol_repair_request_highest(sol_repair_t* repair, sol_slot_t slot, uint64_t shred
     pending->sent_time = sol_gossip_now_ms();
     pending->retries = 0;
     pending->hedge_retry_mark = UINT32_MAX;
+    pending->last_hedge_sent_time = 0;
     pending->active = true;
     repair->pending_count++;
 
@@ -2648,6 +2750,7 @@ sol_repair_request_orphan(sol_repair_t* repair, sol_slot_t slot) {
     pending->sent_time = sol_gossip_now_ms();
     pending->retries = 0;
     pending->hedge_retry_mark = UINT32_MAX;
+    pending->last_hedge_sent_time = 0;
     pending->active = true;
     repair->pending_count++;
 
@@ -2763,6 +2866,34 @@ sol_repair_pending_slot_stats(sol_repair_t* repair,
 }
 
 size_t
+sol_repair_prune_pending_outside_window(sol_repair_t* repair,
+                                        sol_slot_t min_slot,
+                                        sol_slot_t max_slot) {
+    if (!repair || min_slot == 0) return 0;
+    if (max_slot != 0 && max_slot < min_slot) return 0;
+
+    size_t pruned = 0;
+    pthread_mutex_lock(&repair->pending_lock);
+    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
+        sol_repair_pending_t* p = &repair->pending[i];
+        if (!p->active) continue;
+        if (p->slot == 0) continue;
+        if (p->slot < min_slot) {
+            pending_deactivate_locked(repair, p);
+            pruned++;
+            continue;
+        }
+        if (max_slot != 0 && p->slot > max_slot) {
+            pending_deactivate_locked(repair, p);
+            pruned++;
+            continue;
+        }
+    }
+    pthread_mutex_unlock(&repair->pending_lock);
+    return pruned;
+}
+
+size_t
 sol_repair_max_pending(const sol_repair_t* repair) {
     if (!repair) return 0;
     return (size_t)repair->config.max_pending_requests;
@@ -2824,6 +2955,7 @@ sol_repair_request_ancestor_hashes(sol_repair_t* repair, sol_slot_t slot) {
     pending->sent_time = sol_gossip_now_ms();
     pending->retries = 0;
     pending->hedge_retry_mark = UINT32_MAX;
+    pending->last_hedge_sent_time = 0;
     pending->active = true;
     repair->pending_count++;
     (void)__atomic_fetch_add(&repair->ancestor_pending_count, 1u, __ATOMIC_RELAXED);

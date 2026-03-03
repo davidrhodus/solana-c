@@ -261,6 +261,34 @@ void sol_bank_forks_iterate(
 );
 
 /*
+ * Iterate banks for a specific slot only.
+ *
+ * Callback receives (bank_hash, bank, is_dead, ctx).
+ * Return false to stop iteration early.
+ */
+typedef bool (*sol_bank_forks_slot_iter_cb)(
+    const sol_hash_t*       bank_hash,
+    sol_bank_t*             bank,
+    bool                    is_dead,
+    void*                   ctx
+);
+
+void sol_bank_forks_iter_slot(
+    const sol_bank_forks_t*     forks,
+    sol_slot_t                  slot,
+    sol_bank_forks_slot_iter_cb callback,
+    void*                       ctx
+);
+
+/*
+ * Check whether a slot has at least one non-dead frozen bank.
+ */
+bool sol_bank_forks_has_frozen_slot(
+    const sol_bank_forks_t* forks,
+    sol_slot_t              slot
+);
+
+/*
  * Get all frozen banks (for voting)
  *
  * @param forks         Bank forks handle

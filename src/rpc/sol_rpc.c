@@ -4290,6 +4290,7 @@ rpc_client_thread_fn(void* arg) {
 static void*
 accept_thread_fn(void* arg) {
     sol_rpc_t* rpc = (sol_rpc_t*)arg;
+    uint64_t last_emfile_log_ms = 0;
 
     while (rpc->running) {
         struct sockaddr_in client_addr;
@@ -4302,9 +4303,21 @@ accept_thread_fn(void* arg) {
                 usleep(1000);
                 continue;
             }
+            if (errno == EMFILE || errno == ENFILE) {
+                uint64_t now = rpc_now_ms();
+                if (rpc->running &&
+                    (last_emfile_log_ms == 0 || (now - last_emfile_log_ms) >= 1000u)) {
+                    last_emfile_log_ms = now;
+                    sol_log_warn("RPC accept failed: %s (fd pressure; backing off)",
+                                 strerror(errno));
+                }
+                usleep(20000);
+                continue;
+            }
             if (rpc->running) {
                 sol_log_warn("RPC accept failed: %s", strerror(errno));
             }
+            usleep(1000);
             continue;
         }
 
@@ -4748,6 +4761,7 @@ ws_client_thread_fn(void* arg) {
 static void*
 ws_accept_thread_fn(void* arg) {
     sol_rpc_t* rpc = (sol_rpc_t*)arg;
+    uint64_t last_emfile_log_ms = 0;
 
     while (rpc->running) {
         struct sockaddr_in client_addr;
@@ -4760,9 +4774,21 @@ ws_accept_thread_fn(void* arg) {
                 usleep(1000);
                 continue;
             }
+            if (errno == EMFILE || errno == ENFILE) {
+                uint64_t now = rpc_now_ms();
+                if (rpc->running &&
+                    (last_emfile_log_ms == 0 || (now - last_emfile_log_ms) >= 1000u)) {
+                    last_emfile_log_ms = now;
+                    sol_log_warn("WebSocket accept failed: %s (fd pressure; backing off)",
+                                 strerror(errno));
+                }
+                usleep(20000);
+                continue;
+            }
             if (rpc->running) {
                 sol_log_warn("WebSocket accept failed: %s", strerror(errno));
             }
+            usleep(1000);
             continue;
         }
 

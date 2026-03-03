@@ -140,6 +140,8 @@ typedef struct {
     uint32_t            retries;        /* Number of retries */
     /* Hedged repair sends (best-effort) are rate-limited to once per retry. */
     uint32_t            hedge_retry_mark; /* retries value when we last hedged */
+    /* Last time we emitted a hedge burst for this request (ms). */
+    uint64_t            last_hedge_sent_time;
     bool                active;
 } sol_repair_pending_t;
 
@@ -402,6 +404,21 @@ size_t sol_repair_pending_count(sol_repair_t* repair);
 bool sol_repair_pending_slot_stats(sol_repair_t* repair,
                                   sol_slot_t slot,
                                   sol_repair_pending_slot_stats_t* out);
+
+/*
+ * Prune pending requests outside a slot window.
+ *
+ * Useful for catchup decongestion when the next replay slot is blocked and
+ * backlog is dominated by far-ahead repair requests.
+ *
+ * @param repair      Repair service
+ * @param min_slot    Inclusive lower bound (must be non-zero)
+ * @param max_slot    Inclusive upper bound (0 = no upper bound)
+ * @return number of pending requests removed
+ */
+size_t sol_repair_prune_pending_outside_window(sol_repair_t* repair,
+                                              sol_slot_t min_slot,
+                                              sol_slot_t max_slot);
 
 /*
  * Get configured maximum number of pending requests.

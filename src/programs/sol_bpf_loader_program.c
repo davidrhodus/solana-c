@@ -93,6 +93,70 @@ static _Atomic uint64_t g_sbf_prof_exec_ns = 0;
 static _Atomic uint64_t g_sbf_prof_wb_ns = 0;
 static _Atomic uint64_t g_sbf_prof_input_bytes = 0;
 static _Atomic uint64_t g_sbf_prof_meta_total = 0;
+static _Atomic uint64_t g_sbf_prof_last_log_ns = 0;
+
+static uint64_t
+sbf_profile_log_interval_ns(void) {
+    static _Atomic uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) {
+        return v;
+    }
+
+    /* Default to periodic logs every 5s while profiling. */
+    uint64_t interval_ms = 5000u;
+    const char* env = getenv("SOL_SBF_PROFILE_LOG_INTERVAL_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env) {
+            interval_ms = (uint64_t)parsed;
+        }
+    }
+
+    uint64_t interval_ns = interval_ms ? (interval_ms * 1000000ull) : 0ull;
+    __atomic_store_n(&cached, interval_ns, __ATOMIC_RELEASE);
+    return interval_ns;
+}
+
+static inline void
+sbf_profile_maybe_log(void) {
+    uint64_t interval_ns = sbf_profile_log_interval_ns();
+    if (interval_ns == 0u) return;
+
+    uint64_t now = monotonic_ns();
+    uint64_t last = __atomic_load_n(&g_sbf_prof_last_log_ns, __ATOMIC_RELAXED);
+    if (last != 0u && (now - last) < interval_ns) return;
+    if (!__atomic_compare_exchange_n(&g_sbf_prof_last_log_ns,
+                                     &last,
+                                     now,
+                                     false,
+                                     __ATOMIC_RELAXED,
+                                     __ATOMIC_RELAXED)) {
+        return;
+    }
+
+    uint64_t calls = __atomic_load_n(&g_sbf_prof_calls, __ATOMIC_RELAXED);
+    if (!calls) return;
+
+    uint64_t build_ns = __atomic_load_n(&g_sbf_prof_build_ns, __ATOMIC_RELAXED);
+    uint64_t map_ns = __atomic_load_n(&g_sbf_prof_map_ns, __ATOMIC_RELAXED);
+    uint64_t exec_ns = __atomic_load_n(&g_sbf_prof_exec_ns, __ATOMIC_RELAXED);
+    uint64_t wb_ns = __atomic_load_n(&g_sbf_prof_wb_ns, __ATOMIC_RELAXED);
+    uint64_t bytes = __atomic_load_n(&g_sbf_prof_input_bytes, __ATOMIC_RELAXED);
+    uint64_t metas = __atomic_load_n(&g_sbf_prof_meta_total, __ATOMIC_RELAXED);
+    uint64_t total_ns = build_ns + map_ns + exec_ns + wb_ns;
+
+    sol_log_info("sbf_profile_live: calls=%lu avg_ms(total/build/map/exec/wb)=%.3f/%.3f/%.3f/%.3f/%.3f avg_input_kb=%.2f avg_meta=%.2f",
+                 (unsigned long)calls,
+                 (double)total_ns / 1e6 / (double)calls,
+                 (double)build_ns / 1e6 / (double)calls,
+                 (double)map_ns / 1e6 / (double)calls,
+                 (double)exec_ns / 1e6 / (double)calls,
+                 (double)wb_ns / 1e6 / (double)calls,
+                 (double)bytes / 1024.0 / (double)calls,
+                 (double)metas / (double)calls);
+}
 
 static inline void
 sbf_profile_commit(uint64_t build_ns,
@@ -108,6 +172,7 @@ sbf_profile_commit(uint64_t build_ns,
     __atomic_fetch_add(&g_sbf_prof_wb_ns, wb_ns, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_sbf_prof_input_bytes, (uint64_t)input_len, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_sbf_prof_meta_total, (uint64_t)meta_count, __ATOMIC_RELAXED);
+    sbf_profile_maybe_log();
 }
 
 static void
@@ -342,10 +407,11 @@ enum {
 static pthread_once_t    g_bpf_prog_cache_once = PTHREAD_ONCE_INIT;
 static pthread_rwlock_t  g_bpf_prog_cache_lock;
 static sol_pubkey_map_t* g_bpf_prog_cache = NULL;
-static uint64_t          g_bpf_prog_cache_clock = 0;
+static _Atomic uint64_t  g_bpf_prog_cache_clock = 0;
 static size_t            g_bpf_prog_cache_total_bytes = 0;
 static size_t            g_bpf_prog_cache_max_bytes = 0;
 static size_t            g_bpf_prog_cache_max_entries = 0;
+static size_t            g_bpf_prog_cache_evict_cursor = 0;
 
 static inline void
 bpf_prog_handle_acquire(sol_bpf_prog_handle_t* h) {
@@ -482,27 +548,61 @@ bpf_prog_cache_remove_locked(const sol_pubkey_t* program_id) {
 static void
 bpf_prog_cache_evict_one_locked(void) {
     if (!g_bpf_prog_cache) return;
-    if (sol_map_size(g_bpf_prog_cache->inner) == 0) return;
+    if (!g_bpf_prog_cache->inner || sol_map_size(g_bpf_prog_cache->inner) == 0) return;
 
-    sol_pubkey_t victim_key = {0};
+    sol_map_t* m = g_bpf_prog_cache->inner;
+    size_t cap = m->capacity;
+    if (cap == 0) return;
+
+    /* Sample a bounded window first to keep eviction lock hold times low. */
+    size_t idx = g_bpf_prog_cache_evict_cursor % cap;
+    const size_t sample_window = cap < 256u ? cap : 256u;
     bool found = false;
+    size_t victim_idx = 0;
     uint64_t best = UINT64_MAX;
 
-    sol_map_iter_t it = sol_map_iter(g_bpf_prog_cache->inner);
-    void* keyp = NULL;
-    void* valp = NULL;
-    while (sol_map_iter_next(&it, &keyp, &valp)) {
-        sol_bpf_prog_handle_t* h = valp ? *(sol_bpf_prog_handle_t**)valp : NULL;
-        if (!h || !h->prog) continue;
-        if (h->last_used < best) {
-            best = h->last_used;
-            memcpy(victim_key.bytes, keyp, SOL_PUBKEY_SIZE);
-            found = true;
+    for (size_t scanned = 0; scanned < sample_window; scanned++) {
+        if (m->ctrl[idx] & SOL_MAP_OCCUPIED) {
+            void* valp = (char*)m->vals + idx * m->val_size;
+            sol_bpf_prog_handle_t* h = valp ? *(sol_bpf_prog_handle_t**)valp : NULL;
+            if (h && h->prog) {
+                uint64_t last = __atomic_load_n(&h->last_used, __ATOMIC_RELAXED);
+                if (last < best) {
+                    best = last;
+                    victim_idx = idx;
+                    found = true;
+                }
+            }
+        }
+        idx = (idx + 1u) % cap;
+    }
+
+    /* Fallback: if no victim in sampled window, scan full map once. */
+    if (!found) {
+        idx = g_bpf_prog_cache_evict_cursor % cap;
+        for (size_t scanned = 0; scanned < cap; scanned++) {
+            if (m->ctrl[idx] & SOL_MAP_OCCUPIED) {
+                void* valp = (char*)m->vals + idx * m->val_size;
+                sol_bpf_prog_handle_t* h = valp ? *(sol_bpf_prog_handle_t**)valp : NULL;
+                if (h && h->prog) {
+                    uint64_t last = __atomic_load_n(&h->last_used, __ATOMIC_RELAXED);
+                    if (last < best) {
+                        best = last;
+                        victim_idx = idx;
+                        found = true;
+                    }
+                }
+            }
+            idx = (idx + 1u) % cap;
         }
     }
 
     if (!found) return;
 
+    sol_pubkey_t victim_key = {0};
+    void* victim_keyp = (char*)m->keys + victim_idx * m->key_size;
+    memcpy(victim_key.bytes, victim_keyp, SOL_PUBKEY_SIZE);
+    g_bpf_prog_cache_evict_cursor = (victim_idx + 1u) % cap;
     bpf_prog_cache_remove_locked(&victim_key);
 }
 
@@ -534,6 +634,8 @@ bpf_prog_cache_get_locked(const sol_pubkey_t* program_id) {
     sol_bpf_prog_handle_t** slot = (sol_bpf_prog_handle_t**)sol_pubkey_map_get(g_bpf_prog_cache, program_id);
     sol_bpf_prog_handle_t* h = slot ? *slot : NULL;
     if (h) {
+        uint64_t tick = __atomic_add_fetch(&g_bpf_prog_cache_clock, 1u, __ATOMIC_RELAXED);
+        __atomic_store_n(&h->last_used, tick, __ATOMIC_RELAXED);
         bpf_prog_handle_acquire(h);
     }
     return h;
@@ -555,7 +657,8 @@ bpf_prog_cache_insert_locked(const sol_pubkey_t* program_id, sol_bpf_prog_handle
 
     bpf_prog_cache_evict_if_needed_locked(h->ro_section_len);
 
-    h->last_used = ++g_bpf_prog_cache_clock;
+    uint64_t tick = __atomic_add_fetch(&g_bpf_prog_cache_clock, 1u, __ATOMIC_RELAXED);
+    __atomic_store_n(&h->last_used, tick, __ATOMIC_RELAXED);
     h->refcnt = 1u; /* cache owns one ref while resident */
 
     sol_bpf_prog_handle_t* val = h;
@@ -1267,19 +1370,25 @@ sbf_apply_output(
         /* Lamports writeback + checks */
         if (post_lamports != account->meta.lamports) {
             if (!m->is_writable) {
-                char k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
-                sol_log_error("bpf_wb_diag: lamports_ro acct=%s pre=%lu post=%lu",
-                              k58, (unsigned long)account->meta.lamports, (unsigned long)post_lamports);
+                if (wb_diag) {
+                    char k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
+                    sol_log_error("bpf_wb_diag: lamports_ro acct=%s pre=%lu post=%lu",
+                                  k58, (unsigned long)account->meta.lamports,
+                                  (unsigned long)post_lamports);
+                }
                 sol_account_destroy(account);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
             if (!sol_pubkey_eq(&account->meta.owner, &ctx->program_id) &&
                 post_lamports < account->meta.lamports) {
-                char k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
-                sol_log_error("bpf_wb_diag: lamports_nonowner acct=%s pre=%lu post=%lu",
-                              k58, (unsigned long)account->meta.lamports, (unsigned long)post_lamports);
+                if (wb_diag) {
+                    char k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
+                    sol_log_error("bpf_wb_diag: lamports_nonowner acct=%s pre=%lu post=%lu",
+                                  k58, (unsigned long)account->meta.lamports,
+                                  (unsigned long)post_lamports);
+                }
                 sol_account_destroy(account);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
@@ -1301,22 +1410,26 @@ sbf_apply_output(
 
         if (data_changed) {
             if (!m->is_writable) {
-                char k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
-                sol_log_error("bpf_wb_diag: data_ro acct=%s data_len=%zu post_len=%lu",
-                              k58, account->meta.data_len, (unsigned long)post_data_len);
+                if (wb_diag) {
+                    char k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
+                    sol_log_error("bpf_wb_diag: data_ro acct=%s data_len=%zu post_len=%lu",
+                                  k58, account->meta.data_len, (unsigned long)post_data_len);
+                }
                 sol_account_destroy(account);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
             if (!sol_pubkey_eq(&account->meta.owner, &ctx->program_id)) {
-                char k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                char own58[SOL_PUBKEY_BASE58_LEN] = {0};
-                char prog58[SOL_PUBKEY_BASE58_LEN] = {0};
-                sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
-                sol_pubkey_to_base58(&account->meta.owner, own58, sizeof(own58));
-                sol_pubkey_to_base58(&ctx->program_id, prog58, sizeof(prog58));
-                sol_log_error("bpf_wb_diag: data_nonowner acct=%s owner=%s prog=%s",
-                              k58, own58, prog58);
+                if (wb_diag) {
+                    char k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    char own58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    char prog58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
+                    sol_pubkey_to_base58(&account->meta.owner, own58, sizeof(own58));
+                    sol_pubkey_to_base58(&ctx->program_id, prog58, sizeof(prog58));
+                    sol_log_error("bpf_wb_diag: data_nonowner acct=%s owner=%s prog=%s",
+                                  k58, own58, prog58);
+                }
                 sol_account_destroy(account);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
@@ -1331,20 +1444,25 @@ sbf_apply_output(
         /* Owner writeback (rare; typically updated via CPI before end). */
         if (!sol_pubkey_eq(&post_owner, &account->meta.owner)) {
             if (!m->is_writable) {
-                char k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
-                sol_log_error("bpf_wb_diag: owner_ro acct=%s", k58);
+                if (wb_diag) {
+                    char k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
+                    sol_log_error("bpf_wb_diag: owner_ro acct=%s", k58);
+                }
                 sol_account_destroy(account);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
             if (!sol_pubkey_eq(&account->meta.owner, &ctx->program_id)) {
-                char k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                char own58[SOL_PUBKEY_BASE58_LEN] = {0};
-                char prog58[SOL_PUBKEY_BASE58_LEN] = {0};
-                sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
-                sol_pubkey_to_base58(&account->meta.owner, own58, sizeof(own58));
-                sol_pubkey_to_base58(&ctx->program_id, prog58, sizeof(prog58));
-                sol_log_error("bpf_wb_diag: owner_nonowner acct=%s owner=%s prog=%s", k58, own58, prog58);
+                if (wb_diag) {
+                    char k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    char own58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    char prog58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
+                    sol_pubkey_to_base58(&account->meta.owner, own58, sizeof(own58));
+                    sol_pubkey_to_base58(&ctx->program_id, prog58, sizeof(prog58));
+                    sol_log_error("bpf_wb_diag: owner_nonowner acct=%s owner=%s prog=%s",
+                                  k58, own58, prog58);
+                }
                 sol_account_destroy(account);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
@@ -1358,9 +1476,12 @@ sbf_apply_output(
                 }
             }
             if (!zeroed) {
-                char k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
-                sol_log_error("bpf_wb_diag: owner_data_nonzero acct=%s data_len=%zu", k58, account->meta.data_len);
+                if (wb_diag) {
+                    char k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                    sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
+                    sol_log_error("bpf_wb_diag: owner_data_nonzero acct=%s data_len=%zu",
+                                  k58, account->meta.data_len);
+                }
                 sol_account_destroy(account);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }

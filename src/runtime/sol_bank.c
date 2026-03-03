@@ -36,6 +36,11 @@
 /* ---- Concurrency helpers (bank hot path) ---- */
 
 static inline uint64_t bank_monotonic_ns(void);
+static uint32_t signature_hash(const sol_signature_t* sig);
+static void sol_bank_record_tx_status_batch(sol_bank_t* bank,
+                                            const sol_transaction_t* const* tx_ptrs,
+                                            size_t count,
+                                            const sol_tx_result_t* results);
 
 #define BANK_STAT_ADD(bank, field, val) \
     (__atomic_fetch_add(&(bank)->stats.field, (uint64_t)(val), __ATOMIC_RELAXED))
@@ -202,6 +207,21 @@ bank_skip_transaction_processing(void) {
     if (v >= 0) return v != 0;
 
     const char* env = getenv("SOL_SKIP_TX_PROCESSING");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+bank_strict_poh_rehash(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
+
+    /* Default: disabled. Replay already verifies entry hash chains, so we can
+     * trust entry->hash and avoid rehashing every intermediate PoH step inside
+     * bank processing. Set SOL_STRICT_POH_REHASH=1 to restore legacy behavior. */
+    const char* env = getenv("SOL_STRICT_POH_REHASH");
     int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
     __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
     return enabled != 0;
@@ -380,6 +400,7 @@ struct sol_bank {
     /* Transaction status cache */
     sol_tx_status_node_t*   tx_status_buckets[TX_STATUS_HASH_SIZE];
     size_t                  tx_status_count;
+    pthread_mutex_t         tx_status_lock;
 
     /* State */
     bool                    frozen;
@@ -1364,9 +1385,9 @@ tx_status_exists_locked(const sol_bank_t* bank, const sol_signature_t* signature
 static bool
 tx_status_exists(const sol_bank_t* bank, const sol_signature_t* signature) {
     if (!bank || !signature) return false;
-    pthread_mutex_lock((pthread_mutex_t*)&bank->lock);
+    pthread_mutex_lock((pthread_mutex_t*)&bank->tx_status_lock);
     bool exists = tx_status_exists_locked(bank, signature);
-    pthread_mutex_unlock((pthread_mutex_t*)&bank->lock);
+    pthread_mutex_unlock((pthread_mutex_t*)&bank->tx_status_lock);
     return exists;
 }
 
@@ -1376,16 +1397,16 @@ static bool
 tx_status_reserve(sol_bank_t* bank, const sol_signature_t* signature) {
     if (!bank || !signature) return true;
 
-    pthread_mutex_lock(&bank->lock);
+    pthread_mutex_lock(&bank->tx_status_lock);
 
     bool exists = tx_status_exists_locked(bank, signature);
     if (exists) {
-        pthread_mutex_unlock(&bank->lock);
+        pthread_mutex_unlock(&bank->tx_status_lock);
         return false;
     }
 
     if (bank->tx_status_count >= SOL_TX_STATUS_CACHE_SIZE) {
-        pthread_mutex_unlock(&bank->lock);
+        pthread_mutex_unlock(&bank->tx_status_lock);
         return true; /* cache full: skip reserving */
     }
 
@@ -1398,7 +1419,7 @@ tx_status_reserve(sol_bank_t* bank, const sol_signature_t* signature) {
 
     sol_tx_status_node_t* node = sol_calloc(1, sizeof(sol_tx_status_node_t));
     if (!node) {
-        pthread_mutex_unlock(&bank->lock);
+        pthread_mutex_unlock(&bank->tx_status_lock);
         return true; /* best-effort */
     }
 
@@ -1412,7 +1433,7 @@ tx_status_reserve(sol_bank_t* bank, const sol_signature_t* signature) {
     bank->tx_status_buckets[bucket] = node;
     bank->tx_status_count++;
 
-    pthread_mutex_unlock(&bank->lock);
+    pthread_mutex_unlock(&bank->tx_status_lock);
     return true;
 }
 
@@ -2214,6 +2235,18 @@ sol_bank_new(sol_slot_t slot, const sol_hash_t* parent_hash,
         sol_free(bank);
         return NULL;
     }
+    if (pthread_mutex_init(&bank->tx_status_lock, NULL) != 0) {
+        if (bank->recent_blockhash_map) {
+            sol_map_destroy(bank->recent_blockhash_map);
+            bank->recent_blockhash_map = NULL;
+        }
+        pthread_mutex_destroy(&bank->lock);
+        if (bank->owns_accounts_db) {
+            sol_accounts_db_destroy(bank->accounts_db);
+        }
+        sol_free(bank);
+        return NULL;
+    }
 
     bank_alt_cache_init(bank);
 
@@ -2223,6 +2256,7 @@ sol_bank_new(sol_slot_t slot, const sol_hash_t* parent_hash,
             bank->recent_blockhash_map = NULL;
         }
         bank_alt_cache_destroy(bank);
+        pthread_mutex_destroy(&bank->tx_status_lock);
         pthread_mutex_destroy(&bank->lock);
         if (bank->owns_accounts_db) {
             sol_accounts_db_destroy(bank->accounts_db);
@@ -2375,6 +2409,7 @@ sol_bank_destroy(sol_bank_t* bank) {
     }
 
     bank_alt_cache_destroy(bank);
+    pthread_mutex_destroy(&bank->tx_status_lock);
     pthread_mutex_destroy(&bank->lock);
     sol_free(bank);
 }
@@ -2783,6 +2818,119 @@ typedef struct {
 
 static __thread bank_tx_undo_log_t g_tls_tx_undo = {0};
 
+typedef struct {
+    sol_account_t* view; /* Owned cache entry; view->data may be borrowed */
+    sol_slot_t     stored_slot;
+    uint8_t        has_stored_slot;
+} bank_tx_view_cache_entry_t;
+
+static __thread sol_pubkey_map_t* g_tls_tx_view_cache = NULL;
+
+static inline bool
+bank_tx_view_cache_is_active(void) {
+    return g_tls_tx_undo.active;
+}
+
+static inline sol_account_t*
+bank_tx_view_cache_make_view(const sol_account_t* src) {
+    if (!src) return NULL;
+    sol_account_t* v = sol_calloc(1u, sizeof(*v));
+    if (!v) return NULL;
+    v->meta = src->meta;
+    v->data = src->data;
+    v->data_borrowed = true;
+    return v;
+}
+
+static inline void
+bank_tx_view_cache_reset(void) {
+    if (!g_tls_tx_view_cache || !g_tls_tx_view_cache->inner) return;
+
+    void* key = NULL;
+    void* val = NULL;
+    sol_map_iter_t it = sol_map_iter(g_tls_tx_view_cache->inner);
+    while (sol_map_iter_next(&it, &key, &val)) {
+        (void)key;
+        bank_tx_view_cache_entry_t* e = (bank_tx_view_cache_entry_t*)val;
+        if (e && e->view) {
+            sol_account_destroy(e->view);
+            e->view = NULL;
+        }
+    }
+    sol_map_clear(g_tls_tx_view_cache->inner);
+}
+
+static inline void
+bank_tx_view_cache_invalidate(const sol_pubkey_t* pubkey) {
+    if (!pubkey || !g_tls_tx_view_cache) return;
+    bank_tx_view_cache_entry_t* e =
+        (bank_tx_view_cache_entry_t*)sol_pubkey_map_get(g_tls_tx_view_cache, pubkey);
+    if (e && e->view) {
+        sol_account_destroy(e->view);
+        e->view = NULL;
+    }
+    (void)sol_pubkey_map_remove(g_tls_tx_view_cache, pubkey);
+}
+
+static inline const bank_tx_view_cache_entry_t*
+bank_tx_view_cache_entry_get(const sol_pubkey_t* pubkey) {
+    if (!pubkey || !bank_tx_view_cache_is_active() || !g_tls_tx_view_cache) return NULL;
+    bank_tx_view_cache_entry_t* e =
+        (bank_tx_view_cache_entry_t*)sol_pubkey_map_get(g_tls_tx_view_cache, pubkey);
+    if (!e || !e->view) return NULL;
+    return e;
+}
+
+static inline bool
+bank_tx_view_cache_lookup(const sol_pubkey_t* pubkey,
+                          sol_account_t** out_view,
+                          sol_slot_t* out_slot,
+                          bool* out_has_slot) {
+    if (out_view) *out_view = NULL;
+    if (out_slot) *out_slot = 0;
+    if (out_has_slot) *out_has_slot = false;
+    if (!out_view) return false;
+    const bank_tx_view_cache_entry_t* e = bank_tx_view_cache_entry_get(pubkey);
+    if (!e) return false;
+
+    sol_account_t* v = bank_tx_view_cache_make_view(e->view);
+    if (!v) return false;
+
+    *out_view = v;
+    if (out_slot) *out_slot = e->stored_slot;
+    if (out_has_slot) *out_has_slot = (e->has_stored_slot != 0);
+    return true;
+}
+
+static inline bool
+bank_tx_view_cache_insert(const sol_pubkey_t* pubkey,
+                          sol_account_t* view,
+                          bool has_stored_slot,
+                          sol_slot_t stored_slot) {
+    if (!pubkey || !view || !bank_tx_view_cache_is_active()) return false;
+
+    if (!g_tls_tx_view_cache) {
+        g_tls_tx_view_cache = sol_pubkey_map_new(sizeof(bank_tx_view_cache_entry_t), 256u);
+        if (!g_tls_tx_view_cache) return false;
+    }
+
+    bank_tx_view_cache_entry_t* existing =
+        (bank_tx_view_cache_entry_t*)sol_pubkey_map_get(g_tls_tx_view_cache, pubkey);
+    if (existing && existing->view) {
+        sol_account_destroy(existing->view);
+        existing->view = NULL;
+    }
+
+    bank_tx_view_cache_entry_t val = {
+        .view = view,
+        .stored_slot = stored_slot,
+        .has_stored_slot = has_stored_slot ? 1u : 0u,
+    };
+    bank_tx_view_cache_entry_t* inserted =
+        (bank_tx_view_cache_entry_t*)sol_pubkey_map_insert(g_tls_tx_view_cache, pubkey, &val);
+    return inserted != NULL;
+}
+
 /* CPI-time account overrides (see sol_bank.h). */
 static __thread sol_bank_account_overrides_t* g_tls_account_overrides = NULL;
 
@@ -2850,6 +2998,7 @@ bank_tx_undo_end(void) {
     u->len = 0;
     u->active = false;
     u->overlay = false;
+    bank_tx_view_cache_reset();
 }
 
 static inline void
@@ -2937,6 +3086,15 @@ sol_bank_load_account(sol_bank_t* bank, const sol_pubkey_t* pubkey) {
         return sol_account_clone(ov_acct); /* owned clone */
     }
 
+    const bank_tx_view_cache_entry_t* cached = bank_tx_view_cache_entry_get(pubkey);
+    if (cached) {
+        sol_account_t* account = sol_account_clone(cached->view);
+        if (account && sol_accounts_db_is_overlay(bank->accounts_db)) {
+            bank_prev_meta_hints_record(pubkey, account);
+        }
+        if (account) return account;
+    }
+
     sol_account_t* account = sol_accounts_db_load(bank->accounts_db, pubkey);
     if (account && sol_accounts_db_is_overlay(bank->accounts_db)) {
         bank_prev_meta_hints_record(pubkey, account);
@@ -2959,6 +3117,18 @@ sol_bank_load_account_ex(sol_bank_t* bank, const sol_pubkey_t* pubkey,
     if (__builtin_expect(ov_acct != NULL, 0)) {
         if (out_stored_slot) *out_stored_slot = bank->slot;
         return sol_account_clone(ov_acct); /* owned clone */
+    }
+
+    const bank_tx_view_cache_entry_t* cached = bank_tx_view_cache_entry_get(pubkey);
+    if (cached) {
+        sol_account_t* account = sol_account_clone(cached->view);
+        if (account && sol_accounts_db_is_overlay(bank->accounts_db)) {
+            bank_prev_meta_hints_record(pubkey, account);
+        }
+        if (account) {
+            if (out_stored_slot && cached->has_stored_slot) *out_stored_slot = cached->stored_slot;
+            return account;
+        }
     }
 
     sol_account_t* account = sol_accounts_db_load_ex(bank->accounts_db, pubkey, out_stored_slot);
@@ -2987,9 +3157,22 @@ sol_bank_load_account_view(sol_bank_t* bank, const sol_pubkey_t* pubkey) {
         return view;
     }
 
+    sol_account_t* cached_view = NULL;
+    if (bank_tx_view_cache_lookup(pubkey, &cached_view, NULL, NULL)) {
+        return cached_view;
+    }
+
     sol_account_t* account = sol_accounts_db_load_view(bank->accounts_db, pubkey);
     if (account && sol_accounts_db_is_overlay(bank->accounts_db)) {
         bank_prev_meta_hints_record(pubkey, account);
+    }
+
+    if (account && bank_tx_view_cache_is_active()) {
+        sol_account_t* ret = bank_tx_view_cache_make_view(account);
+        if (ret && bank_tx_view_cache_insert(pubkey, account, false, 0)) {
+            return ret;
+        }
+        if (ret) sol_account_destroy(ret);
     }
     return account;
 }
@@ -3016,10 +3199,28 @@ sol_bank_load_account_view_ex(sol_bank_t* bank, const sol_pubkey_t* pubkey,
         return view;
     }
 
+    sol_account_t* cached_view = NULL;
+    sol_slot_t cached_slot = 0;
+    bool cached_has_slot = false;
+    if (bank_tx_view_cache_lookup(pubkey, &cached_view, &cached_slot, &cached_has_slot)) {
+        if (out_stored_slot && cached_has_slot) *out_stored_slot = cached_slot;
+        return cached_view;
+    }
+
+    sol_slot_t stored_slot_tmp = 0;
+    sol_slot_t* stored_slot_ptr = out_stored_slot ? out_stored_slot : &stored_slot_tmp;
     sol_account_t* account =
-        sol_accounts_db_load_view_ex(bank->accounts_db, pubkey, out_stored_slot);
+        sol_accounts_db_load_view_ex(bank->accounts_db, pubkey, stored_slot_ptr);
     if (account && sol_accounts_db_is_overlay(bank->accounts_db)) {
         bank_prev_meta_hints_record(pubkey, account);
+    }
+
+    if (account && bank_tx_view_cache_is_active()) {
+        sol_account_t* ret = bank_tx_view_cache_make_view(account);
+        if (ret && bank_tx_view_cache_insert(pubkey, account, true, *stored_slot_ptr)) {
+            return ret;
+        }
+        if (ret) sol_account_destroy(ret);
     }
     return account;
 }
@@ -3042,6 +3243,7 @@ sol_bank_store_account(sol_bank_t* bank, const sol_pubkey_t* pubkey,
 
     /* If CPI overrides are active, this pubkey is now written by the callee. */
     bank_overrides_mark_written(pubkey);
+    bank_tx_view_cache_invalidate(pubkey);
 
     bank_tx_undo_entry_t* undo_e = NULL;
     sol_err_t undo_err = bank_tx_undo_record(bank, pubkey, &undo_e);
@@ -3119,6 +3321,7 @@ bank_delete_account(sol_bank_t* bank, const sol_pubkey_t* pubkey) {
 
     /* Deleting also counts as a write for CPI override purposes. */
     bank_overrides_mark_written(pubkey);
+    bank_tx_view_cache_invalidate(pubkey);
 
     bank_tx_undo_entry_t* undo_e = NULL;
     sol_err_t undo_err = bank_tx_undo_record(bank, pubkey, &undo_e);
@@ -6336,8 +6539,88 @@ typedef struct sol_tx_pool {
     size_t                   wake;   /* number of worker threads permitted to join this job */
 } sol_tx_pool_t;
 
-static sol_tx_pool_t      g_tx_pool;
+enum { SOL_TX_POOL_SHARDS_MAX = 16 };
+static sol_tx_pool_t      g_tx_pools[SOL_TX_POOL_SHARDS_MAX];
+static size_t             g_tx_pool_count = 0u;
 static pthread_once_t     g_tx_pool_once = PTHREAD_ONCE_INIT;
+
+static size_t
+tx_pool_shard_target(size_t workers_total) {
+    size_t shards = 1u;
+    const char* env = getenv("SOL_TX_POOL_SHARDS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end != env && v > 0ul) {
+            shards = (size_t)v;
+        }
+    } else {
+        if (workers_total >= 128u) {
+            shards = 16u;
+        } else if (workers_total >= 96u) {
+            shards = 12u;
+        } else if (workers_total >= 64u) {
+            shards = 8u;
+        } else if (workers_total >= 32u) {
+            shards = 4u;
+        }
+    }
+    if (shards < 1u) shards = 1u;
+    if (shards > SOL_TX_POOL_SHARDS_MAX) shards = SOL_TX_POOL_SHARDS_MAX;
+    if (workers_total > 0u && shards > workers_total) shards = workers_total;
+    if (shards < 1u) shards = 1u;
+    return shards;
+}
+
+static inline size_t
+tx_pool_shard_index(const sol_bank_t* bank, size_t count) {
+    if (count <= 1u || !bank) return 0u;
+    return (size_t)(bank->slot % (sol_slot_t)count);
+}
+
+static inline sol_tx_pool_t*
+tx_pool_select(const sol_bank_t* bank) {
+    size_t count = g_tx_pool_count;
+    if (count == 0u) return NULL;
+    size_t idx = tx_pool_shard_index(bank, count);
+    return &g_tx_pools[idx];
+}
+
+static sol_tx_pool_t*
+tx_pool_lock_for_job(sol_tx_pool_t* preferred, const sol_bank_t* bank) {
+    if (!preferred) return NULL;
+
+    size_t count = g_tx_pool_count;
+    if (count <= 1u) {
+        pthread_mutex_lock(&preferred->mu);
+        return preferred;
+    }
+
+    size_t start = tx_pool_shard_index(bank, count);
+
+    if (pthread_mutex_trylock(&preferred->mu) == 0) {
+        if (!preferred->stop && !preferred->has_job) {
+            return preferred;
+        }
+        pthread_mutex_unlock(&preferred->mu);
+    }
+
+    for (size_t probe = 1u; probe < count; probe++) {
+        size_t idx = (start + probe) % count;
+        sol_tx_pool_t* alt = &g_tx_pools[idx];
+        if (alt->nthreads == 0u) continue;
+        if (pthread_mutex_trylock(&alt->mu) != 0) continue;
+        if (!alt->stop && !alt->has_job) {
+            return alt;
+        }
+        pthread_mutex_unlock(&alt->mu);
+    }
+
+    /* All shards are currently busy; queue behind the preferred shard instead
+     * of dropping to sequential execution for large batches. */
+    pthread_mutex_lock(&preferred->mu);
+    return preferred;
+}
 
 static bool
 tx_parallel_enabled(void) {
@@ -6387,13 +6670,10 @@ tx_dag_sched_enabled(void) {
     int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v >= 0, 1)) return v != 0;
 
-    /* Default: disabled.
-     *
-     * The DAG scheduler is an experimental optimization. On busy mainnet
-     * blocks it can become overly conservative and leave many workers spinning,
-     * inflating slot replay times. Users can re-enable it explicitly via
-     * SOL_TX_DAG_SCHED=1 for experimentation. */
-    int enabled = 0;
+    /* Default: enable on large-core hosts where barrier-heavy waves often
+     * dominate replay tail latency. Keep env as an explicit override. */
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int enabled = (ncpu >= 64) ? 1 : 0;
     const char* env = getenv("SOL_TX_DAG_SCHED");
     if (env && env[0] != '\0') {
         while (*env && isspace((unsigned char)*env)) env++;
@@ -6406,6 +6686,38 @@ tx_dag_sched_enabled(void) {
 
     __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
     return enabled != 0;
+}
+
+static size_t
+tx_dag_min_batch(void) {
+    static size_t cached = 0u;
+    size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != 0u, 1)) return v;
+
+    /* DAG graph construction has non-trivial overhead. On big-core hosts we
+     * can profitably use DAG at smaller batch sizes to reduce wave barriers. */
+    size_t min_batch = 1024u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        min_batch = 32u;
+    } else if (ncpu >= 96) {
+        min_batch = 48u;
+    } else if (ncpu >= 64) {
+        min_batch = 128u;
+    }
+    const char* env = getenv("SOL_TX_DAG_MIN_BATCH");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env && x > 0ul) {
+            min_batch = (size_t)x;
+        }
+    }
+
+    if (min_batch < 32u) min_batch = 32u;
+    if (min_batch > 65536u) min_batch = 65536u;
+    __atomic_store_n(&cached, min_batch, __ATOMIC_RELEASE);
+    return min_batch;
 }
 
 static size_t
@@ -6424,21 +6736,30 @@ tx_worker_target(void) {
     if (n < 1) n = 1;
     /* Default to a moderate worker count.
      *
-     * Replay on mainnet is extremely CPU-heavy (SBF execution + account loads).
-     * On large machines, the previous cap of 8 workers left a lot of CPU idle,
-     * making it difficult to keep up with wall-clock slot times.
+     * Replay on mainnet is extremely CPU-heavy (SBF execution + account loads),
+     * but driving one tx worker per logical CPU can over-saturate shared
+     * queues/locks and hurt tail latency. Keep high parallelism while leaving
+     * headroom for replay/repair/rocksdb threads on large machines.
      *
-     * This still isn't meant to scale linearly with core count due to
-     * shared-state contention and per-wave overhead.  Users can override via
-     * SOL_TX_WORKERS if they want to experiment. */
+     * Users can still override via SOL_TX_WORKERS. */
     size_t workers = (size_t)n;
-    /* The tx-exec pool is the primary replay throughput lever.  On large
-     * machines (e.g. 96+ cores), the previous cap of 32 workers leaves too much
-     * CPU idle and makes it difficult to catch up to the cluster head. */
-    /* Prefer to use SMT on 128-core EPYC-class hosts (often 256 logical CPUs).
-     * Cap to a reasonable upper bound to avoid runaway thread counts on exotic
-     * hosts; users can still override via SOL_TX_WORKERS. */
-    if (workers > 256u) workers = 256u;
+    /* Use a more aggressive default worker budget on large-core hosts.
+     * Replay latency is typically bounded by tx execution throughput, and
+     * under-provisioning workers leaves CPUs idle while slots queue up. */
+    if (workers >= 128u) {
+        workers = 112u;
+    } else if (workers >= 96u) {
+        workers = 84u;
+    } else if (workers >= 64u) {
+        workers = 56u;
+    } else if (workers >= 48u) {
+        workers = 32u;
+    } else if (workers >= 24u) {
+        workers /= 2u;
+    }
+    if (n >= 24 && workers < 8u) workers = 8u;
+    if (workers > 128u) workers = 128u;
+    if (workers < 1u) workers = 1u;
     return workers;
 }
 
@@ -6474,6 +6795,57 @@ tx_pool_min_batch(void) {
 
     __atomic_store_n(&cached, min_batch, __ATOMIC_RELEASE);
     return min_batch;
+}
+
+static size_t
+tx_pool_target_txs_per_worker(void) {
+    static size_t cached = 0u;
+    size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != 0u, 1)) return v;
+
+    /* Keep enough work per worker to amortize wake/sync overhead while still
+     * exposing high concurrency on large-core hosts. */
+    size_t tx_per_worker = 8u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        tx_per_worker = 2u;
+    } else if (ncpu >= 96) {
+        tx_per_worker = 3u;
+    } else if (ncpu >= 64) {
+        tx_per_worker = 4u;
+    } else if (ncpu >= 32) {
+        tx_per_worker = 6u;
+    }
+    const char* env = getenv("SOL_TX_PER_WORKER");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env && x > 0ul) tx_per_worker = (size_t)x;
+    }
+
+    if (tx_per_worker < 1u) tx_per_worker = 1u;
+    if (tx_per_worker > 256u) tx_per_worker = 256u;
+    __atomic_store_n(&cached, tx_per_worker, __ATOMIC_RELEASE);
+    return tx_per_worker;
+}
+
+static inline size_t
+tx_pool_worker_threads_for_len(const sol_tx_pool_t* p, size_t len) {
+    if (!p || p->nthreads == 0u || len <= 1u) return 0u;
+
+    size_t max_workers = len - 1u; /* caller thread always participates */
+    size_t workers = p->nthreads;
+    if (workers > max_workers) workers = max_workers;
+    if (workers == 0u) return 0u;
+
+    size_t tx_per_worker = tx_pool_target_txs_per_worker();
+    size_t desired_total = (len + tx_per_worker - 1u) / tx_per_worker;
+    if (desired_total < 1u) desired_total = 1u;
+    size_t desired_workers = desired_total - 1u;
+    if (desired_workers < 1u) desired_workers = 1u;
+
+    if (workers > desired_workers) workers = desired_workers;
+    return workers;
 }
 
 /* ---- Parallel transaction execution (DAG scheduler) ---- */
@@ -6632,6 +7004,8 @@ tx_pool_dag_pop_batch(void) {
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu > 0 && ncpu <= 16) pop = 64u;
     else if (ncpu > 0 && ncpu <= 32) pop = 32u;
+    else if (ncpu >= 128) pop = 2u;
+    else if (ncpu >= 64) pop = 3u;
 
     const char* env = getenv("SOL_TX_DAG_POP_BATCH");
     if (env && env[0] != '\0') {
@@ -6645,6 +7019,33 @@ tx_pool_dag_pop_batch(void) {
 
     __atomic_store_n(&cached, pop, __ATOMIC_RELEASE);
     return pop;
+}
+
+static size_t
+tx_parallel_min_batch(void) {
+    static size_t cached = 0u;
+    size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != 0u, 1)) return v;
+
+    size_t min_batch = 16u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        min_batch = 4u;
+    } else if (ncpu >= 64) {
+        min_batch = 8u;
+    }
+
+    const char* env = getenv("SOL_TX_PARALLEL_MIN_BATCH");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env && x > 0ul) min_batch = (size_t)x;
+    }
+
+    if (min_batch < 2u) min_batch = 2u;
+    if (min_batch > 1024u) min_batch = 1024u;
+    __atomic_store_n(&cached, min_batch, __ATOMIC_RELEASE);
+    return min_batch;
 }
 
 static void
@@ -6886,81 +7287,102 @@ tx_pool_worker_main(void* arg) {
 
 static void
 tx_pool_shutdown(void) {
-    sol_tx_pool_t* p = &g_tx_pool;
-    if (!p->inited) return;
+    for (size_t shard = 0; shard < g_tx_pool_count; shard++) {
+        sol_tx_pool_t* p = &g_tx_pools[shard];
+        if (!p->inited) continue;
 
-    pthread_mutex_lock(&p->mu);
-    p->stop = true;
-    pthread_cond_broadcast(&p->cv);
-    pthread_mutex_unlock(&p->mu);
+        pthread_mutex_lock(&p->mu);
+        p->stop = true;
+        pthread_cond_broadcast(&p->cv);
+        pthread_mutex_unlock(&p->mu);
 
-    for (size_t i = 0; i < p->nthreads; i++) {
-        (void)pthread_join(p->threads[i], NULL);
+        for (size_t i = 0; i < p->nthreads; i++) {
+            (void)pthread_join(p->threads[i], NULL);
+        }
+        sol_free(p->threads);
+        p->threads = NULL;
+        sol_free(p->worker_ctx);
+        p->worker_ctx = NULL;
+        p->nthreads = 0;
+
+        pthread_mutex_destroy(&p->mu);
+        pthread_cond_destroy(&p->cv);
+        pthread_cond_destroy(&p->done);
+        p->inited = false;
     }
-    sol_free(p->threads);
-    p->threads = NULL;
-    sol_free(p->worker_ctx);
-    p->worker_ctx = NULL;
-    p->nthreads = 0;
-
-    pthread_mutex_destroy(&p->mu);
-    pthread_cond_destroy(&p->cv);
-    pthread_cond_destroy(&p->done);
-    p->inited = false;
+    g_tx_pool_count = 0u;
 }
 
 static void
 tx_pool_init_once(void) {
-    sol_tx_pool_t* p = &g_tx_pool;
-    memset(p, 0, sizeof(*p));
+    size_t workers_total = tx_worker_target();
+    size_t shards = tx_pool_shard_target(workers_total);
+    if (shards < 1u) shards = 1u;
+    if (shards > SOL_TX_POOL_SHARDS_MAX) shards = SOL_TX_POOL_SHARDS_MAX;
+    if (workers_total > 0u && shards > workers_total) shards = workers_total;
+    if (shards < 1u) shards = 1u;
+    g_tx_pool_count = shards;
 
-    (void)pthread_mutex_init(&p->mu, NULL);
-    (void)pthread_cond_init(&p->cv, NULL);
-    (void)pthread_cond_init(&p->done, NULL);
-    p->inited = true;
-    p->job_id = 0;
+    size_t base_workers = (workers_total >= shards) ? (workers_total / shards) : 1u;
+    size_t rem_workers = (workers_total >= shards) ? (workers_total % shards) : 0u;
+    size_t total_spawned_workers = 0u;
 
-    size_t workers = tx_worker_target();
-    if (workers <= 1u) {
-        p->nthreads = 0;
-        return;
-    }
+    for (size_t shard = 0; shard < shards; shard++) {
+        sol_tx_pool_t* p = &g_tx_pools[shard];
+        memset(p, 0, sizeof(*p));
 
-    /* Use caller thread as a worker too. */
-    p->nthreads = workers - 1u;
-    sol_log_info("TX pool: workers=%lu (threads=%lu + caller), dag=%d, min_batch=%lu",
-                 (unsigned long)workers,
-                 (unsigned long)p->nthreads,
-                 tx_dag_sched_enabled() ? 1 : 0,
-                 (unsigned long)tx_pool_min_batch());
-    p->threads = sol_calloc(p->nthreads, sizeof(pthread_t));
-    if (!p->threads) {
-        p->nthreads = 0;
-        return;
-    }
-    p->worker_ctx = sol_calloc(p->nthreads, sizeof(tx_pool_worker_ctx_t));
-    if (!p->worker_ctx) {
-        sol_free(p->threads);
-        p->threads = NULL;
-        p->nthreads = 0;
-        return;
-    }
+        (void)pthread_mutex_init(&p->mu, NULL);
+        (void)pthread_cond_init(&p->cv, NULL);
+        (void)pthread_cond_init(&p->done, NULL);
+        p->inited = true;
+        p->job_id = 0;
 
-    for (size_t i = 0; i < p->nthreads; i++) {
-        p->worker_ctx[i].p = p;
-        p->worker_ctx[i].thread_idx = i;
-        if (pthread_create(&p->threads[i], NULL, tx_pool_worker_main, &p->worker_ctx[i]) != 0) {
-            p->nthreads = i;
-            break;
+        size_t workers = base_workers + (shard < rem_workers ? 1u : 0u);
+        if (workers < 1u) workers = 1u;
+        if (workers <= 1u) {
+            p->nthreads = 0u;
+            continue;
+        }
+
+        /* Use caller thread as a worker too. */
+        p->nthreads = workers - 1u;
+        total_spawned_workers += workers;
+
+        p->threads = sol_calloc(p->nthreads, sizeof(pthread_t));
+        if (!p->threads) {
+            p->nthreads = 0u;
+            continue;
+        }
+        p->worker_ctx = sol_calloc(p->nthreads, sizeof(tx_pool_worker_ctx_t));
+        if (!p->worker_ctx) {
+            sol_free(p->threads);
+            p->threads = NULL;
+            p->nthreads = 0u;
+            continue;
+        }
+
+        for (size_t i = 0; i < p->nthreads; i++) {
+            p->worker_ctx[i].p = p;
+            p->worker_ctx[i].thread_idx = i;
+            if (pthread_create(&p->threads[i], NULL, tx_pool_worker_main, &p->worker_ctx[i]) != 0) {
+                p->nthreads = i;
+                break;
+            }
         }
     }
 
+    sol_log_info("TX pool: workers=%lu shards=%lu (dag=%d dag_min_batch=%lu min_batch=%lu)",
+                 (unsigned long)(total_spawned_workers ? total_spawned_workers : workers_total),
+                 (unsigned long)g_tx_pool_count,
+                 tx_dag_sched_enabled() ? 1 : 0,
+                 (unsigned long)tx_dag_min_batch(),
+                 (unsigned long)tx_pool_min_batch());
     atexit(tx_pool_shutdown);
 }
 
 static inline bool
-tx_pool_available(void) {
-    return g_tx_pool.nthreads > 0;
+tx_pool_available(const sol_tx_pool_t* p) {
+    return p && p->nthreads > 0;
 }
 
 static void
@@ -6977,9 +7399,10 @@ tx_pool_run_range(sol_bank_t* bank,
     bool ran_parallel = false;
 
     size_t min_batch = tx_pool_min_batch();
+    sol_tx_pool_t* p = tx_pool_select(bank);
 
     /* Parallelize only when the batch is large enough to amortize coordination. */
-    if (!tx_pool_available() || len < min_batch) {
+    if (!tx_pool_available(p) || len < min_batch) {
         for (size_t i = start; i < end; i++) {
             results[i] = sol_bank_process_transaction(bank, &txs[i]);
         }
@@ -6992,15 +7415,42 @@ tx_pool_run_range(sol_bank_t* bank,
         return;
     }
 
-    sol_tx_pool_t* p = &g_tx_pool;
     ran_parallel = true;
+
+    p = tx_pool_lock_for_job(p, bank);
+    if (!p) {
+        for (size_t i = start; i < end; i++) {
+            results[i] = sol_bank_process_transaction(bank, &txs[i]);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)len;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
+
+    while (!p->stop && p->has_job) {
+        pthread_cond_wait(&p->done, &p->mu);
+    }
+    if (p->stop || p->has_job) {
+        pthread_mutex_unlock(&p->mu);
+        for (size_t i = start; i < end; i++) {
+            results[i] = sol_bank_process_transaction(bank, &txs[i]);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)len;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
 
     /* Wake only the number of worker threads we can use for this job. Waking the
      * full pool for tiny batches is extremely expensive and can dominate replay. */
-    size_t workers = p->nthreads;
-    if (workers > (len - 1u)) workers = len - 1u;
-
-    pthread_mutex_lock(&p->mu);
+    size_t workers = tx_pool_worker_threads_for_len(p, len);
     p->job_kind = TX_POOL_JOB_TXS;
     p->bank = bank;
     p->txs = txs;
@@ -7072,9 +7522,10 @@ tx_pool_run_range_ptrs(sol_bank_t* bank,
     }
 
     size_t min_batch = tx_pool_min_batch();
+    sol_tx_pool_t* p = tx_pool_select(bank);
 
     /* Parallelize only when the batch is large enough to amortize coordination. */
-    if (!tx_pool_available() || len < min_batch) {
+    if (!tx_pool_available(p) || len < min_batch) {
         for (size_t i = start; i < end; i++) {
             const sol_transaction_t* tx = tx_ptrs[i];
             if (!tx) {
@@ -7094,13 +7545,48 @@ tx_pool_run_range_ptrs(sol_bank_t* bank,
         return;
     }
 
-    sol_tx_pool_t* p = &g_tx_pool;
     ran_parallel = true;
 
-    size_t workers = p->nthreads;
-    if (workers > (len - 1u)) workers = len - 1u;
+    p = tx_pool_lock_for_job(p, bank);
+    if (!p) {
+        for (size_t i = start; i < end; i++) {
+            const sol_transaction_t* tx = tx_ptrs[i];
+            if (!tx) continue;
+            results[i] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx)
+                : sol_bank_process_transaction(bank, tx);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)exec_txs;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
 
-    pthread_mutex_lock(&p->mu);
+    while (!p->stop && p->has_job) {
+        pthread_cond_wait(&p->done, &p->mu);
+    }
+    if (p->stop || p->has_job) {
+        pthread_mutex_unlock(&p->mu);
+        for (size_t i = start; i < end; i++) {
+            const sol_transaction_t* tx = tx_ptrs[i];
+            if (!tx) continue;
+            results[i] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx)
+                : sol_bank_process_transaction(bank, tx);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)exec_txs;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
+
+    size_t workers = tx_pool_worker_threads_for_len(p, len);
     p->job_kind = TX_POOL_JOB_TX_PTRS;
     p->bank = bank;
     p->txs = NULL;
@@ -7178,9 +7664,10 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
     uint64_t t0 = stats ? bank_monotonic_ns() : 0;
 
     size_t min_batch = tx_pool_min_batch();
+    sol_tx_pool_t* p = tx_pool_select(bank);
 
     /* Sequential fallback for small segments or when the pool isn't available. */
-    if (!tx_pool_available() || seg_len < min_batch) {
+    if (!tx_pool_available(p) || seg_len < min_batch) {
         for (size_t i = 0; i < seg_len; i++) {
             uint32_t node = seg_nodes[i];
             const sol_transaction_t* tx = tx_ptrs[node];
@@ -7217,8 +7704,6 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
         return;
     }
 
-    sol_tx_pool_t* p = &g_tx_pool;
-
     /* Initialize ready stack from indegree==0 nodes. */
     uint32_t init_head = TX_POOL_DAG_NONE;
     for (size_t i = 0; i < seg_len; i++) {
@@ -7228,13 +7713,9 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
             init_head = node;
         }
     }
-    __atomic_store_n(&p->dag_ready_head, init_head, __ATOMIC_RELEASE);
-    __atomic_store_n(&p->dag_remaining, (uint32_t)seg_len, __ATOMIC_RELEASE);
-
     /* If nothing is ready, something is wrong (cycle or bad graph). Avoid
      * deadlocking by falling back to sequential execution. */
     if (init_head == TX_POOL_DAG_NONE) {
-        __atomic_store_n(&p->dag_remaining, 0u, __ATOMIC_RELEASE);
         for (size_t i = 0; i < seg_len; i++) {
             uint32_t node = seg_nodes[i];
             const sol_transaction_t* tx = tx_ptrs[node];
@@ -7252,10 +7733,47 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
         return;
     }
 
-    size_t workers = p->nthreads;
-    if (workers > (seg_len - 1u)) workers = seg_len - 1u;
+    p = tx_pool_lock_for_job(p, bank);
+    if (!p) {
+        for (size_t i = 0; i < seg_len; i++) {
+            uint32_t node = seg_nodes[i];
+            const sol_transaction_t* tx = tx_ptrs[node];
+            if (!tx) continue;
+            results[node] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx)
+                : sol_bank_process_transaction(bank, tx);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)seg_len;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
 
-    pthread_mutex_lock(&p->mu);
+    while (!p->stop && p->has_job) {
+        pthread_cond_wait(&p->done, &p->mu);
+    }
+    if (p->stop || p->has_job) {
+        pthread_mutex_unlock(&p->mu);
+        for (size_t i = 0; i < seg_len; i++) {
+            uint32_t node = seg_nodes[i];
+            const sol_transaction_t* tx = tx_ptrs[node];
+            if (!tx) continue;
+            results[node] = skip_tx_status
+                ? sol_bank_process_transaction_parallel(bank, tx)
+                : sol_bank_process_transaction(bank, tx);
+        }
+        if (stats) {
+            uint64_t dt = bank_monotonic_ns() - t0;
+            stats->seq_calls++;
+            stats->seq_txs += (uint64_t)seg_len;
+            stats->seq_ns += dt;
+        }
+        return;
+    }
+    size_t workers = tx_pool_worker_threads_for_len(p, seg_len);
     p->job_kind = TX_POOL_JOB_TX_DAG_PTRS;
     p->bank = bank;
     p->txs = NULL;
@@ -7273,6 +7791,8 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
     p->lthash_partials = NULL;
     p->start = 0;
     p->end = 0;
+    __atomic_store_n(&p->dag_ready_head, init_head, __ATOMIC_RELEASE);
+    __atomic_store_n(&p->dag_remaining, (uint32_t)seg_len, __ATOMIC_RELEASE);
     __atomic_store_n(&p->next, 0u, __ATOMIC_RELAXED);
     p->active = workers + 1u;
     p->wake = workers;
@@ -7378,16 +7898,14 @@ tx_pool_run_lthash_delta(sol_accounts_db_t* parent,
     }
 
     (void)pthread_once(&g_tx_pool_once, tx_pool_init_once);
-    if (!tx_pool_available()) {
+    sol_tx_pool_t* p = tx_pool_select(NULL);
+    if (!tx_pool_available(p)) {
         lthash_delta_seq(parent, entries, count, out_delta);
         return;
     }
-
-    sol_tx_pool_t* p = &g_tx_pool;
     size_t len = count;
 
-    size_t workers = p->nthreads;
-    if (workers > (len - 1u)) workers = len - 1u;
+    size_t workers = tx_pool_worker_threads_for_len(p, len);
     if (workers == 0u) {
         lthash_delta_seq(parent, entries, count, out_delta);
         return;
@@ -7400,6 +7918,12 @@ tx_pool_run_lthash_delta(sol_accounts_db_t* parent,
     }
 
     pthread_mutex_lock(&p->mu);
+    if (p->stop || p->has_job) {
+        pthread_mutex_unlock(&p->mu);
+        sol_free(partials);
+        lthash_delta_seq(parent, entries, count, out_delta);
+        return;
+    }
     p->job_kind = TX_POOL_JOB_LT_HASH_DELTA;
     p->bank = NULL;
     p->txs = NULL;
@@ -7471,7 +7995,7 @@ sol_bank_process_transactions(sol_bank_t* bank, const sol_transaction_t* txs,
     if (!bank || !txs || !results) return SOL_ERR_INVAL;
     if (count == 0) return SOL_OK;
 
-    if (!tx_parallel_enabled() || count < 16) {
+    if (!tx_parallel_enabled() || count < tx_parallel_min_batch()) {
         for (size_t i = 0; i < count; i++) {
             results[i] = sol_bank_process_transaction(bank, &txs[i]);
         }
@@ -7991,7 +8515,7 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
         g_tls_tx_pool_stats = &pool_stats;
     }
 
-    if (!tx_parallel_enabled() || count < 16) {
+    if (!tx_parallel_enabled() || count < tx_parallel_min_batch()) {
         for (size_t i = 0; i < count; i++) {
             results[i] = sol_bank_process_transaction(bank, tx_ptrs[i]);
         }
@@ -8114,7 +8638,10 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
         last_access = sc->last_access;
         sol_map_clear(last_access->inner);
 
-        bool use_dag = tx_dag_sched_enabled() && count <= (size_t)UINT32_MAX;
+        bool use_dag =
+            tx_dag_sched_enabled() &&
+            count >= tx_dag_min_batch() &&
+            count <= (size_t)UINT32_MAX;
 
         /* Pre-pass for duplicate filtering and NULL tx pointers. Must happen before
          * any parallel execution in skip_tx_status mode. */
@@ -9111,16 +9638,14 @@ legacy_sched:
 
 tx_sched_done:
     if (skip_tx_status) {
-        for (size_t i = 0; i < count; i++) {
-            const sol_transaction_t* tx = tx_ptrs[i];
-            if (!tx) continue;
-            const sol_signature_t* sig = sol_transaction_signature(tx);
-            if (!sig) continue;
-            sol_bank_record_tx_status(bank,
-                                      sig,
-                                      results[i].status,
-                                      results[i].fee,
-                                      results[i].compute_units_used);
+        uint64_t tx_status_t0 = bank_monotonic_ns();
+        sol_bank_record_tx_status_batch(bank, tx_ptrs, count, results);
+        uint64_t tx_status_ns = bank_monotonic_ns() - tx_status_t0;
+        if (__builtin_expect(tx_status_ns >= 500000000ull, 0)) {
+            sol_log_info("tx_status_slow: slot=%lu txs=%zu time=%.2fms",
+                         (unsigned long)bank->slot,
+                         count,
+                         (double)tx_status_ns / 1000000.0);
         }
     }
 
@@ -9195,28 +9720,51 @@ bank_advance_poh_and_register_ticks(sol_bank_t* bank, const sol_entry_t* entry) 
     hashes_in_tick = bank->hashes_in_tick;
     pthread_mutex_unlock(&bank->lock);
 
-    /* Fast path: Most ledgers do not cross tick boundaries inside transaction
-     * (record) entries. In that common case, we can advance PoH/ticks without
-     * recomputing the full sha256 hash_n chain, since `entry->hash` already
-     * contains the post-entry PoH hash and replay verifies the entry chain
-     * separately (sol_entry_batch_verify).
-     *
-     * We must fall back to the slow path only if this entry would advance past
-     * a tick boundary (needs intermediate tick hash value). */
+    /* Default fast path: trust entry->hash and advance tick counters arithmetically.
+     * This avoids replay-time rehashing of every intermediate PoH step, which can
+     * dominate slot latency on heavy mainnet slots. */
     {
-        uint64_t next_hashes = 0;
-        bool oflow = __builtin_add_overflow(hashes_in_tick, entry->num_hashes, &next_hashes);
-        if (!oflow && next_hashes <= hashes_per_tick) {
+        uint64_t total_hashes = 0;
+        bool oflow = __builtin_add_overflow(hashes_in_tick, entry->num_hashes, &total_hashes);
+        if (!oflow && !bank_strict_poh_rehash()) {
+            uint64_t ticks_crossed = total_hashes / hashes_per_tick;
+            uint64_t rem_hashes = total_hashes % hashes_per_tick;
+            for (uint64_t i = 0; i < ticks_crossed; i++) {
+                /* For the final boundary that lands exactly at entry end, use
+                 * entry->hash as the tick hash; intermediate tick hashes are not
+                 * consumed by bank state updates. */
+                const sol_hash_t* tick_hash = &current;
+                if ((i + 1u == ticks_crossed) && rem_hashes == 0u) {
+                    tick_hash = &entry->hash;
+                }
+                sol_err_t err = sol_bank_register_tick(bank, tick_hash);
+                if (err != SOL_OK && err != SOL_ERR_OVERFLOW) {
+                    return err;
+                }
+            }
+
             current = entry->hash;
-            if (next_hashes == hashes_per_tick) {
-                /* Tick boundary exactly at end of entry. */
+            hashes_in_tick = rem_hashes;
+
+            pthread_mutex_lock(&bank->lock);
+            bank->poh_hash = current;
+            bank->hashes_in_tick = hashes_in_tick;
+            pthread_mutex_unlock(&bank->lock);
+            return SOL_OK;
+        }
+
+        /* Legacy fast path for strict mode when this entry does not cross a
+         * tick boundary. */
+        if (!oflow && total_hashes <= hashes_per_tick) {
+            current = entry->hash;
+            if (total_hashes == hashes_per_tick) {
                 sol_err_t err = sol_bank_register_tick(bank, &current);
                 if (err != SOL_OK && err != SOL_ERR_OVERFLOW) {
                     return err;
                 }
                 hashes_in_tick = 0;
             } else {
-                hashes_in_tick = next_hashes;
+                hashes_in_tick = total_hashes;
             }
 
             pthread_mutex_lock(&bank->lock);
@@ -9321,15 +9869,25 @@ sol_bank_process_entry(sol_bank_t* bank, const sol_entry_t* entry) {
 }
 
 sol_err_t
-sol_bank_process_entries(sol_bank_t* bank, const sol_entry_batch_t* batch) {
+sol_bank_process_entries_ex(sol_bank_t* bank,
+                            const sol_entry_batch_t* batch,
+                            sol_bank_process_entries_timing_t* timing) {
     if (!bank || !batch) return SOL_ERR_INVAL;
+    if (timing) {
+        timing->tx_exec_ns = 0;
+        timing->poh_ns = 0;
+    }
 
     /* When skipping transaction execution, keep the original ordering: advance
      * PoH/ticks entry-by-entry and return. */
     if (bank_skip_transaction_processing()) {
+        uint64_t poh_t0 = timing ? bank_monotonic_ns() : 0;
         for (size_t i = 0; i < batch->num_entries; i++) {
             sol_err_t err = bank_advance_poh_and_register_ticks(bank, &batch->entries[i]);
             if (err != SOL_OK) return err;
+        }
+        if (timing) {
+            timing->poh_ns += bank_monotonic_ns() - poh_t0;
         }
         return SOL_OK;
     }
@@ -9343,9 +9901,13 @@ sol_bank_process_entries(sol_bank_t* bank, const sol_entry_batch_t* batch) {
     }
 
     if (total_txs == 0) {
+        uint64_t poh_t0 = timing ? bank_monotonic_ns() : 0;
         for (size_t i = 0; i < batch->num_entries; i++) {
             sol_err_t err = bank_advance_poh_and_register_ticks(bank, &batch->entries[i]);
             if (err != SOL_OK) return err;
+        }
+        if (timing) {
+            timing->poh_ns += bank_monotonic_ns() - poh_t0;
         }
         return SOL_OK;
     }
@@ -9366,9 +9928,13 @@ sol_bank_process_entries(sol_bank_t* bank, const sol_entry_batch_t* batch) {
             if (tx_ptrs) sol_free((void*)tx_ptrs);
             if (results) sol_free(results);
             /* Fall back to conservative entry-by-entry behavior. */
+            uint64_t exec_t0 = timing ? bank_monotonic_ns() : 0;
             for (size_t i = 0; i < batch->num_entries; i++) {
                 sol_err_t err = sol_bank_process_entry(bank, &batch->entries[i]);
                 if (err != SOL_OK) return err;
+            }
+            if (timing) {
+                timing->tx_exec_ns += bank_monotonic_ns() - exec_t0;
             }
             return SOL_OK;
         }
@@ -9382,7 +9948,11 @@ sol_bank_process_entries(sol_bank_t* bank, const sol_entry_batch_t* batch) {
         }
     }
 
+    uint64_t exec_t0 = timing ? bank_monotonic_ns() : 0;
     sol_err_t terr = sol_bank_process_transactions_ptrs(bank, tx_ptrs, total_txs, results);
+    if (timing) {
+        timing->tx_exec_ns += bank_monotonic_ns() - exec_t0;
+    }
     if (terr != SOL_OK) {
         if (heap_bufs) {
             sol_free((void*)tx_ptrs);
@@ -9392,6 +9962,7 @@ sol_bank_process_entries(sol_bank_t* bank, const sol_entry_batch_t* batch) {
     }
 
     /* Preserve per-entry logging and PoH advancement. */
+    uint64_t poh_t0 = timing ? bank_monotonic_ns() : 0;
     cursor = 0;
     for (size_t ei = 0; ei < batch->num_entries; ei++) {
         const sol_entry_t* entry = &batch->entries[ei];
@@ -9411,12 +9982,20 @@ sol_bank_process_entries(sol_bank_t* bank, const sol_entry_batch_t* batch) {
             return aerr;
         }
     }
+    if (timing) {
+        timing->poh_ns += bank_monotonic_ns() - poh_t0;
+    }
 
     if (heap_bufs) {
         sol_free((void*)tx_ptrs);
         sol_free(results);
     }
     return SOL_OK;
+}
+
+sol_err_t
+sol_bank_process_entries(sol_bank_t* bank, const sol_entry_batch_t* batch) {
+    return sol_bank_process_entries_ex(bank, batch, NULL);
 }
 
 sol_err_t
@@ -9838,6 +10417,59 @@ signature_hash(const sol_signature_t* sig) {
     return h % TX_STATUS_HASH_SIZE;
 }
 
+static void
+sol_bank_record_tx_status_batch(sol_bank_t* bank,
+                                const sol_transaction_t* const* tx_ptrs,
+                                size_t count,
+                                const sol_tx_result_t* results) {
+    if (!bank || !tx_ptrs || !results || count == 0) return;
+
+    pthread_mutex_lock(&bank->tx_status_lock);
+
+    for (size_t i = 0; i < count; i++) {
+        const sol_transaction_t* tx = tx_ptrs[i];
+        if (!tx) continue;
+
+        const sol_signature_t* signature = sol_transaction_signature(tx);
+        if (!signature) continue;
+
+        uint32_t bucket = signature_hash(signature);
+        sol_tx_status_node_t* node = bank->tx_status_buckets[bucket];
+        bool found = false;
+
+        while (node) {
+            if (memcmp(&node->entry.signature, signature, sizeof(sol_signature_t)) == 0) {
+                node->entry.status = results[i].status;
+                node->entry.fee = results[i].fee;
+                node->entry.compute_units = results[i].compute_units_used;
+                found = true;
+                break;
+            }
+            node = node->next;
+        }
+        if (found) continue;
+
+        if (bank->tx_status_count >= SOL_TX_STATUS_CACHE_SIZE) {
+            continue;
+        }
+
+        node = sol_calloc(1, sizeof(sol_tx_status_node_t));
+        if (!node) continue;
+
+        node->entry.signature = *signature;
+        node->entry.slot = bank->slot;
+        node->entry.status = results[i].status;
+        node->entry.fee = results[i].fee;
+        node->entry.compute_units = results[i].compute_units_used;
+
+        node->next = bank->tx_status_buckets[bucket];
+        bank->tx_status_buckets[bucket] = node;
+        bank->tx_status_count++;
+    }
+
+    pthread_mutex_unlock(&bank->tx_status_lock);
+}
+
 void
 sol_bank_record_tx_status(sol_bank_t* bank,
                           const sol_signature_t* signature,
@@ -9848,7 +10480,7 @@ sol_bank_record_tx_status(sol_bank_t* bank,
 
     uint32_t bucket = signature_hash(signature);
 
-    pthread_mutex_lock(&bank->lock);
+    pthread_mutex_lock(&bank->tx_status_lock);
 
     /* Check if already exists */
     sol_tx_status_node_t* node = bank->tx_status_buckets[bucket];
@@ -9858,7 +10490,7 @@ sol_bank_record_tx_status(sol_bank_t* bank,
             node->entry.status = status;
             node->entry.fee = fee;
             node->entry.compute_units = compute_units;
-            pthread_mutex_unlock(&bank->lock);
+            pthread_mutex_unlock(&bank->tx_status_lock);
             return;
         }
         node = node->next;
@@ -9866,14 +10498,14 @@ sol_bank_record_tx_status(sol_bank_t* bank,
 
     /* Cache full: allow updates of existing entries above, but skip inserts. */
     if (bank->tx_status_count >= SOL_TX_STATUS_CACHE_SIZE) {
-        pthread_mutex_unlock(&bank->lock);
+        pthread_mutex_unlock(&bank->tx_status_lock);
         return;
     }
 
     /* Create new entry */
     node = sol_calloc(1, sizeof(sol_tx_status_node_t));
     if (!node) {
-        pthread_mutex_unlock(&bank->lock);
+        pthread_mutex_unlock(&bank->tx_status_lock);
         return;
     }
 
@@ -9888,7 +10520,7 @@ sol_bank_record_tx_status(sol_bank_t* bank,
     bank->tx_status_buckets[bucket] = node;
     bank->tx_status_count++;
 
-    pthread_mutex_unlock(&bank->lock);
+    pthread_mutex_unlock(&bank->tx_status_lock);
 }
 
 bool
@@ -9899,7 +10531,7 @@ sol_bank_get_tx_status(const sol_bank_t* bank,
 
     uint32_t bucket = signature_hash(signature);
 
-    pthread_mutex_lock((pthread_mutex_t*)&bank->lock);
+    pthread_mutex_lock((pthread_mutex_t*)&bank->tx_status_lock);
 
     sol_tx_status_node_t* node = bank->tx_status_buckets[bucket];
     while (node) {
@@ -9907,13 +10539,13 @@ sol_bank_get_tx_status(const sol_bank_t* bank,
             if (out_status) {
                 *out_status = node->entry;
             }
-            pthread_mutex_unlock((pthread_mutex_t*)&bank->lock);
+            pthread_mutex_unlock((pthread_mutex_t*)&bank->tx_status_lock);
             return true;
         }
         node = node->next;
     }
 
-    pthread_mutex_unlock((pthread_mutex_t*)&bank->lock);
+    pthread_mutex_unlock((pthread_mutex_t*)&bank->tx_status_lock);
     return false;
 }
 
@@ -9923,7 +10555,7 @@ sol_bank_purge_tx_status(sol_bank_t* bank, sol_slot_t min_slot) {
 
     size_t removed = 0;
 
-    pthread_mutex_lock(&bank->lock);
+    pthread_mutex_lock(&bank->tx_status_lock);
 
     for (size_t i = 0; i < TX_STATUS_HASH_SIZE; i++) {
         sol_tx_status_node_t** ptr = &bank->tx_status_buckets[i];
@@ -9940,14 +10572,17 @@ sol_bank_purge_tx_status(sol_bank_t* bank, sol_slot_t min_slot) {
         }
     }
 
-    pthread_mutex_unlock(&bank->lock);
+    pthread_mutex_unlock(&bank->tx_status_lock);
     return removed;
 }
 
 size_t
 sol_bank_tx_status_count(const sol_bank_t* bank) {
     if (!bank) return 0;
-    return bank->tx_status_count;
+    pthread_mutex_lock((pthread_mutex_t*)&bank->tx_status_lock);
+    size_t n = bank->tx_status_count;
+    pthread_mutex_unlock((pthread_mutex_t*)&bank->tx_status_lock);
+    return n;
 }
 
 /*

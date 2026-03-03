@@ -40,6 +40,11 @@ typedef struct {
     uint32_t            num_transactions;
     uint64_t            compute_units;
     uint64_t            replay_time_ns;     /* Time to replay */
+    uint64_t            fetch_time_ns;      /* Block fetch/read time */
+    uint64_t            decode_time_ns;     /* Entry decode/parse time */
+    uint64_t            execute_time_ns;    /* Bank execution time */
+    uint64_t            commit_time_ns;     /* Freeze/hash/insert time */
+    uint64_t            verify_time_ns;     /* Entry-hash verification time */
 } sol_replay_slot_info_t;
 
 /*
@@ -164,6 +169,31 @@ bool sol_replay_is_replayed(
  * Used for parent-availability gating during live catchup.
  */
 bool sol_replay_has_frozen_bank(
+    sol_replay_t*   replay,
+    sol_slot_t      slot
+);
+
+/*
+ * Check whether a slot's parent is currently available for replay.
+ *
+ * Returns true when the slot's parent bank is already available/frozen in
+ * bank-forks (or the slot is a root-style self-parent). This is useful for
+ * parent-aware scheduling in TVU.
+ */
+bool sol_replay_parent_ready(
+    sol_replay_t*   replay,
+    sol_slot_t      slot,
+    sol_slot_t*     out_parent_slot
+);
+
+/*
+ * Best-effort pre-replay warming for a slot.
+ *
+ * This runs lightweight asynchronous work ahead of replay (block fetch/decode,
+ * parse, and optional account-cache warming when parent context is available)
+ * without mutating consensus state.
+ */
+bool sol_replay_prewarm_slot(
     sol_replay_t*   replay,
     sol_slot_t      slot
 );

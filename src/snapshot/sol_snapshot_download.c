@@ -1018,6 +1018,7 @@ snapshot_download_curl_stream_to_fd(const char* url,
                                     int out_fd,
                                     uint64_t start_offset,
                                     uint64_t expected_size,
+                                    bool enforce_size_match,
                                     uint32_t timeout,
                                     const char* timeout_buf,
                                     bool enable_resume,
@@ -1183,7 +1184,7 @@ snapshot_download_curl_stream_to_fd(const char* url,
             /* Ensure the on-disk file size reflects the bytes we actually wrote. */
             (void)ftruncate(out_fd, (off_t)bytes);
 
-            if (diff > tol) {
+            if (diff > tol && enforce_size_match) {
                 return SOL_ERR_IO;
             }
         }
@@ -1483,10 +1484,11 @@ typedef struct {
     uint32_t    saw_range_reject;
     uint32_t    part_failures;
 
-    /* Progress reporting (best-effort). `bytes_streamed` counts bytes written
-     * to disk across all workers and will double-count if a part is retried.
-     * This is fine for speed estimates; we clamp percent to 100%. */
+    /* Progress reporting:
+     * - bytes_streamed: bytes written to disk by active workers (for MB/s)
+     * - bytes_completed: bytes in fully completed parts (for percentage) */
     uint64_t    bytes_streamed;
+    uint64_t    bytes_completed;
     uint32_t    parts_done; /* completed parts */
     uint64_t    last_log_ms;
     uint64_t    last_log_bytes;
@@ -1543,9 +1545,9 @@ direct_maybe_log_progress(sol_snapshot_parallel_direct_ctx_t* ctx) {
 
     uint64_t total = ctx->total_size;
     uint64_t max_remaining = total > ctx->start_offset ? (total - ctx->start_offset) : 0;
-    uint64_t clamped = streamed;
-    if (max_remaining > 0 && clamped > max_remaining) clamped = max_remaining;
-    uint64_t bytes = ctx->start_offset + clamped;
+    uint64_t completed = __atomic_load_n(&ctx->bytes_completed, __ATOMIC_RELAXED);
+    if (max_remaining > 0 && completed > max_remaining) completed = max_remaining;
+    uint64_t bytes = ctx->start_offset + completed;
     double pct = total > 0 ? (double)bytes * 100.0 / (double)total : 0.0;
 
     uint32_t parts_done = __atomic_load_n(&ctx->parts_done, __ATOMIC_RELAXED);
@@ -1591,7 +1593,7 @@ direct_download_part(sol_snapshot_parallel_direct_ctx_t* ctx, uint32_t part_idx)
     uint8_t* buf = sol_alloc(BUF_SZ);
     if (!buf) return SOL_ERR_NOMEM;
 
-    const uint32_t max_retries = 4;
+    const uint32_t max_retries = 16;
     for (uint32_t attempt = 1; attempt <= max_retries; attempt++) {
         if (sol_snapshot_download_should_abort()) {
             sol_free(buf);
@@ -1602,12 +1604,16 @@ direct_download_part(sol_snapshot_parallel_direct_ctx_t* ctx, uint32_t part_idx)
             return (sol_err_t)__atomic_load_n(&ctx->fatal_err, __ATOMIC_RELAXED);
         }
 
+        const uint64_t req_start = start;
+        const uint64_t req_expected = expected;
+        const uint64_t req_end = end;
+
         pid_t pid = (pid_t)-1;
         int rfd = -1;
         sol_err_t serr = spawn_curl_range_stream(ctx->url,
-                                                 start,
-                                                 end,
-                                                 expected,
+                                                 req_start,
+                                                 req_end,
+                                                 req_expected,
                                                  ctx->timeout,
                                                  timeout_buf,
                                                  &pid,
@@ -1620,13 +1626,13 @@ direct_download_part(sol_snapshot_parallel_direct_ctx_t* ctx, uint32_t part_idx)
 
         uint64_t have = 0;
         sol_err_t io_err = SOL_OK;
-        while (have < expected) {
+        while (have < req_expected) {
             if (sol_snapshot_download_should_abort()) {
                 io_err = SOL_ERR_SHUTDOWN;
                 break;
             }
 
-            size_t want = (size_t)(expected - have);
+            size_t want = (size_t)(req_expected - have);
             if (want > (size_t)BUF_SZ) want = (size_t)BUF_SZ;
 
             ssize_t n = read(rfd, buf, want);
@@ -1643,7 +1649,7 @@ direct_download_part(sol_snapshot_parallel_direct_ctx_t* ctx, uint32_t part_idx)
                                                ctx->out_fd,
                                                buf,
                                                (size_t)n,
-                                               start + have);
+                                               req_start + have);
             if (werr != SOL_OK) {
                 io_err = werr;
                 break;
@@ -1666,7 +1672,14 @@ direct_download_part(sol_snapshot_parallel_direct_ctx_t* ctx, uint32_t part_idx)
             exit_code = WEXITSTATUS(status);
         }
 
-        if (io_err == SOL_OK && have == expected && exit_code == 0) {
+        /* Accept a part only when:
+         * - we consumed exactly the requested number of bytes, and
+         * - curl exited cleanly.
+         *
+         * This prevents silent corruption when an origin intermittently ignores
+         * Range and curl exits non-zero (e.g. 63 from --max-filesize) after we
+         * already consumed req_expected bytes from the wrong offset. */
+        if (io_err == SOL_OK && have == req_expected && exit_code == 0) {
             sol_free(buf);
             return SOL_OK;
         }
@@ -1725,6 +1738,10 @@ direct_worker_main(void* arg) {
             if (merr != SOL_OK) {
                 direct_ctx_set_fatal(ctx, merr);
                 break;
+            }
+            uint64_t expected = direct_part_expected_bytes(ctx, idx);
+            if (expected > 0) {
+                (void)__atomic_fetch_add(&ctx->bytes_completed, expected, __ATOMIC_RELAXED);
             }
             (void)__atomic_fetch_add(&ctx->parts_done, 1u, __ATOMIC_RELAXED);
             continue;
@@ -1839,7 +1856,34 @@ snapshot_download_parallel_direct(const char* url,
     }
 
     int out_fd = -1;
-    if (state_fresh || !options->resume) {
+    bool legacy_prefix_resume = options->resume && start_offset > 0 && state_fresh;
+    uint64_t legacy_existing_size = 0;
+    if (legacy_prefix_resume) {
+        struct stat st;
+        if (stat(out_path, &st) != 0 || st.st_size < 0) {
+            sol_log_warn("Parallel direct download: legacy resume missing base prefix file; cannot resume from %lu: %s",
+                         (unsigned long)start_offset,
+                         out_path);
+            close(state_fd);
+            sol_free(bitmap);
+            return SOL_ERR_IO;
+        }
+
+        legacy_existing_size = (uint64_t)st.st_size;
+        if (legacy_existing_size < start_offset) {
+            sol_log_warn("Parallel direct download: legacy resume prefix too small (have=%lu expected=%lu): %s",
+                         (unsigned long)legacy_existing_size,
+                         (unsigned long)start_offset,
+                         out_path);
+            close(state_fd);
+            sol_free(bitmap);
+            return SOL_ERR_IO;
+        }
+    }
+
+    if (legacy_prefix_resume) {
+        out_fd = open(out_path, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    } else if (state_fresh || !options->resume) {
         out_fd = open(out_path, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0644);
     } else {
         out_fd = open(out_path, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
@@ -1848,6 +1892,15 @@ snapshot_download_parallel_direct(const char* url,
         close(state_fd);
         sol_free(bitmap);
         return SOL_ERR_IO;
+    }
+
+    if (legacy_prefix_resume && legacy_existing_size > start_offset) {
+        if (ftruncate(out_fd, (off_t)start_offset) != 0) {
+            close(out_fd);
+            close(state_fd);
+            sol_free(bitmap);
+            return SOL_ERR_IO;
+        }
     }
 
     if (ftruncate(out_fd, (off_t)total_size) != 0) {
@@ -1875,6 +1928,7 @@ snapshot_download_parallel_direct(const char* url,
     ctx.bitmap = bitmap;
     ctx.bitmap_len = bitmap_len;
     ctx.bytes_streamed = 0;
+    ctx.bytes_completed = 0;
     ctx.parts_done = 0;
     ctx.last_log_ms = 0;
     ctx.last_log_bytes = 0;
@@ -1904,6 +1958,7 @@ snapshot_download_parallel_direct(const char* url,
             }
         }
         __atomic_store_n(&ctx.bytes_streamed, done, __ATOMIC_RELAXED);
+        __atomic_store_n(&ctx.bytes_completed, done, __ATOMIC_RELAXED);
         __atomic_store_n(&ctx.parts_done, done_parts, __ATOMIC_RELAXED);
         __atomic_store_n(&ctx.last_log_bytes, done, __ATOMIC_RELAXED);
     }
@@ -3586,7 +3641,7 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
      * leads to reusing corrupt/truncated archives (especially if a previous
      * download left zeros/holes at the end). */
     bool enforce_size_match = (expected_size > 0) &&
-                              (snapshot->size > 0 || supports_ranges || probe_ok);
+                              (supports_ranges || probe_ok);
 
     bool use_aria2c = false;
     {
@@ -3751,29 +3806,17 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
             sol_sighandler_fn_t old_term = SIG_DFL;
             sol_snapshot_download_install_signal_handlers(&old_int, &old_term);
 
-            bool used_direct = false;
-            sol_err_t err = SOL_ERR_IO;
-            if (have_rangedl_state || resume_from == 0) {
-                used_direct = true;
-                err = snapshot_download_parallel_direct(
-                    effective_url,
-                    tmp_path,
-                    rangedl_state_path,
-                    total_size,
-                    0,
-                    options.parallel_connections,
-                    probe_ok && supports_ranges,
-                    &options);
-            } else {
-                err = snapshot_download_parallel(
-                    effective_url,
-                    tmp_path,
-                    total_size,
-                    resume_from,
-                    options.parallel_connections,
-                    probe_ok && supports_ranges,
-                    &options);
-            }
+            bool used_direct = true;
+            uint64_t direct_start_offset = have_rangedl_state ? 0 : resume_from;
+            sol_err_t err = snapshot_download_parallel_direct(
+                effective_url,
+                tmp_path,
+                rangedl_state_path,
+                total_size,
+                direct_start_offset,
+                options.parallel_connections,
+                probe_ok && supports_ranges,
+                &options);
             sol_snapshot_download_restore_signal_handlers(old_int, old_term);
 
             if (err == SOL_ERR_SHUTDOWN) {
@@ -3941,6 +3984,23 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
 
     char timeout_buf[32];
     uint32_t timeout = snapshot_curl_effective_timeout(options.timeout_secs);
+    if (!supports_ranges && options.timeout_secs == 0 && expected_size > 0) {
+        /* Non-range origins force single-stream download. Auto-tune timeout from
+         * archive size so large full snapshots don't hit curl's max-time and
+         * restart from byte 0. */
+        const uint64_t floor_bps = 20ULL * 1024ULL * 1024ULL; /* 20 MiB/s floor */
+        uint64_t est_secs = expected_size / floor_bps;
+        if ((expected_size % floor_bps) != 0) est_secs++;
+        uint64_t tuned_timeout = est_secs + 180ULL; /* margin for jitter/retries */
+        if (tuned_timeout < 1800ULL) tuned_timeout = 1800ULL;   /* 30m minimum */
+        if (tuned_timeout > 14400ULL) tuned_timeout = 14400ULL; /* 4h cap */
+        if (tuned_timeout > (uint64_t)timeout) {
+            timeout = (uint32_t)tuned_timeout;
+            sol_log_info("Auto-tuned single-stream snapshot timeout to %u seconds (size=%llu bytes)",
+                         (unsigned)timeout,
+                         (unsigned long long)expected_size);
+        }
+    }
     snprintf(timeout_buf, sizeof(timeout_buf), "%u", (unsigned)timeout);
 
     char conn_timeout_buf[16];
@@ -3955,7 +4015,28 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
     sol_snapshot_download_install_signal_handlers(&old_int, &old_term);
 
     int last_exit = -1;
-    const int max_attempts = options.resume ? 8 : 1;
+    int max_attempts = options.resume ? 16 : 1;
+    const char* max_attempts_env = getenv("SOL_SNAPSHOT_MAX_ATTEMPTS");
+    if (max_attempts_env && max_attempts_env[0] != '\0') {
+        errno = 0;
+        char* end = NULL;
+        unsigned long parsed = strtoul(max_attempts_env, &end, 10);
+        if (errno == 0 && end && end != max_attempts_env) {
+            while (*end && isspace((unsigned char)*end)) end++;
+            if (*end == '\0') {
+                if (parsed < 1UL) parsed = 1UL;
+                if (parsed > 128UL) parsed = 128UL;
+                max_attempts = (int)parsed;
+            }
+        }
+    }
+    uint64_t last_retry_progress_bytes = 0;
+    if (options.resume) {
+        struct stat st;
+        if (stat(tmp_path, &st) == 0 && st.st_size > 0) {
+            last_retry_progress_bytes = (uint64_t)st.st_size;
+        }
+    }
 
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         if (sol_snapshot_download_should_abort()) {
@@ -4004,6 +4085,7 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
                                                                  out_fd,
                                                                  resume_from,
                                                                  expected_size,
+                                                                 enforce_size_match,
                                                                  timeout,
                                                                  timeout_buf,
                                                                  resume_from > 0 && supports_ranges,
@@ -4090,6 +4172,25 @@ sol_snapshot_download(const sol_available_snapshot_t* snapshot,
             if (last_exit == 0) {
                 break;
             }
+        }
+
+        bool made_retry_progress = false;
+        if (options.resume) {
+            struct stat st;
+            if (stat(tmp_path, &st) == 0 && st.st_size > 0) {
+                uint64_t cur = (uint64_t)st.st_size;
+                if (cur > last_retry_progress_bytes + (128ULL * 1024ULL * 1024ULL)) {
+                    made_retry_progress = true;
+                }
+                if (cur > last_retry_progress_bytes) {
+                    last_retry_progress_bytes = cur;
+                }
+            }
+        }
+        if (made_retry_progress && attempt == max_attempts && max_attempts < 128) {
+            max_attempts++;
+            sol_log_warn("Snapshot download made progress before failure; extending retry budget to %d attempts",
+                         max_attempts);
         }
 
         if (!options.resume || attempt == max_attempts) {
