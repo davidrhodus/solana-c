@@ -51,6 +51,9 @@ bash ./scripts/run-mainnet-rpc-voting.sh ledger.mainnet
 # Canary gate (health + RPC smoke + sync/replay soak)
 LOG_FILE=ledger.mainnet/validator.log \
 bash ./scripts/run-mainnet-canary-gate.sh 3600
+# Gate also checks vote progress and sustained severe backpressure in the same
+# log window. Tune via REQUIRE_VOTE_PROGRESS, MAX_SEVERE_MODE_EVENTS, and
+# MAX_SEVERE_MODE_RATIO.
 
 # Optional: install dedicated systemd unit for RPC+voting canary
 sudo bash ./scripts/install-mainnet-rpc-voting-service.sh

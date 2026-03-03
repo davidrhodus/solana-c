@@ -157,6 +157,17 @@ Required env values in `/etc/solana-c/mainnet-rpc-voting.env`:
 - `IDENTITY_PATH`
 - `VOTE_ACCOUNT`
 
+Post-start canary validation:
+
+```bash
+LOG_FILE=ledger.mainnet/validator.log \
+./scripts/run-mainnet-canary-gate.sh 3600
+```
+
+The canary gate fails if vote counters do not advance during the soak window,
+or if severe RPC backpressure mode is sustained beyond thresholds. Tune via:
+`REQUIRE_VOTE_PROGRESS`, `MAX_SEVERE_MODE_EVENTS`, `MAX_SEVERE_MODE_RATIO`.
+
 ### Docker Compose
 
 ```bash
