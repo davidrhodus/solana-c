@@ -14,6 +14,9 @@
 #   LOG_FILE=ledger.mainnet/validator.log
 #   HALT_AT=123   # set empty to run continuously
 #   MANIFEST_URL=https://data.pipedev.network/snapshot-manifest.json
+#   ENABLE_VOTING=1   # default: 0 (smoke/non-voting mode)
+#   IDENTITY_PATH=/path/to/identity.json   # required when ENABLE_VOTING=1
+#   VOTE_ACCOUNT=/path/to/vote-account.json|<base58-pubkey>   # required when ENABLE_VOTING=1
 #
 
 set -euo pipefail
@@ -33,6 +36,22 @@ TPU_PORT="${TPU_PORT:-8026}"
 TVU_PORT="${TVU_PORT:-8028}"
 RPC_PORT="${RPC_PORT:-8899}"
 RPC_BIND="${RPC_BIND:-127.0.0.1}"
+ENABLE_VOTING="${ENABLE_VOTING:-0}"
+IDENTITY_PATH="${IDENTITY_PATH:-${IDENTITY:-}}"
+VOTE_ACCOUNT="${VOTE_ACCOUNT:-}"
+
+case "${ENABLE_VOTING}" in
+  1|true|TRUE|yes|YES|on|ON)
+    ENABLE_VOTING=1
+    ;;
+  0|false|FALSE|no|NO|off|OFF|"")
+    ENABLE_VOTING=0
+    ;;
+  *)
+    echo "error: invalid ENABLE_VOTING=${ENABLE_VOTING} (expected 0/1)" >&2
+    exit 1
+    ;;
+esac
 
 if [[ ! -x "${BIN}" ]]; then
   BIN="./build/bin/solana-validator"
@@ -150,7 +169,6 @@ fi
 args=(
   --ledger "${LEDGER_DIR}"
   --rocksdb-path "${ROCKSDB_PATH}"
-  --no-voting
   --rpc-bind "${RPC_BIND}"
   --rpc-port "${RPC_PORT}"
   --log-level info
@@ -160,6 +178,25 @@ args=(
   --tpu-port "${TPU_PORT}"
   --tvu-port "${TVU_PORT}"
 )
+
+if [[ "${ENABLE_VOTING}" == "1" ]]; then
+  if [[ -z "${IDENTITY_PATH}" ]]; then
+    echo "error: ENABLE_VOTING=1 requires IDENTITY_PATH (or IDENTITY)" >&2
+    exit 1
+  fi
+  if [[ ! -r "${IDENTITY_PATH}" ]]; then
+    echo "error: identity keypair not readable: ${IDENTITY_PATH}" >&2
+    exit 1
+  fi
+  if [[ -z "${VOTE_ACCOUNT}" ]]; then
+    echo "error: ENABLE_VOTING=1 requires VOTE_ACCOUNT" >&2
+    exit 1
+  fi
+  echo "Voting enabled: identity=${IDENTITY_PATH} vote_account=${VOTE_ACCOUNT}" >&2
+  args+=(--identity "${IDENTITY_PATH}" --vote-account "${VOTE_ACCOUNT}")
+else
+  args+=(--no-voting)
+fi
 
 if [[ -n "${HALT_AT}" ]]; then
   echo "Dev smoke: halting once slot ${HALT_AT} is replayed." >&2

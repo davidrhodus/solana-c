@@ -12,6 +12,9 @@
 #   BIN=./build.local/bin/solana-validator
 #   LOG_FILE=ledger.mainnet/validator.log
 #   HALT_AT=123   # set to halt once slot is replayed (dev)
+#   ENABLE_VOTING=1
+#   IDENTITY_PATH=/path/to/identity.json
+#   VOTE_ACCOUNT=/path/to/vote-account.json|<base58-pubkey>
 #
 
 set -euo pipefail
@@ -23,4 +26,3 @@ LEDGER_DIR="${1:-ledger.mainnet}"
 export HALT_AT
 
 exec "$(dirname "$0")/run-mainnet-smoke.sh" "${LEDGER_DIR}"
-

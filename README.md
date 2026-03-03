@@ -34,11 +34,19 @@ mkdir -p ledger.mainnet
 # solana-validator will try to raise RLIMIT_NOFILE to 1,000,000 at startup.
 # If that fails (common on constrained systems), set it manually:
 # ulimit -n 1000000
+# Non-voting smoke/catchup mode:
 ./build.local/bin/solana-validator --ledger ledger.mainnet --rocksdb-path ledger.mainnet/rocksdb --no-voting --rpc-bind 0.0.0.0 --log-file ledger.mainnet/validator.log
 
 # Optional: scripted end-to-end smoke bootstrap (best-effort stops a conflicting
-# pipe-solana-validator systemd unit, and halts shortly after the snapshot slot)
+# pipe-solana-validator systemd unit, and halts shortly after the snapshot slot).
+# Defaults to --no-voting unless ENABLE_VOTING=1 is exported.
 bash ./scripts/run-mainnet-smoke.sh ledger.mainnet
+
+# Combined RPC+voting canary profile (single node):
+IDENTITY_PATH=/path/to/identity.json \
+VOTE_ACCOUNT=/path/to/vote-account.json \
+bash ./scripts/run-mainnet-rpc-voting.sh ledger.mainnet
+# To expose RPC externally, set RPC_BIND=0.0.0.0 (and firewall/allowlist it).
 ```
 
 ## Snapshots (bootstrap)
