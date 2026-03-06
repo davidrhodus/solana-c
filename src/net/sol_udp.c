@@ -9,6 +9,9 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <limits.h>
 
 #ifdef __linux__
 #include <sys/sendfile.h>
@@ -20,6 +23,51 @@ struct sol_udp_sock {
     bool           nonblocking;
 };
 
+static size_t
+udp_buf_env_override(const char* env_name, size_t current) {
+    const char* env = getenv(env_name);
+    if (!env || env[0] == '\0') {
+        return current;
+    }
+
+    errno = 0;
+    char* end = NULL;
+    unsigned long long parsed = strtoull(env, &end, 10);
+    if (errno != 0 || end == env) {
+        return current;
+    }
+
+    while (*end && isspace((unsigned char)*end)) end++;
+    unsigned long long mul = 1ull;
+    if (*end == 'k' || *end == 'K') {
+        mul = 1024ull;
+        end++;
+    } else if (*end == 'm' || *end == 'M') {
+        mul = 1024ull * 1024ull;
+        end++;
+    } else if (*end == 'g' || *end == 'G') {
+        mul = 1024ull * 1024ull * 1024ull;
+        end++;
+    }
+    while (*end && isspace((unsigned char)*end)) end++;
+    if (*end != '\0') {
+        return current;
+    }
+
+    if (parsed > ULLONG_MAX / mul) {
+        parsed = ULLONG_MAX / mul;
+    }
+    unsigned long long bytes = parsed * mul;
+    if (bytes > (unsigned long long)SIZE_MAX) {
+        bytes = (unsigned long long)SIZE_MAX;
+    }
+    if (bytes < 65536ull) {
+        bytes = 65536ull;
+    }
+
+    return (size_t)bytes;
+}
+
 sol_udp_sock_t*
 sol_udp_new(const sol_udp_config_t* config) {
     sol_udp_config_t cfg;
@@ -28,6 +76,9 @@ sol_udp_new(const sol_udp_config_t* config) {
     } else {
         cfg = *config;
     }
+
+    cfg.recv_buf = udp_buf_env_override("SOL_UDP_RECVBUF", cfg.recv_buf);
+    cfg.send_buf = udp_buf_env_override("SOL_UDP_SNDBUF", cfg.send_buf);
 
     /* Default to IPv4 */
     int family = cfg.family ? cfg.family : AF_INET;

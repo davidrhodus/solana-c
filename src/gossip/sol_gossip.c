@@ -86,6 +86,33 @@ struct sol_gossip {
     uint8_t             recv_buf[SOL_NET_MTU];
 };
 
+static size_t
+gossip_recv_budget(void) {
+    static size_t cached = 0;
+    if (__builtin_expect(cached != 0u, 1)) {
+        return cached;
+    }
+
+    size_t budget = 16384u;
+    const char* env = getenv("SOL_GOSSIP_RECV_BUDGET");
+    if (env && env[0] != '\0') {
+        errno = 0;
+        char* end = NULL;
+        unsigned long long parsed = strtoull(env, &end, 10);
+        if (errno == 0 && end && end != env) {
+            while (*end && isspace((unsigned char)*end)) end++;
+            if (*end == '\0') {
+                budget = (size_t)parsed;
+            }
+        }
+    }
+
+    if (budget < 1024u) budget = 1024u;
+    if (budget > 1048576u) budget = 1048576u;
+    cached = budget;
+    return cached;
+}
+
 static bool
 ipv4_is_global(uint32_t addr_be) {
     uint32_t a = ntohl(addr_be);
@@ -1099,10 +1126,17 @@ sol_gossip_start(sol_gossip_t* gossip) {
     udp_cfg.bind_ip = gossip->config.bind_ip;
     udp_cfg.bind_port = gossip->config.gossip_port;
     udp_cfg.nonblocking = true;
-    /* Gossip can be extremely bursty on mainnet; keep buffers large to reduce
-     * packet drops while the node is busy with catchup/replay. */
-    udp_cfg.recv_buf = 128u * 1024u * 1024u;
-    udp_cfg.send_buf = 128u * 1024u * 1024u;
+    /* Gossip can be extremely bursty on mainnet; scale socket buffers with
+     * host size to reduce packet drops while replay is saturated. */
+    size_t gossip_sock_buf = 128u * 1024u * 1024u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        gossip_sock_buf = 512u * 1024u * 1024u;
+    } else if (ncpu >= 64) {
+        gossip_sock_buf = 256u * 1024u * 1024u;
+    }
+    udp_cfg.recv_buf = gossip_sock_buf;
+    udp_cfg.send_buf = gossip_sock_buf;
 
     uint16_t requested_port = udp_cfg.bind_port;
     gossip->sock = sol_udp_new(&udp_cfg);
@@ -1307,10 +1341,10 @@ sol_gossip_run_once(sol_gossip_t* gossip, uint32_t timeout_ms) {
     }
 
     /* Receive messages (drain socket to keep up with mainnet rates). */
-    enum { SOL_GOSSIP_RECV_BUDGET = 4096 };
+    size_t recv_budget = gossip_recv_budget();
     size_t processed = 0;
     sol_udp_pkt_t pkts[SOL_NET_BATCH_SIZE];
-    while (processed < SOL_GOSSIP_RECV_BUDGET) {
+    while (processed < recv_budget) {
         int n = sol_udp_recv_batch(gossip->sock, pkts, SOL_NET_BATCH_SIZE);
         if (n < 0) {
             sol_log_warn("UDP recv error");

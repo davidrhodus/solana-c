@@ -183,7 +183,7 @@ typedef struct {
 
 #define SOL_REPAIR_CONFIG_DEFAULT {         \
     .request_timeout_ms = 200,              \
-    .max_pending_requests = 8192,           \
+    .max_pending_requests = 16384,          \
     .max_retries = 7,                       \
     .serve_repairs = true,                  \
 }
@@ -419,6 +419,19 @@ bool sol_repair_pending_slot_stats(sol_repair_t* repair,
 size_t sol_repair_prune_pending_outside_window(sol_repair_t* repair,
                                               sol_slot_t min_slot,
                                               sol_slot_t max_slot);
+
+/*
+ * Prune all pending requests for a specific slot.
+ *
+ * Useful as a targeted reset when a replay-critical slot is deeply stalled and
+ * in-flight requests appear stuck on unhelpful peers.
+ *
+ * @param repair      Repair service
+ * @param slot        Slot to prune (must be non-zero)
+ * @return number of pending requests removed
+ */
+size_t sol_repair_prune_pending_slot(sol_repair_t* repair,
+                                     sol_slot_t slot);
 
 /*
  * Get configured maximum number of pending requests.

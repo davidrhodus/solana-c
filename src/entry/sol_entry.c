@@ -8,6 +8,8 @@
 #include "../crypto/sol_sha256.h"
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
 
 /*
  * Initial transaction capacity for entries
@@ -622,8 +624,92 @@ sol_entry_batch_parse(sol_entry_batch_t* batch, const uint8_t* data, size_t len)
     return sol_entry_batch_parse_ex(batch, data, len, true);
 }
 
-sol_entry_verify_result_t
-sol_entry_batch_verify(const sol_entry_batch_t* batch, const sol_hash_t* start_hash) {
+typedef struct {
+    const sol_entry_batch_t* batch;
+    size_t                   start_idx;
+    size_t                   end_idx;
+    sol_hash_t               start_hash;
+    bool                     valid;
+} sol_entry_verify_chunk_t;
+
+static void*
+sol_entry_verify_chunk_main(void* arg) {
+    sol_entry_verify_chunk_t* chunk = (sol_entry_verify_chunk_t*)arg;
+    if (!chunk || !chunk->batch) return NULL;
+
+    sol_hash_t current_hash = chunk->start_hash;
+    chunk->valid = true;
+
+    for (size_t i = chunk->start_idx; i < chunk->end_idx; i++) {
+        const sol_entry_t* entry = &chunk->batch->entries[i];
+        sol_hash_t expected_hash;
+        sol_entry_compute_hash(entry, &current_hash, &expected_hash);
+        if (memcmp(expected_hash.bytes, entry->hash.bytes, 32) != 0) {
+            chunk->valid = false;
+            return NULL;
+        }
+        current_hash = entry->hash;
+    }
+
+    return NULL;
+}
+
+static inline uint64_t
+sol_entry_verify_work_units(const sol_entry_t* entry) {
+    if (!entry) return 1u;
+    return entry->num_hashes ? entry->num_hashes : 1u;
+}
+
+static size_t
+sol_entry_verify_parallel_threads(void) {
+    size_t threads = 1u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        threads = 32u;
+    } else if (ncpu >= 96) {
+        threads = 24u;
+    } else if (ncpu >= 64) {
+        threads = 16u;
+    } else if (ncpu >= 32) {
+        threads = 8u;
+    }
+
+    const char* env = getenv("SOL_ENTRY_VERIFY_PARALLEL_THREADS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            threads = (size_t)x;
+        }
+    }
+
+    if (threads > 64u) threads = 64u;
+    return threads;
+}
+
+static size_t
+sol_entry_verify_parallel_min_entries(void) {
+    size_t min_entries = 256u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) min_entries = 128u;
+    else if (ncpu >= 64) min_entries = 160u;
+    else if (ncpu >= 32) min_entries = 192u;
+
+    const char* env = getenv("SOL_ENTRY_VERIFY_PARALLEL_MIN_ENTRIES");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            min_entries = (size_t)x;
+        }
+    }
+
+    if (min_entries > 65536u) min_entries = 65536u;
+    return min_entries;
+}
+
+static sol_entry_verify_result_t
+sol_entry_batch_verify_serial(const sol_entry_batch_t* batch, const sol_hash_t* start_hash) {
     sol_entry_verify_result_t result = {0};
 
     if (!batch || !start_hash) {
@@ -843,6 +929,105 @@ sol_entry_batch_verify(const sol_entry_batch_t* batch, const sol_hash_t* start_h
 
     result.valid = true;
     return result;
+}
+
+sol_entry_verify_result_t
+sol_entry_batch_verify(const sol_entry_batch_t* batch, const sol_hash_t* start_hash) {
+    sol_entry_verify_result_t result = {0};
+
+    if (!batch || !start_hash) {
+        result.error = SOL_ERR_INVAL;
+        return result;
+    }
+
+    const size_t entry_count = batch->num_entries;
+    size_t parallel_threads = sol_entry_verify_parallel_threads();
+    size_t min_entries = sol_entry_verify_parallel_min_entries();
+
+    if (parallel_threads > 1u && entry_count >= min_entries) {
+        if (parallel_threads > entry_count) parallel_threads = entry_count;
+        if (parallel_threads > 64u) parallel_threads = 64u;
+
+        if (parallel_threads > 1u) {
+            sol_entry_verify_chunk_t chunks[64];
+            pthread_t threads[63];
+            size_t started = 0;
+            size_t cursor = 0;
+            uint64_t total_work = 0u;
+            for (size_t i = 0; i < entry_count; i++) {
+                total_work += sol_entry_verify_work_units(&batch->entries[i]);
+            }
+            uint64_t remaining_work = total_work;
+
+            for (size_t t = 0; t < parallel_threads; t++) {
+                size_t remaining_chunks = parallel_threads - t;
+                uint64_t target_work =
+                    (remaining_work + (uint64_t)remaining_chunks - 1u) /
+                    (uint64_t)remaining_chunks;
+                if (target_work == 0u) target_work = 1u;
+
+                size_t end = cursor;
+                uint64_t chunk_work = 0u;
+                while (end < entry_count) {
+                    chunk_work += sol_entry_verify_work_units(&batch->entries[end]);
+                    end++;
+                    if (chunk_work >= target_work) break;
+                    if ((entry_count - end) <= (remaining_chunks - 1u)) break;
+                }
+                if (end <= cursor) {
+                    end = cursor + 1u;
+                    chunk_work = sol_entry_verify_work_units(&batch->entries[cursor]);
+                }
+
+                chunks[t].batch = batch;
+                chunks[t].start_idx = cursor;
+                chunks[t].end_idx = end;
+                chunks[t].start_hash = (cursor == 0u) ? *start_hash : batch->entries[cursor - 1u].hash;
+                chunks[t].valid = false;
+                cursor = end;
+                if (chunk_work >= remaining_work) {
+                    remaining_work = 0u;
+                } else {
+                    remaining_work -= chunk_work;
+                }
+            }
+
+            bool thread_create_failed = false;
+            for (size_t t = 1; t < parallel_threads; t++) {
+                if (pthread_create(&threads[t - 1u], NULL, sol_entry_verify_chunk_main, &chunks[t]) != 0) {
+                    thread_create_failed = true;
+                    break;
+                }
+                started++;
+            }
+
+            /* Use caller thread for chunk 0 to avoid one extra wakeup. */
+            (void)sol_entry_verify_chunk_main(&chunks[0]);
+
+            for (size_t i = 0; i < started; i++) {
+                (void)pthread_join(threads[i], NULL);
+            }
+
+            if (!thread_create_failed) {
+                bool all_valid = true;
+                for (size_t t = 0; t < parallel_threads; t++) {
+                    if (!chunks[t].valid) {
+                        all_valid = false;
+                        break;
+                    }
+                }
+                if (all_valid) {
+                    result.valid = true;
+                    result.num_verified =
+                        (entry_count > (size_t)UINT32_MAX) ? UINT32_MAX : (uint32_t)entry_count;
+                    return result;
+                }
+            }
+        }
+    }
+
+    /* Fallback path preserves first-failure diagnostics. */
+    return sol_entry_batch_verify_serial(batch, start_hash);
 }
 
 uint32_t

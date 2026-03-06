@@ -186,6 +186,141 @@ TEST(tvu_process_shred_too_large) {
     sol_tvu_destroy(tvu);
 }
 
+TEST(tvu_max_shred_ahead_adapts_to_lag) {
+    sol_blockstore_t* blockstore = sol_blockstore_new(NULL);
+    ASSERT(blockstore != NULL);
+
+    sol_bank_config_t bank_cfg = SOL_BANK_CONFIG_DEFAULT;
+    bank_cfg.ticks_per_slot = 2;
+    sol_bank_t* root = sol_bank_new(1, NULL, NULL, &bank_cfg);
+    ASSERT(root != NULL);
+
+    sol_bank_forks_t* forks = sol_bank_forks_new(root, NULL);
+    ASSERT(forks != NULL);
+
+    sol_replay_t* replay = sol_replay_new(forks, blockstore, NULL);
+    ASSERT(replay != NULL);
+    ASSERT(sol_replay_highest_replayed_slot(replay) == 1);
+
+    uint8_t seed[SOL_ED25519_SEED_SIZE] = {2};
+    sol_keypair_t leader;
+    sol_ed25519_keypair_from_seed(seed, &leader);
+
+    uint8_t payload[1] = {0};
+    uint8_t raw_high[SOL_SHRED_SIZE];
+    size_t raw_high_len = 0;
+    sol_err_t berr = sol_shred_build_legacy_data(
+        &leader,
+        6000,   /* slot */
+        5999,   /* parent_slot */
+        0,      /* index */
+        0,      /* version */
+        0,      /* fec_set_index */
+        (uint8_t)(SOL_SHRED_FLAG_DATA_COMPLETE | SOL_SHRED_FLAG_LAST_IN_SLOT),
+        payload,
+        sizeof(payload),
+        raw_high,
+        sizeof(raw_high),
+        &raw_high_len
+    );
+    ASSERT(berr == SOL_OK);
+
+    sol_shred_t high_shred;
+    ASSERT(sol_shred_parse(&high_shred, raw_high, raw_high_len) == SOL_OK);
+    ASSERT(sol_blockstore_insert_shred(blockstore, &high_shred, raw_high, raw_high_len) == SOL_OK);
+    ASSERT(sol_blockstore_highest_slot(blockstore) >= 6000);
+
+    sol_tvu_t* tvu = sol_tvu_new(blockstore, replay, NULL, NULL, NULL);
+    ASSERT(tvu != NULL);
+
+    sol_tvu_stats_t before = sol_tvu_stats(tvu);
+
+    uint8_t far_raw[256];
+    size_t far_len = build_mock_legacy_data_shred(far_raw, sizeof(far_raw), 1500, 0);
+    ASSERT(far_len > 0);
+    ASSERT(sol_tvu_process_shred(tvu, far_raw, far_len) == SOL_OK);
+    sol_tvu_stats_t after_far = sol_tvu_stats(tvu);
+    ASSERT(after_far.shreds_received == before.shreds_received);
+
+    uint8_t near_raw[256];
+    size_t near_len = build_mock_legacy_data_shred(near_raw, sizeof(near_raw), 900, 0);
+    ASSERT(near_len > 0);
+    ASSERT(sol_tvu_process_shred(tvu, near_raw, near_len) == SOL_OK);
+    sol_tvu_stats_t after_near = sol_tvu_stats(tvu);
+    ASSERT(after_near.shreds_received == before.shreds_received + 1);
+
+    sol_tvu_destroy(tvu);
+    sol_replay_destroy(replay);
+    sol_blockstore_destroy(blockstore);
+    sol_bank_forks_destroy(forks);
+}
+
+TEST(tvu_replay_window_deprioritizes_far_complete_slot) {
+    sol_blockstore_t* blockstore = sol_blockstore_new(NULL);
+    ASSERT(blockstore != NULL);
+
+    sol_bank_config_t bank_cfg = SOL_BANK_CONFIG_DEFAULT;
+    bank_cfg.ticks_per_slot = 2;
+    sol_bank_t* root = sol_bank_new(1, NULL, NULL, &bank_cfg);
+    ASSERT(root != NULL);
+
+    sol_bank_forks_t* forks = sol_bank_forks_new(root, NULL);
+    ASSERT(forks != NULL);
+
+    sol_replay_t* replay = sol_replay_new(forks, blockstore, NULL);
+    ASSERT(replay != NULL);
+    ASSERT(sol_replay_highest_replayed_slot(replay) == 1);
+
+    sol_tvu_t* tvu = sol_tvu_new(blockstore, replay, NULL, NULL, NULL);
+    ASSERT(tvu != NULL);
+    ASSERT(sol_tvu_start(tvu) == SOL_OK);
+
+    uint8_t seed[SOL_ED25519_SEED_SIZE] = {3};
+    sol_keypair_t leader;
+    sol_ed25519_keypair_from_seed(seed, &leader);
+
+    uint8_t payload[1] = {0};
+    uint8_t raw[SOL_SHRED_SIZE];
+    size_t raw_len = 0;
+    sol_err_t berr = sol_shred_build_legacy_data(
+        &leader,
+        3500,   /* slot */
+        3499,   /* parent_slot */
+        0,      /* index */
+        0,      /* version */
+        0,      /* fec_set_index */
+        (uint8_t)(SOL_SHRED_FLAG_DATA_COMPLETE | SOL_SHRED_FLAG_LAST_IN_SLOT),
+        payload,
+        sizeof(payload),
+        raw,
+        sizeof(raw),
+        &raw_len
+    );
+    ASSERT(berr == SOL_OK);
+    ASSERT(sol_tvu_process_shred(tvu, raw, raw_len) == SOL_OK);
+
+    sol_slot_status_t status = SOL_SLOT_STATUS_UNKNOWN;
+    for (int i = 0; i < 300; i++) { /* ~3s */
+        status = sol_tvu_slot_status(tvu, 3500);
+        if (status != SOL_SLOT_STATUS_UNKNOWN &&
+            status != SOL_SLOT_STATUS_RECEIVING) {
+            break;
+        }
+        usleep(10000);
+    }
+
+    /* Far-ahead complete slot should remain queued for replay, not replayed
+     * immediately while frontier slots are missing. */
+    ASSERT(status == SOL_SLOT_STATUS_COMPLETE);
+    usleep(200000); /* 200ms */
+    ASSERT(sol_tvu_slot_status(tvu, 3500) == SOL_SLOT_STATUS_COMPLETE);
+
+    sol_tvu_destroy(tvu);
+    sol_replay_destroy(replay);
+    sol_blockstore_destroy(blockstore);
+    sol_bank_forks_destroy(forks);
+}
+
 TEST(tvu_leader_schedule_swap) {
     sol_tvu_config_t config = SOL_TVU_CONFIG_DEFAULT;
     sol_tvu_t* tvu = sol_tvu_new(NULL, NULL, NULL, NULL, &config);
@@ -351,6 +486,107 @@ TEST(tvu_tracker_eviction_preserves_low_slot) {
     sol_tvu_destroy(tvu);
 }
 
+TEST(tvu_replay_primary_rehydrated_from_blockstore) {
+    enum { TVU_MAX_TRACKED_SLOTS = 4096 };
+
+    sol_blockstore_t* blockstore = sol_blockstore_new(NULL);
+    ASSERT(blockstore != NULL);
+
+    sol_bank_config_t bank_cfg = SOL_BANK_CONFIG_DEFAULT;
+    bank_cfg.ticks_per_slot = 2;
+    sol_bank_t* root = sol_bank_new(1, NULL, NULL, &bank_cfg);
+    ASSERT(root != NULL);
+
+    sol_bank_forks_t* forks = sol_bank_forks_new(root, NULL);
+    ASSERT(forks != NULL);
+
+    sol_replay_t* replay = sol_replay_new(forks, blockstore, NULL);
+    ASSERT(replay != NULL);
+    ASSERT(sol_replay_highest_replayed_slot(replay) == 1);
+
+    /* Seed an executable bank for slot 2 so replay can advance once the
+     * frontier slot is discovered from blockstore state. */
+    sol_bank_t* bank2 = sol_bank_new_from_parent(root, 2);
+    ASSERT(bank2 != NULL);
+    sol_hash_t tick_hash = {{7}};
+    ASSERT(sol_bank_register_tick(bank2, &tick_hash) == SOL_OK);
+    ASSERT(sol_bank_register_tick(bank2, &tick_hash) == SOL_OK);
+    ASSERT(sol_bank_forks_insert(forks, bank2) == SOL_OK);
+
+    sol_tvu_t* tvu = sol_tvu_new(blockstore, replay, NULL, NULL, NULL);
+    ASSERT(tvu != NULL);
+    ASSERT(sol_tvu_start(tvu) == SOL_OK);
+
+    /* Saturate slot trackers with far-ahead slots so the replay frontier slot
+     * is absent from tracker state. */
+    uint8_t raw[256];
+    for (sol_slot_t slot = 10000; slot < (sol_slot_t)(10000 + TVU_MAX_TRACKED_SLOTS + 1024); slot++) {
+        size_t len = build_mock_legacy_data_shred(raw, sizeof(raw), slot, 0);
+        ASSERT(len > 0);
+        sol_err_t err = sol_tvu_process_shred(tvu, raw, len);
+        while (err == SOL_ERR_FULL) {
+            usleep(1000);
+            err = sol_tvu_process_shred(tvu, raw, len);
+        }
+        ASSERT(err == SOL_OK);
+    }
+
+    for (int i = 0; i < 200; i++) { /* ~2s */
+        if (sol_tvu_slot_status(tvu, 2) == SOL_SLOT_STATUS_UNKNOWN) {
+            break;
+        }
+        usleep(10000);
+    }
+    ASSERT(sol_tvu_slot_status(tvu, 2) == SOL_SLOT_STATUS_UNKNOWN);
+
+    /* Insert the primary slot directly into blockstore (without TVU shred
+     * ingestion) to emulate persisted/repair-complete data with missing
+     * tracker state. */
+    uint8_t seed[SOL_ED25519_SEED_SIZE] = {9};
+    sol_keypair_t leader;
+    sol_ed25519_keypair_from_seed(seed, &leader);
+
+    uint8_t payload[1] = {0};
+    uint8_t primary_raw[SOL_SHRED_SIZE];
+    size_t primary_len = 0;
+    sol_err_t berr = sol_shred_build_legacy_data(
+        &leader,
+        2,      /* slot */
+        1,      /* parent_slot */
+        0,      /* index */
+        0,      /* version */
+        0,      /* fec_set_index */
+        (uint8_t)(SOL_SHRED_FLAG_DATA_COMPLETE | SOL_SHRED_FLAG_LAST_IN_SLOT),
+        payload,
+        sizeof(payload),
+        primary_raw,
+        sizeof(primary_raw),
+        &primary_len
+    );
+    ASSERT(berr == SOL_OK);
+
+    sol_shred_t primary_shred;
+    ASSERT(sol_shred_parse(&primary_shred, primary_raw, primary_len) == SOL_OK);
+    ASSERT(sol_blockstore_insert_shred(blockstore, &primary_shred, primary_raw, primary_len) == SOL_OK);
+
+    sol_slot_status_t status = SOL_SLOT_STATUS_UNKNOWN;
+    for (int i = 0; i < 500; i++) { /* ~5s */
+        status = sol_tvu_slot_status(tvu, 2);
+        if (status == SOL_SLOT_STATUS_REPLAYED || status == SOL_SLOT_STATUS_DEAD) {
+            break;
+        }
+        usleep(10000);
+    }
+
+    ASSERT(status == SOL_SLOT_STATUS_REPLAYED);
+    ASSERT(sol_replay_highest_replayed_slot(replay) >= 2);
+
+    sol_tvu_destroy(tvu);
+    sol_replay_destroy(replay);
+    sol_blockstore_destroy(blockstore);
+    sol_bank_forks_destroy(forks);
+}
+
 /*
  * Main
  */
@@ -365,9 +601,12 @@ int main(void) {
     RUN_TEST(tvu_start_stop);
     RUN_TEST(tvu_process_shred_null);
     RUN_TEST(tvu_process_shred_too_large);
+    RUN_TEST(tvu_max_shred_ahead_adapts_to_lag);
+    RUN_TEST(tvu_replay_window_deprioritizes_far_complete_slot);
     RUN_TEST(tvu_leader_schedule_swap);
     RUN_TEST(tvu_replay_duplicate_not_dead);
     RUN_TEST(tvu_tracker_eviction_preserves_low_slot);
+    RUN_TEST(tvu_replay_primary_rehydrated_from_blockstore);
 
     printf("\nResults: %d/%d passed\n\n", tests_passed, tests_run);
 

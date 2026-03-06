@@ -26,7 +26,7 @@
 /*
  * Maximum packets to send/receive in a batch
  */
-#define SOL_NET_BATCH_SIZE 64
+#define SOL_NET_BATCH_SIZE 128
 
 /*
  * Socket address abstraction

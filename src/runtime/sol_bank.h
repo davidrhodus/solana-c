@@ -88,6 +88,7 @@ typedef struct {
 typedef struct sol_bank sol_bank_t;
 
 typedef struct {
+    uint64_t    prep_ns;    /* pre-exec overhead (scratch ensure + tx flatten) */
     uint64_t    tx_exec_ns; /* tx scheduling + execution + tx-status writeback */
     uint64_t    poh_ns;     /* PoH/tick advancement over batch entries */
 } sol_bank_process_entries_timing_t;
@@ -161,6 +162,12 @@ void sol_bank_vote_timestamp_cache_update(
  */
 void sol_bank_programdata_cache_invalidate_program(const sol_pubkey_t* program_id);
 void sol_bank_programdata_cache_invalidate_programdata(const sol_pubkey_t* programdata_id);
+
+/*
+ * Prewarm shared tx pool workers eagerly (instead of first-use lazy init in
+ * replay/lt-hash hot paths). Safe to call multiple times.
+ */
+void sol_bank_tx_pool_prewarm(void);
 
 /*
  * Destroy bank
@@ -519,6 +526,14 @@ sol_err_t sol_bank_process_entries_ex(
     const sol_entry_batch_t*                batch,
     sol_bank_process_entries_timing_t*      timing
 );
+
+/*
+ * Replay hint: set true when the current thread is processing entries whose
+ * transaction signatures were already verified by replay entry verification.
+ * This allows bank transaction execution to skip redundant per-transaction
+ * signature re-verification on the same thread.
+ */
+void sol_bank_set_replay_signatures_preverified(bool enabled);
 
 /*
  * Register a tick (PoH advancement)

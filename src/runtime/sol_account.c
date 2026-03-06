@@ -4,49 +4,18 @@
 
 #include "sol_account.h"
 #include "../util/sol_alloc.h"
-#include "../util/sol_slab.h"
 #include "../crypto/sol_sha256.h"
 #include <string.h>
 
-/* ---- sol_account_t allocation ----
- *
- * Replay loads/destroys accounts at extremely high rates. Avoid malloc/free
- * overhead by using a per-thread slab allocator for sol_account_t objects.
- *
- * We intentionally do not reclaim the slab at thread-exit: validator worker
- * threads are long-lived and the slab footprint is small relative to the
- * overall process.
- */
-
-static __thread sol_slab_t* g_tls_account_slab = NULL;
-
-static inline sol_slab_t*
-account_slab_get_or_init(void) {
-    if (g_tls_account_slab) {
-        return g_tls_account_slab;
-    }
-
-    sol_slab_t* slab = sol_slab_new(sizeof(sol_account_t), _Alignof(sol_account_t), 0);
-    if (!slab) {
-        return NULL;
-    }
-    g_tls_account_slab = slab;
-    return slab;
-}
-
 sol_account_t*
 sol_account_alloc(void) {
-    sol_slab_t* slab = account_slab_get_or_init();
-    if (!slab) return NULL;
-    return (sol_account_t*)sol_slab_calloc(slab);
+    return (sol_account_t*)sol_calloc(1, sizeof(sol_account_t));
 }
 
 static inline void
 sol_account_free_struct(sol_account_t* account) {
     if (!account) return;
-    sol_slab_t* slab = account_slab_get_or_init();
-    if (!slab) return; /* OOM: leak rather than freeing an interior pointer. */
-    sol_slab_free(slab, account);
+    sol_free(account);
 }
 
 /*

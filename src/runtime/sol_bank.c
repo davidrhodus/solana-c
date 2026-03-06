@@ -32,10 +32,12 @@
 #include <pthread.h>
 #include <sched.h>
 #include <unistd.h>
+#include <errno.h>
 
 /* ---- Concurrency helpers (bank hot path) ---- */
 
 static inline uint64_t bank_monotonic_ns(void);
+static bool lthash_parallel_enabled(void);
 static uint32_t signature_hash(const sol_signature_t* sig);
 static void sol_bank_record_tx_status_batch(sol_bank_t* bank,
                                             const sol_transaction_t* const* tx_ptrs,
@@ -177,6 +179,48 @@ bank_skip_signature_verify(void) {
     return enabled != 0;
 }
 
+static bool
+bank_record_tx_status_batch_enabled(void) {
+    /* Default: when tx indexing is disabled, skip replay batch tx-status cache
+     * writes to avoid long mutex-held updates in the replay hot path.
+     *
+     * Override:
+     *   SOL_TX_STATUS_BATCH_RECORD=1  force-enable
+     *   SOL_TX_STATUS_BATCH_RECORD=0  force-disable
+     */
+    const char* env = getenv("SOL_TX_STATUS_BATCH_RECORD");
+    if (env && env[0] != '\0') {
+        while (*env && isspace((unsigned char)*env)) env++;
+        if (*env == '0' || *env == 'n' || *env == 'N' || *env == 'f' || *env == 'F') {
+            return false;
+        }
+        return true;
+    }
+
+    const char* skip_tx_index = getenv("SOL_SKIP_TX_INDEX");
+    if (skip_tx_index && skip_tx_index[0] != '\0') {
+        while (*skip_tx_index && isspace((unsigned char)*skip_tx_index)) skip_tx_index++;
+        if (*skip_tx_index == '0' || *skip_tx_index == 'n' || *skip_tx_index == 'N' ||
+            *skip_tx_index == 'f' || *skip_tx_index == 'F') {
+            return true;
+        }
+        return false;
+    }
+
+    return true;
+}
+
+/* Replay-only thread-local hint: when set, the current thread is processing
+ * entries whose transaction signatures are being verified by replay entry
+ * verification (sync or async-then-joined) and can skip redundant per-tx
+ * signature re-verification in the bank hot path. */
+static __thread int g_tls_replay_signatures_preverified = 0;
+
+void
+sol_bank_set_replay_signatures_preverified(bool enabled) {
+    g_tls_replay_signatures_preverified = enabled ? 1 : 0;
+}
+
 static uint64_t
 bank_slow_tx_threshold_ns(void) {
     /* Returns 0 when disabled. Cached after first call. */
@@ -198,6 +242,41 @@ bank_slow_tx_threshold_ns(void) {
 
     __atomic_store_n(&cached, ns, __ATOMIC_RELEASE);
     return ns;
+}
+
+static uint64_t
+bank_slow_instr_threshold_ns(void) {
+    /* Returns 0 when disabled. Cached after first call. */
+    static _Atomic uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) {
+        return v;
+    }
+
+    uint64_t ns = 0;
+    const char* env = getenv("SOL_SLOW_INSTR_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long ms = strtoul(env, &end, 10);
+        if (end != env && ms > 0ul) {
+            ns = (uint64_t)ms * 1000000ull;
+        }
+    }
+
+    __atomic_store_n(&cached, ns, __ATOMIC_RELEASE);
+    return ns;
+}
+
+static bool
+bank_slow_tx_phase_diag_enabled(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) return v != 0;
+
+    const char* env = getenv("SOL_SLOW_TX_PHASES");
+    int enabled = (env && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
 }
 
 static bool
@@ -1835,7 +1914,7 @@ bank_compute_accounts_lt_hash_locked(sol_bank_t* bank) {
              * frozen (no further overlay mutations). */
             if (__atomic_load_n(&bank->frozen, __ATOMIC_ACQUIRE)) {
                 sol_accounts_db_local_snapshot_view_t snap = {0};
-                sol_err_t err = sol_accounts_db_snapshot_local_view(bank->accounts_db, &snap);
+                sol_err_t err = sol_accounts_db_snapshot_local_view_immutable(bank->accounts_db, &snap);
                 if (err == SOL_OK) {
                     sol_lt_hash_t delta;
                     tx_pool_run_lthash_delta(snap.parent, snap.entries, snap.len, &delta);
@@ -2934,6 +3013,24 @@ bank_tx_view_cache_insert(const sol_pubkey_t* pubkey,
 /* CPI-time account overrides (see sol_bank.h). */
 static __thread sol_bank_account_overrides_t* g_tls_account_overrides = NULL;
 
+static inline void
+bank_tx_view_cache_store_written_account_if_cpi(const sol_pubkey_t* pubkey,
+                                                const sol_account_t* account,
+                                                sol_slot_t stored_slot) {
+    if (!pubkey || !account) return;
+    if (!bank_tx_view_cache_is_active()) return;
+    /* Hot-path optimization for CPI post-update:
+     * when callee writes an account, cache the post-write view so the caller's
+     * AccountInfo sync doesn't need to reload from AccountsDB. */
+    if (__builtin_expect(g_tls_account_overrides == NULL, 1)) return;
+
+    sol_account_t* cached = sol_account_clone(account);
+    if (!cached) return;
+    if (!bank_tx_view_cache_insert(pubkey, cached, true, stored_slot)) {
+        sol_account_destroy(cached);
+    }
+}
+
 sol_bank_account_overrides_t*
 sol_bank_overrides_push(sol_bank_account_overrides_t* overrides) {
     sol_bank_account_overrides_t* prev = g_tls_account_overrides;
@@ -3244,6 +3341,7 @@ sol_bank_store_account(sol_bank_t* bank, const sol_pubkey_t* pubkey,
     /* If CPI overrides are active, this pubkey is now written by the callee. */
     bank_overrides_mark_written(pubkey);
     bank_tx_view_cache_invalidate(pubkey);
+    bank_tx_view_cache_store_written_account_if_cpi(pubkey, account, bank->slot);
 
     bank_tx_undo_entry_t* undo_e = NULL;
     sol_err_t undo_err = bank_tx_undo_record(bank, pubkey, &undo_e);
@@ -5453,6 +5551,25 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
 
     uint64_t slow_tx_thresh_ns = bank_slow_tx_threshold_ns();
     uint64_t slow_tx_t0 = slow_tx_thresh_ns ? bank_monotonic_ns() : 0;
+    bool slow_tx_phase_diag = slow_tx_t0 && bank_slow_tx_phase_diag_enabled();
+    uint8_t slow_tx_phase = 0u; /* 0=pre, 1=exec, 2=post */
+    uint64_t slow_tx_phase_t0 = slow_tx_phase_diag ? slow_tx_t0 : 0u;
+    uint64_t slow_tx_pre_ns = 0u;
+    uint64_t slow_tx_exec_ns = 0u;
+    uint64_t slow_tx_post_ns = 0u;
+    uint64_t slow_tx_pre_mark_ns = slow_tx_phase_diag ? slow_tx_t0 : 0u;
+    uint64_t slow_tx_pre_validate_ns = 0u;
+    uint64_t slow_tx_pre_blockhash_fee_ns = 0u;
+    uint64_t slow_tx_pre_payer_sig_ns = 0u;
+    uint64_t slow_tx_pre_fee_commit_ns = 0u;
+    uint64_t slow_tx_pre_setup_ns = 0u;
+    uint64_t slow_tx_pre_setup_stage_t0 = 0u;
+    uint64_t slow_tx_pre_setup_demote_ns = 0u;
+    uint64_t slow_tx_pre_setup_instr_sysvar_ns = 0u;
+    uint64_t slow_tx_pre_setup_undo_ns = 0u;
+    uint64_t slow_tx_pre_setup_rent_fixup_ns = 0u;
+    uint64_t slow_tx_pre_setup_invoke_ctx_ns = 0u;
+    uint64_t slow_instr_thresh_ns = bank_slow_instr_threshold_ns();
 
     /* Clear TLS overrides in case the caller reuses a worker thread. */
     g_tls_instructions_sysvar = NULL;
@@ -5604,6 +5721,12 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
         }
     }
 
+    if (slow_tx_pre_mark_ns) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_validate_ns += (now - slow_tx_pre_mark_ns);
+        slow_tx_pre_mark_ns = now;
+    }
+
     /* 1. Verify blockhash is recent (and fetch lamports_per_signature). */
     bool recent_ok = false;
     uint64_t lamports_per_signature = bank->config.lamports_per_signature;
@@ -5657,6 +5780,12 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
     uint64_t priority_fee = sol_compute_budget_priority_fee(&compute_budget);
     result.fee = base_fee + priority_fee;
 
+    if (slow_tx_pre_mark_ns) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_blockhash_fee_ns += (now - slow_tx_pre_mark_ns);
+        slow_tx_pre_mark_ns = now;
+    }
+
     /* 4. Get fee payer */
     const sol_pubkey_t* fee_payer = sol_message_fee_payer(&tx->message);
     if (!fee_payer) {
@@ -5699,6 +5828,7 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
     BANK_STAT_ADD(bank, signatures_verified, (uint64_t)tx->signatures_len);
 
     if (!bank_skip_signature_verify() &&
+        !g_tls_replay_signatures_preverified &&
         !sol_transaction_verify_signatures(tx, NULL)) {
         result.status = SOL_ERR_TX_SIGNATURE;
         BANK_STAT_INC(bank, transactions_failed);
@@ -5706,6 +5836,12 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
         log_prevalidation_rejection(bank, tx, "signature", SOL_ERR_TX_SIGNATURE);
         sol_account_destroy(payer_account);
         goto unlock_and_return;
+    }
+
+    if (slow_tx_pre_mark_ns) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_payer_sig_ns += (now - slow_tx_pre_mark_ns);
+        slow_tx_pre_mark_ns = now;
     }
 
     /* 6.5 Fix rent_epoch for fee payer.
@@ -5787,6 +5923,13 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
         goto unlock_and_return;
     }
 
+    if (slow_tx_pre_mark_ns) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_fee_commit_ns += (now - slow_tx_pre_mark_ns);
+        slow_tx_pre_mark_ns = now;
+        slow_tx_pre_setup_stage_t0 = now;
+    }
+
     /* 6.5 Prepare for instruction execution (after fee deduction). */
     const sol_pubkey_t* tx_account_keys = tx->message.resolved_accounts_len
         ? tx->message.resolved_accounts
@@ -5842,6 +5985,12 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
         }
     }
 
+    if (slow_tx_pre_mark_ns) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_setup_demote_ns += (now - slow_tx_pre_mark_ns);
+        slow_tx_pre_mark_ns = now;
+    }
+
     /* The Instructions sysvar is virtual in Agave. Our implementation updates it
      * by storing a real account into AccountsDB, which is expensive. Only do so
      * when a program may actually read it (precompiles or explicitly passed as
@@ -5889,9 +6038,21 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
         g_tls_instructions_sysvar = tx_instructions_sysvar;
     }
 
+    if (slow_tx_pre_mark_ns) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_setup_instr_sysvar_ns += (now - slow_tx_pre_mark_ns);
+        slow_tx_pre_mark_ns = now;
+    }
+
     /* From here onward, account stores/deletes must be rollbackable if an
      * instruction fails. Use a tx-local undo log recorded on first write. */
     bank_tx_undo_begin(bank);
+
+    if (slow_tx_pre_mark_ns) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_setup_undo_ns += (now - slow_tx_pre_mark_ns);
+        slow_tx_pre_mark_ns = now;
+    }
 
     /* Fix rent_epoch for all writable accounts before execution.
      * In Agave, collect_rent_from_account() is called during account loading
@@ -5904,45 +6065,94 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
     for (size_t ri = 1; ri < tx_account_keys_len; ri++) {
         if (ri < SOL_MAX_MESSAGE_ACCOUNTS && !demoted_is_writable[ri])
             continue;
-        sol_account_t* wa_view = sol_accounts_db_load_view(bank->accounts_db, &tx_account_keys[ri]);
-        if (!wa_view || wa_view->meta.lamports == 0) {
-            if (wa_view) sol_account_destroy(wa_view);
-            continue;
+        bool meta_found = false;
+        uint64_t meta_lamports = 0;
+        uint64_t meta_data_len = 0;
+        uint64_t meta_rent_epoch = 0;
+        sol_err_t meta_err =
+            sol_accounts_db_lookup_visible_rent_meta(bank->accounts_db,
+                                                     &tx_account_keys[ri],
+                                                     &meta_found,
+                                                     &meta_lamports,
+                                                     &meta_data_len,
+                                                     &meta_rent_epoch);
+        if (meta_err == SOL_OK) {
+            if (!meta_found || meta_lamports == 0 || meta_rent_epoch == UINT64_MAX) {
+                continue;
+            }
+            if (meta_data_len <= (uint64_t)SIZE_MAX) {
+                uint64_t rent_min = sol_account_rent_exempt_minimum(
+                    (size_t)meta_data_len,
+                    bank->config.rent_per_byte_year,
+                    bank->config.rent_exemption_threshold);
+                if (meta_lamports < rent_min) {
+                    continue;
+                }
+
+                /* Only load an owned account when metadata indicates a possible fixup. */
+                sol_account_t* wa = sol_bank_load_account(bank, &tx_account_keys[ri]);
+                if (wa && wa->meta.lamports != 0 &&
+                    wa->meta.rent_epoch != UINT64_MAX &&
+                    sol_account_is_rent_exempt(wa,
+                                              bank->config.rent_per_byte_year,
+                                              bank->config.rent_exemption_threshold)) {
+                    wa->meta.rent_epoch = UINT64_MAX;
+                    (void)sol_bank_store_account(bank, &tx_account_keys[ri], wa);
+                }
+                if (wa) sol_account_destroy(wa);
+                continue;
+            }
+            meta_err = SOL_ERR_TOO_LARGE;
         }
 
-        bool needs_fix =
-            (wa_view->meta.rent_epoch != UINT64_MAX) &&
-            sol_account_is_rent_exempt(wa_view,
-                                      bank->config.rent_per_byte_year,
-                                      bank->config.rent_exemption_threshold);
-
-        if (needs_fix) {
-            if (!wa_view->data_borrowed) {
-                /* We already have an owned copy (e.g. overlay/in-memory). */
-                wa_view->meta.rent_epoch = UINT64_MAX;
-                (void)sol_bank_store_account(bank, &tx_account_keys[ri], wa_view);
-                sol_account_destroy(wa_view);
+        /* Fallback path for transient metadata lookup failures. */
+        if (meta_err != SOL_OK) {
+            sol_account_t* wa_view = sol_bank_load_account_view(bank, &tx_account_keys[ri]);
+            if (!wa_view || wa_view->meta.lamports == 0) {
+                if (wa_view) sol_account_destroy(wa_view);
                 continue;
             }
 
-            /* Borrowed view (AppendVec mmap). Reload an owned copy only when needed. */
-            sol_account_destroy(wa_view);
-            wa_view = NULL;
-
-            sol_account_t* wa = sol_accounts_db_load(bank->accounts_db, &tx_account_keys[ri]);
-            if (wa && wa->meta.lamports != 0 &&
-                wa->meta.rent_epoch != UINT64_MAX &&
-                sol_account_is_rent_exempt(wa,
+            bool needs_fix =
+                (wa_view->meta.rent_epoch != UINT64_MAX) &&
+                sol_account_is_rent_exempt(wa_view,
                                           bank->config.rent_per_byte_year,
-                                          bank->config.rent_exemption_threshold)) {
-                wa->meta.rent_epoch = UINT64_MAX;
-                (void)sol_bank_store_account(bank, &tx_account_keys[ri], wa);
-            }
-            if (wa) sol_account_destroy(wa);
-            continue;
-        }
+                                          bank->config.rent_exemption_threshold);
 
-        sol_account_destroy(wa_view);
+            if (needs_fix) {
+                if (!wa_view->data_borrowed) {
+                    /* We already have an owned copy (e.g. overlay/in-memory). */
+                    wa_view->meta.rent_epoch = UINT64_MAX;
+                    (void)sol_bank_store_account(bank, &tx_account_keys[ri], wa_view);
+                    sol_account_destroy(wa_view);
+                    continue;
+                }
+
+                /* Borrowed view (AppendVec mmap). Reload an owned copy only when needed. */
+                sol_account_destroy(wa_view);
+                wa_view = NULL;
+
+                sol_account_t* wa = sol_bank_load_account(bank, &tx_account_keys[ri]);
+                if (wa && wa->meta.lamports != 0 &&
+                    wa->meta.rent_epoch != UINT64_MAX &&
+                    sol_account_is_rent_exempt(wa,
+                                              bank->config.rent_per_byte_year,
+                                              bank->config.rent_exemption_threshold)) {
+                    wa->meta.rent_epoch = UINT64_MAX;
+                    (void)sol_bank_store_account(bank, &tx_account_keys[ri], wa);
+                }
+                if (wa) sol_account_destroy(wa);
+                continue;
+            }
+
+            sol_account_destroy(wa_view);
+        }
+    }
+
+    if (slow_tx_pre_mark_ns) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_setup_rent_fixup_ns += (now - slow_tx_pre_mark_ns);
+        slow_tx_pre_mark_ns = now;
     }
 
     /* Prepare an invoke context template once per transaction and reuse it for
@@ -5980,14 +6190,65 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
     };
     fill_invoke_sysvars(&invoke_ctx, bank);
 
+    if (slow_tx_pre_mark_ns) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_setup_invoke_ctx_ns += (now - slow_tx_pre_mark_ns);
+        if (slow_tx_pre_setup_stage_t0) {
+            slow_tx_pre_setup_ns += (now - slow_tx_pre_setup_stage_t0);
+        }
+        slow_tx_pre_mark_ns = now;
+    }
+
     /* 7. Execute instructions */
+    if (slow_tx_phase_t0) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_pre_ns += (now - slow_tx_phase_t0);
+        slow_tx_phase = 1u;
+        slow_tx_phase_t0 = now;
+    }
     for (uint8_t i = 0; i < tx->message.instructions_len; i++) {
         const sol_compiled_instruction_t* instr = &tx->message.instructions[i];
         if (tx_instructions_sysvar) {
             bank_set_instructions_sysvar_current(tx_instructions_sysvar, (uint16_t)i);
         }
 
+        uint64_t instr_t0 = slow_instr_thresh_ns ? bank_monotonic_ns() : 0u;
+        uint64_t cu_before = compute_meter.consumed;
         sol_err_t instr_err = execute_instruction_prepared(&invoke_ctx, instr, i);
+        if (instr_t0) {
+            uint64_t instr_ns = bank_monotonic_ns() - instr_t0;
+            if (instr_ns >= slow_instr_thresh_ns) {
+                char sig_b58[SOL_SIGNATURE_BASE58_LEN] = {0};
+                if (tx_sig) {
+                    sol_signature_to_base58(tx_sig, sig_b58, sizeof(sig_b58));
+                }
+
+                const sol_pubkey_t* pid = NULL;
+                if (tx_account_keys &&
+                    (size_t)instr->program_id_index < tx_account_keys_len) {
+                    pid = &tx_account_keys[instr->program_id_index];
+                }
+                char pid_b58[SOL_PUBKEY_BASE58_LEN] = {0};
+                if (pid) {
+                    sol_pubkey_to_base58(pid, pid_b58, sizeof(pid_b58));
+                }
+
+                uint64_t cu_after = compute_meter.consumed;
+                uint64_t cu_delta = (cu_after >= cu_before) ? (cu_after - cu_before) : 0u;
+                sol_log_info("SLOW_INSTR: slot=%lu ix=%u dur_ms=%.3f cu_before=%lu cu_after=%lu cu_delta=%lu err=%d program=%s sig=%s data_len=%u accs=%u",
+                             (unsigned long)bank->slot,
+                             (unsigned)i,
+                             (double)instr_ns / 1e6,
+                             (unsigned long)cu_before,
+                             (unsigned long)cu_after,
+                             (unsigned long)cu_delta,
+                             instr_err,
+                             pid_b58[0] ? pid_b58 : "unknown",
+                             sig_b58[0] ? sig_b58 : "none",
+                             (unsigned)instr->data_len,
+                             (unsigned)instr->account_indices_len);
+            }
+        }
         if (instr_err != SOL_OK) {
             result.status = instr_err;
             result.compute_units_used = compute_meter.consumed;
@@ -6025,6 +6286,13 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
 
             goto unlock_and_return;
         }
+    }
+
+    if (slow_tx_phase_t0) {
+        uint64_t now = bank_monotonic_ns();
+        slow_tx_exec_ns += (now - slow_tx_phase_t0);
+        slow_tx_phase = 2u;
+        slow_tx_phase_t0 = now;
     }
 
     /* Post-execution rent state transition check (InsufficientFundsForRent).
@@ -6233,6 +6501,18 @@ unlock_and_return:
                                   result.compute_units_used);
     }
 
+    if (slow_tx_phase_t0) {
+        uint64_t now = bank_monotonic_ns();
+        if (slow_tx_phase == 0u) {
+            slow_tx_pre_ns += (now - slow_tx_phase_t0);
+        } else if (slow_tx_phase == 1u) {
+            slow_tx_exec_ns += (now - slow_tx_phase_t0);
+        } else {
+            slow_tx_post_ns += (now - slow_tx_phase_t0);
+        }
+        slow_tx_phase_t0 = 0u;
+    }
+
     if (slow_tx_t0) {
         uint64_t dt_ns = bank_monotonic_ns() - slow_tx_t0;
         if (dt_ns >= slow_tx_thresh_ns) {
@@ -6247,14 +6527,38 @@ unlock_and_return:
                 sol_pubkey_to_base58(payer, payer_b58, sizeof(payer_b58));
             }
 
-            sol_log_info("SLOW_TX: slot=%lu dur_ms=%.3f err=%d cu=%lu fee=%lu payer=%s sig=%s",
-                         (unsigned long)bank->slot,
-                         (double)dt_ns / 1e6,
-                         result.status,
-                         (unsigned long)result.compute_units_used,
-                         (unsigned long)result.fee,
-                         payer_b58[0] ? payer_b58 : "none",
-                         sig_b58[0] ? sig_b58 : "none");
+            if (slow_tx_phase_diag) {
+                sol_log_info("SLOW_TX: slot=%lu dur_ms=%.3f pre_ms=%.3f pre_validate_ms=%.3f pre_blockhash_fee_ms=%.3f pre_payer_sig_ms=%.3f pre_fee_commit_ms=%.3f pre_setup_ms=%.3f pre_setup_demote_ms=%.3f pre_setup_instr_sysvar_ms=%.3f pre_setup_undo_ms=%.3f pre_setup_rent_fixup_ms=%.3f pre_setup_invoke_ctx_ms=%.3f exec_ms=%.3f post_ms=%.3f err=%d cu=%lu fee=%lu payer=%s sig=%s",
+                             (unsigned long)bank->slot,
+                             (double)dt_ns / 1e6,
+                             (double)slow_tx_pre_ns / 1e6,
+                             (double)slow_tx_pre_validate_ns / 1e6,
+                             (double)slow_tx_pre_blockhash_fee_ns / 1e6,
+                             (double)slow_tx_pre_payer_sig_ns / 1e6,
+                             (double)slow_tx_pre_fee_commit_ns / 1e6,
+                             (double)slow_tx_pre_setup_ns / 1e6,
+                             (double)slow_tx_pre_setup_demote_ns / 1e6,
+                             (double)slow_tx_pre_setup_instr_sysvar_ns / 1e6,
+                             (double)slow_tx_pre_setup_undo_ns / 1e6,
+                             (double)slow_tx_pre_setup_rent_fixup_ns / 1e6,
+                             (double)slow_tx_pre_setup_invoke_ctx_ns / 1e6,
+                             (double)slow_tx_exec_ns / 1e6,
+                             (double)slow_tx_post_ns / 1e6,
+                             result.status,
+                             (unsigned long)result.compute_units_used,
+                             (unsigned long)result.fee,
+                             payer_b58[0] ? payer_b58 : "none",
+                             sig_b58[0] ? sig_b58 : "none");
+            } else {
+                sol_log_info("SLOW_TX: slot=%lu dur_ms=%.3f err=%d cu=%lu fee=%lu payer=%s sig=%s",
+                             (unsigned long)bank->slot,
+                             (double)dt_ns / 1e6,
+                             result.status,
+                             (unsigned long)result.compute_units_used,
+                             (unsigned long)result.fee,
+                             payer_b58[0] ? payer_b58 : "none",
+                             sig_b58[0] ? sig_b58 : "none");
+            }
         }
     }
 
@@ -6470,6 +6774,10 @@ typedef struct {
     uint64_t par_calls;
     uint64_t par_txs;
     uint64_t par_ns;
+    uint64_t par_lock_ns;
+    uint64_t par_wait_ns;
+    uint64_t par_caller_ns;
+    uint64_t par_join_ns;
 } tx_pool_stats_t;
 
 static __thread tx_pool_stats_t* g_tls_tx_pool_stats = NULL;
@@ -6504,6 +6812,7 @@ typedef struct sol_tx_pool {
     pthread_mutex_t mu;
     pthread_cond_t  cv;
     pthread_cond_t  done;
+    bool            done_clock_monotonic;
     pthread_t*      threads;
     tx_pool_worker_ctx_t* worker_ctx;
     size_t          nthreads; /* worker threads (excluding caller thread) */
@@ -6519,6 +6828,7 @@ typedef struct sol_tx_pool {
     const sol_transaction_t* const* tx_ptrs;
     bool                     use_ptrs;
     bool                     skip_tx_status;
+    bool                     replay_sigs_preverified;
     sol_tx_result_t*         results;
     size_t                   start;
     size_t                   end;
@@ -6555,14 +6865,16 @@ tx_pool_shard_target(size_t workers_total) {
             shards = (size_t)v;
         }
     } else {
+        /* Favor deeper per-shard worker pools on large hosts so replay-heavy
+         * slots keep enough intra-slot parallelism and avoid long tails. */
         if (workers_total >= 128u) {
-            shards = 16u;
-        } else if (workers_total >= 96u) {
-            shards = 12u;
-        } else if (workers_total >= 64u) {
             shards = 8u;
-        } else if (workers_total >= 32u) {
+        } else if (workers_total >= 96u) {
+            shards = 8u;
+        } else if (workers_total >= 64u) {
             shards = 4u;
+        } else if (workers_total >= 32u) {
+            shards = 2u;
         }
     }
     if (shards < 1u) shards = 1u;
@@ -6586,8 +6898,367 @@ tx_pool_select(const sol_bank_t* bank) {
     return &g_tx_pools[idx];
 }
 
+static size_t
+tx_pool_busy_fallback_batch(void) {
+    /* If every tx-pool shard is busy, small/medium tx ranges are better run
+     * locally than queued behind another slot's pool work. Queueing in that
+     * state causes convoy behavior and multi-second replay outliers. */
+    static size_t cached = SIZE_MAX;
+    size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != SIZE_MAX, 1)) return v;
+
+    size_t threshold = 512u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        threshold = 4096u;
+    } else if (ncpu >= 96) {
+        threshold = 3072u;
+    } else if (ncpu >= 64) {
+        threshold = 2048u;
+    } else if (ncpu >= 32) {
+        threshold = 1024u;
+    } else {
+        threshold = 256u;
+    }
+
+    const char* env = getenv("SOL_TX_POOL_BUSY_FALLBACK_BATCH");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            threshold = (size_t)x;
+        }
+    }
+
+    if (threshold > 8192u) threshold = 8192u;
+    __atomic_store_n(&cached, threshold, __ATOMIC_RELEASE);
+    return threshold;
+}
+
+static size_t
+tx_pool_replay_busy_fallback_batch(void) {
+    static size_t cached = SIZE_MAX;
+    size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != SIZE_MAX, 1)) return v;
+
+    /* Replay throughput mode: allow small fallback-to-local execution when all
+     * shards are busy to avoid multi-second queue convoy outliers. */
+    size_t threshold = 64u;
+    const char* env = getenv("SOL_TX_POOL_REPLAY_BUSY_FALLBACK_BATCH");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            threshold = (size_t)x;
+        }
+    }
+
+    if (threshold > 8192u) threshold = 8192u;
+    __atomic_store_n(&cached, threshold, __ATOMIC_RELEASE);
+    return threshold;
+}
+
+static uint64_t
+tx_pool_queue_wait_budget_ns(void) {
+    static uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) return v;
+
+    /* Bound convoy delay when a shard is already running a job. If queue wait
+     * exceeds this budget, callers fall back to local execution. */
+    uint64_t budget_ms = 2u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu < 64) {
+        budget_ms = 8u;
+    }
+
+    const char* env = getenv("SOL_TX_POOL_QUEUE_WAIT_BUDGET_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            budget_ms = (uint64_t)x;
+        }
+    }
+
+    if (budget_ms > 1000u) budget_ms = 1000u;
+    uint64_t budget_ns = budget_ms * 1000000ULL;
+    __atomic_store_n(&cached, budget_ns, __ATOMIC_RELEASE);
+    return budget_ns;
+}
+
+static uint64_t
+tx_pool_replay_queue_wait_budget_ns(void) {
+    static uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) return v;
+
+    /* Replay throughput mode: keep queueing bias, but bound wait so replay can
+     * fall back for stubbornly busy shards. 1ms proved too aggressive on
+     * high-throughput slots: transient shard busy periods often exceed that and
+     * trigger expensive sequential fallback. */
+    uint64_t budget_ms = 4u;
+    const char* env = getenv("SOL_TX_POOL_REPLAY_QUEUE_WAIT_BUDGET_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            budget_ms = (uint64_t)x;
+        }
+    }
+
+    if (budget_ms > 2000u) budget_ms = 2000u;
+    uint64_t budget_ns = budget_ms * 1000000ULL;
+    __atomic_store_n(&cached, budget_ns, __ATOMIC_RELEASE);
+    return budget_ns;
+}
+
+static size_t
+tx_pool_replay_no_seq_fallback_batch(void) {
+    static size_t cached = SIZE_MAX;
+    size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != SIZE_MAX, 1)) return v;
+
+    /* For medium/large replay batches, waiting briefly for a busy shard is
+     * usually much cheaper than falling back to fully sequential execution. */
+    size_t threshold = 64u;
+    const char* env = getenv("SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            threshold = (size_t)x;
+        }
+    }
+
+    if (threshold > 16384u) threshold = 16384u;
+    __atomic_store_n(&cached, threshold, __ATOMIC_RELEASE);
+    return threshold;
+}
+
+static uint64_t
+tx_pool_replay_queue_wait_long_budget_ns(void) {
+    static uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) return v;
+
+    /* Secondary queue-wait budget used for medium/large replay batches after
+     * the short budget expires. Keep this generous enough to absorb a single
+     * in-flight shard job and avoid multi-second sequential fallback tails.
+     *
+     * On large-core hosts a single in-flight shard job can easily exceed
+     * ~128ms for busy mainnet slots; a too-small budget causes frequent
+     * fallback to fully sequential execution, which creates 4-5s replay
+     * outliers. */
+    uint64_t budget_ms = 256u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        budget_ms = 1500u;
+    } else if (ncpu >= 96) {
+        budget_ms = 1200u;
+    } else if (ncpu >= 64) {
+        budget_ms = 900u;
+    } else if (ncpu >= 32) {
+        budget_ms = 512u;
+    }
+    const char* env = getenv("SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            budget_ms = (uint64_t)x;
+        }
+    }
+
+    if (budget_ms > 5000u) budget_ms = 5000u;
+    uint64_t budget_ns = budget_ms * 1000000ULL;
+    __atomic_store_n(&cached, budget_ns, __ATOMIC_RELEASE);
+    return budget_ns;
+}
+
+static uint64_t
+lthash_queue_wait_budget_ns(void) {
+    static uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) return v;
+
+    /* Lt-hash delta fallback-to-sequential is particularly expensive on replay
+     * hot slots. Bias toward waiting longer for an idle tx-pool shard. */
+    uint64_t budget_ms = 1000u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        budget_ms = 3000u;
+    } else if (ncpu >= 96) {
+        budget_ms = 2500u;
+    } else if (ncpu >= 64) {
+        budget_ms = 2000u;
+    } else if (ncpu >= 32) {
+        budget_ms = 1500u;
+    }
+
+    const char* env = getenv("SOL_LT_HASH_QUEUE_WAIT_BUDGET_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            budget_ms = (uint64_t)x;
+        }
+    }
+
+    if (budget_ms > 10000u) budget_ms = 10000u;
+    uint64_t budget_ns = budget_ms * 1000000ULL;
+    __atomic_store_n(&cached, budget_ns, __ATOMIC_RELEASE);
+    return budget_ns;
+}
+
+static bool
+tx_pool_replay_force_wait_on_busy(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) return v != 0;
+
+    /* On large-core replay hosts, falling back to sequential execution after a
+     * bounded queue wait is often worse than waiting for a shard to drain. */
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int enabled = (ncpu >= 96) ? 1 : 0;
+
+    const char* env = getenv("SOL_TX_POOL_REPLAY_FORCE_WAIT_ON_BUSY");
+    if (env && env[0] != '\0') {
+        enabled = (strcmp(env, "0") != 0) ? 1 : 0;
+    }
+
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static uint64_t
+tx_pool_replay_force_wait_cap_ns(void) {
+    static uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) return v;
+
+    /* Avoid unbounded convoy waits when every shard is busy. Keep this below
+     * the multi-second range so replay can fail over instead of stalling a
+     * slot behind one long-running shard job. */
+    uint64_t cap_ms = 0u; /* 0 preserves legacy unbounded wait behavior. */
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        cap_ms = 2000u;
+    } else if (ncpu >= 96) {
+        cap_ms = 1500u;
+    } else if (ncpu >= 64) {
+        cap_ms = 1200u;
+    }
+
+    const char* env = getenv("SOL_TX_POOL_REPLAY_FORCE_WAIT_CAP_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            cap_ms = (uint64_t)x;
+        }
+    }
+
+    if (cap_ms > 10000u) cap_ms = 10000u;
+    uint64_t cap_ns = cap_ms * 1000000ULL;
+    __atomic_store_n(&cached, cap_ns, __ATOMIC_RELEASE);
+    return cap_ns;
+}
+
+static bool
+tx_pool_wait_idle_locked(sol_tx_pool_t* p, uint64_t budget_ns) {
+    if (!p) return false;
+    if (budget_ns == 0u) {
+        while (!p->stop && p->has_job) {
+            pthread_cond_wait(&p->done, &p->mu);
+        }
+        return !p->stop && !p->has_job;
+    }
+
+    struct timespec deadline = {0};
+    if (p->done_clock_monotonic) {
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+    } else {
+        clock_gettime(CLOCK_REALTIME, &deadline);
+    }
+    deadline.tv_sec += (time_t)(budget_ns / 1000000000ull);
+    deadline.tv_nsec += (long)(budget_ns % 1000000000ull);
+    if (deadline.tv_nsec >= 1000000000l) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000l;
+    }
+
+    while (!p->stop && p->has_job) {
+        int rc = pthread_cond_timedwait(&p->done, &p->mu, &deadline);
+        if (rc == ETIMEDOUT) {
+            return false;
+        }
+        if (rc != 0 && rc != EINTR) {
+            return false;
+        }
+    }
+
+    return !p->stop && !p->has_job;
+}
+
 static sol_tx_pool_t*
-tx_pool_lock_for_job(sol_tx_pool_t* preferred, const sol_bank_t* bank) {
+tx_pool_try_lock_idle_shard(const sol_bank_t* bank, const sol_tx_pool_t* skip) {
+    size_t count = g_tx_pool_count;
+    if (count <= 1u) return NULL;
+
+    size_t start = tx_pool_shard_index(bank, count);
+    for (size_t probe = 0u; probe < count; probe++) {
+        size_t idx = (start + probe) % count;
+        sol_tx_pool_t* alt = &g_tx_pools[idx];
+        if (alt == skip || alt->nthreads == 0u) continue;
+        if (pthread_mutex_trylock(&alt->mu) != 0) continue;
+        if (!alt->stop && !alt->has_job) {
+            return alt;
+        }
+        pthread_mutex_unlock(&alt->mu);
+    }
+    return NULL;
+}
+
+static unsigned
+tx_pool_lock_probe_rounds(void) {
+    static unsigned cached = 0u;
+    unsigned v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != 0u, 1)) return v;
+
+    unsigned rounds = 64u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        rounds = 96u;
+    } else if (ncpu >= 96) {
+        rounds = 80u;
+    } else if (ncpu >= 64) {
+        rounds = 64u;
+    } else if (ncpu >= 32) {
+        rounds = 48u;
+    } else {
+        rounds = 32u;
+    }
+
+    const char* env = getenv("SOL_TX_POOL_LOCK_PROBE_ROUNDS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env && x > 0ul) {
+            rounds = (unsigned)x;
+        }
+    }
+
+    if (rounds > 4096u) rounds = 4096u;
+    __atomic_store_n(&cached, rounds, __ATOMIC_RELEASE);
+    return rounds;
+}
+
+static sol_tx_pool_t*
+tx_pool_lock_for_job(sol_tx_pool_t* preferred,
+                     const sol_bank_t* bank,
+                     size_t len,
+                     bool throughput_mode) {
     if (!preferred) return NULL;
 
     size_t count = g_tx_pool_count;
@@ -6616,8 +7287,37 @@ tx_pool_lock_for_job(sol_tx_pool_t* preferred, const sol_bank_t* bank) {
         pthread_mutex_unlock(&alt->mu);
     }
 
-    /* All shards are currently busy; queue behind the preferred shard instead
-     * of dropping to sequential execution for large batches. */
+    /* All shards are busy. For small/medium ranges, fall back to local
+     * execution to avoid queueing convoys across replay threads. */
+    size_t fallback_batch = throughput_mode
+        ? tx_pool_replay_busy_fallback_batch()
+        : tx_pool_busy_fallback_batch();
+    if (fallback_batch > 0u && len <= fallback_batch) {
+        return NULL;
+    }
+
+    /* For larger ranges, briefly keep probing all shards before we commit to
+     * queueing behind the preferred shard. This avoids long convoy waits when
+     * shards are only transiently busy. */
+    unsigned probe_rounds = tx_pool_lock_probe_rounds();
+    for (unsigned round = 0u; round < probe_rounds; round++) {
+        size_t offset = (size_t)(round % (unsigned)count);
+        for (size_t probe = 0u; probe < count; probe++) {
+            size_t idx = (start + offset + probe) % count;
+            sol_tx_pool_t* alt = &g_tx_pools[idx];
+            if (alt->nthreads == 0u) continue;
+            if (pthread_mutex_trylock(&alt->mu) != 0) continue;
+            if (!alt->stop && !alt->has_job) {
+                return alt;
+            }
+            pthread_mutex_unlock(&alt->mu);
+        }
+        if ((round & 7u) == 7u) {
+            sched_yield();
+        }
+    }
+
+    /* For large ranges, queue behind the preferred shard. */
     pthread_mutex_lock(&preferred->mu);
     return preferred;
 }
@@ -6725,11 +7425,15 @@ static size_t
 tx_dag_edge_cap_limit(size_t tx_count) {
     size_t limit = 0u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    size_t mul = 64u;
+    size_t mul = 128u;
     if (ncpu >= 128) {
-        mul = 128u;
+        /* Large-core hosts see dense conflict graphs on hot slots. Keep a
+         * much higher edge ceiling to avoid aborting into sequential replay. */
+        mul = 512u;
+    } else if (ncpu >= 96) {
+        mul = 384u;
     } else if (ncpu >= 64) {
-        mul = 96u;
+        mul = 256u;
     }
 
     if (tx_count > 0u && tx_count <= (SIZE_MAX / mul)) {
@@ -6748,9 +7452,35 @@ tx_dag_edge_cap_limit(size_t tx_count) {
     }
 
     if (limit < 4096u) limit = 4096u;
-    /* Hard safety cap: 16M edges ~128 MiB across edge arrays. */
-    if (limit > (size_t)(1u << 24)) limit = (size_t)(1u << 24);
+    /* Hard safety cap: 32M edges ~256 MiB across edge arrays. */
+    if (limit > (size_t)(1u << 25)) limit = (size_t)(1u << 25);
     return limit;
+}
+
+static void
+tx_dag_abort_log_once(const sol_bank_t* bank,
+                      size_t tx_count,
+                      size_t abort_at,
+                      size_t seg_len,
+                      size_t segments_done,
+                      size_t edge_len,
+                      size_t edge_cap,
+                      size_t edge_cap_limit,
+                      const char* path) {
+    static uint32_t warned = 0u;
+    uint32_t n = __atomic_fetch_add(&warned, 1u, __ATOMIC_RELAXED);
+    if (n >= 32u) return;
+
+    sol_log_warn("tx_dag_abort: slot=%lu txs=%zu abort_at=%zu seg_len=%zu segments_done=%zu edge_len=%zu edge_cap=%zu edge_cap_limit=%zu path=%s",
+                 bank ? (unsigned long)bank->slot : 0ul,
+                 tx_count,
+                 abort_at,
+                 seg_len,
+                 segments_done,
+                 edge_len,
+                 edge_cap,
+                 edge_cap_limit,
+                 path ? path : "unknown");
 }
 
 static size_t
@@ -6803,11 +7533,14 @@ tx_worker_target(void) {
      * Replay latency is typically bounded by tx execution throughput, and
      * under-provisioning workers leaves CPUs idle while slots queue up. */
     if (workers >= 128u) {
+        /* Prefer higher replay execution parallelism on 128-thread hosts.
+         * Remaining cores are still available to networking/repair/replay
+         * threads due tx-pool sharding and caller-participation. */
         workers = 96u;
     } else if (workers >= 96u) {
-        workers = 72u;
+        workers = 80u;
     } else if (workers >= 64u) {
-        workers = 48u;
+        workers = 56u;
     } else if (workers >= 48u) {
         workers = 32u;
     } else if (workers >= 24u) {
@@ -6864,7 +7597,7 @@ tx_pool_target_txs_per_worker(void) {
     size_t tx_per_worker = 8u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu >= 128) {
-        tx_per_worker = 4u;
+        tx_per_worker = 8u;
     } else if (ncpu >= 96) {
         tx_per_worker = 4u;
     } else if (ncpu >= 64) {
@@ -6902,6 +7635,42 @@ tx_pool_worker_threads_for_len(const sol_tx_pool_t* p, size_t len) {
 
     if (workers > desired_workers) workers = desired_workers;
     return workers;
+}
+
+static bool
+tx_pool_replay_interleave_order(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) return v != 0;
+
+    /* Replay-only scheduling: spread early work across both ends of the batch.
+     * This reduces long-tail stragglers when a few very expensive txs cluster
+     * near the end of a replay segment. */
+    int enabled = 1;
+    const char* env = getenv("SOL_TX_POOL_REPLAY_INTERLEAVE_ORDER");
+    if (env && env[0] != '\0') {
+        while (*env && isspace((unsigned char)*env)) env++;
+        if (*env == '0' || *env == 'n' || *env == 'N' || *env == 'f' || *env == 'F') {
+            enabled = 0;
+        }
+    }
+
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static inline size_t
+tx_pool_job_index(size_t start, size_t len, size_t off, bool replay_throughput_mode) {
+    if (!replay_throughput_mode || len < 32u || !tx_pool_replay_interleave_order()) {
+        return start + off;
+    }
+
+    /* Deterministic interleave: 0, n-1, 1, n-2, ... */
+    size_t half = off >> 1;
+    if ((off & 1u) == 0u) {
+        return start + half;
+    }
+    return start + (len - 1u - half);
 }
 
 /* ---- Parallel transaction execution (DAG scheduler) ---- */
@@ -7128,6 +7897,8 @@ tx_pool_run_dag_worker(sol_bank_t* bank,
     uint32_t local_stop = TX_POOL_DAG_NONE;
 
     unsigned idle_spins = 0;
+    const bool big_core_host = tx_pool_big_core_host();
+    const unsigned idle_spin_cap = big_core_host ? 8192u : 4096u;
     const unsigned pop_batch = tx_pool_dag_pop_batch();
     for (;;) {
         uint32_t node = TX_POOL_DAG_NONE;
@@ -7151,17 +7922,14 @@ tx_pool_run_dag_worker(sol_bank_t* bank,
                  * refills quickly. */
                 if (__atomic_load_n(remaining, __ATOMIC_RELAXED) == 0u) return;
 
-                /* Favor spinning over yielding on large-core hosts: yield can
-                 * introduce scheduling latency that shows up as "pauses"
-                 * between ready txs. */
-                if (idle_spins < 1048576u) {
+                /* Keep spin windows short enough to avoid starving replay
+                 * verify/network threads under sustained contention. */
+                if (idle_spins < idle_spin_cap) {
                     tx_pool_cpu_pause();
                     idle_spins++;
                 } else {
                     idle_spins = 0;
-                    if (!tx_pool_big_core_host()) {
-                        sched_yield();
-                    }
+                    sched_yield();
                 }
                 continue;
             }
@@ -7220,6 +7988,7 @@ tx_pool_worker_main(void* arg) {
         const sol_transaction_t* const* tx_ptrs = NULL;
         bool use_ptrs = false;
         bool skip_tx_status = false;
+        bool replay_sigs_preverified = false;
         sol_tx_result_t* results = NULL;
         const uint32_t* dag_adj_head = NULL;
         const uint32_t* dag_edge_to = NULL;
@@ -7252,6 +8021,7 @@ tx_pool_worker_main(void* arg) {
         tx_ptrs = p->tx_ptrs;
         use_ptrs = p->use_ptrs;
         skip_tx_status = p->skip_tx_status;
+        replay_sigs_preverified = p->replay_sigs_preverified;
         results = p->results;
         dag_adj_head = p->dag_adj_head;
         dag_edge_to = p->dag_edge_to;
@@ -7266,6 +8036,15 @@ tx_pool_worker_main(void* arg) {
         start = p->start;
         end = p->end;
         pthread_mutex_unlock(&p->mu);
+
+        bool tx_job =
+            (kind == TX_POOL_JOB_TXS ||
+             kind == TX_POOL_JOB_TX_PTRS ||
+             kind == TX_POOL_JOB_TX_DAG_PTRS);
+        int prev_sigverify_tls = g_tls_replay_signatures_preverified;
+        if (tx_job) {
+            g_tls_replay_signatures_preverified = replay_sigs_preverified ? 1 : 0;
+        }
 
         size_t len = end - start;
         if (kind == TX_POOL_JOB_LT_HASH_DELTA) {
@@ -7313,10 +8092,11 @@ tx_pool_worker_main(void* arg) {
                                    dag_ready_head,
                                    dag_remaining);
         } else {
+            bool replay_throughput_mode = use_ptrs && skip_tx_status;
             for (;;) {
                 size_t off = __atomic_fetch_add(&p->next, 1u, __ATOMIC_RELAXED);
                 if (off >= len) break;
-                size_t idx = start + off;
+                size_t idx = tx_pool_job_index(start, len, off, replay_throughput_mode);
                 if (use_ptrs) {
                     const sol_transaction_t* tx = tx_ptrs[idx];
                     if (!tx) {
@@ -7330,6 +8110,10 @@ tx_pool_worker_main(void* arg) {
                     results[idx] = sol_bank_process_transaction(bank, &txs[idx]);
                 }
             }
+        }
+
+        if (tx_job) {
+            g_tls_replay_signatures_preverified = prev_sigverify_tls;
         }
 
         pthread_mutex_lock(&p->mu);
@@ -7389,7 +8173,22 @@ tx_pool_init_once(void) {
 
         (void)pthread_mutex_init(&p->mu, NULL);
         (void)pthread_cond_init(&p->cv, NULL);
-        (void)pthread_cond_init(&p->done, NULL);
+        pthread_condattr_t done_attr;
+        bool done_attr_inited = false;
+        bool done_clock_monotonic = false;
+        if (pthread_condattr_init(&done_attr) == 0) {
+            done_attr_inited = true;
+#if defined(CLOCK_MONOTONIC)
+            if (pthread_condattr_setclock(&done_attr, CLOCK_MONOTONIC) == 0) {
+                done_clock_monotonic = true;
+            }
+#endif
+        }
+        (void)pthread_cond_init(&p->done, done_clock_monotonic ? &done_attr : NULL);
+        if (done_attr_inited) {
+            pthread_condattr_destroy(&done_attr);
+        }
+        p->done_clock_monotonic = done_clock_monotonic;
         p->inited = true;
         p->job_id = 0;
 
@@ -7436,6 +8235,21 @@ tx_pool_init_once(void) {
     atexit(tx_pool_shutdown);
 }
 
+void
+sol_bank_tx_pool_prewarm(void) {
+    if (!tx_parallel_enabled() && !lthash_parallel_enabled()) {
+        return;
+    }
+
+    uint64_t t0 = bank_monotonic_ns();
+    (void)pthread_once(&g_tx_pool_once, tx_pool_init_once);
+    uint64_t dt_ns = bank_monotonic_ns() - t0;
+
+    if (dt_ns >= 1000000ULL) {
+        sol_log_info("TX pool prewarm: %.2fms", (double)dt_ns / 1000000.0);
+    }
+}
+
 static inline bool
 tx_pool_available(const sol_tx_pool_t* p) {
     return p && p->nthreads > 0;
@@ -7452,6 +8266,10 @@ tx_pool_run_range(sol_bank_t* bank,
     size_t len = end - start;
     tx_pool_stats_t* stats = g_tls_tx_pool_stats;
     uint64_t t0 = stats ? bank_monotonic_ns() : 0;
+    uint64_t phase_lock_ns = 0;
+    uint64_t phase_wait_ns = 0;
+    uint64_t phase_caller_ns = 0;
+    uint64_t phase_join_ns = 0;
     bool ran_parallel = false;
 
     size_t min_batch = tx_pool_min_batch();
@@ -7473,7 +8291,11 @@ tx_pool_run_range(sol_bank_t* bank,
 
     ran_parallel = true;
 
-    p = tx_pool_lock_for_job(p, bank);
+    uint64_t t_lock0 = stats ? bank_monotonic_ns() : 0;
+    p = tx_pool_lock_for_job(p, bank, len, false);
+    if (stats && p) {
+        phase_lock_ns = bank_monotonic_ns() - t_lock0;
+    }
     if (!p) {
         for (size_t i = start; i < end; i++) {
             results[i] = sol_bank_process_transaction(bank, &txs[i]);
@@ -7487,10 +8309,12 @@ tx_pool_run_range(sol_bank_t* bank,
         return;
     }
 
-    while (!p->stop && p->has_job) {
-        pthread_cond_wait(&p->done, &p->mu);
+    uint64_t t_wait0 = stats ? bank_monotonic_ns() : 0;
+    bool idle_ready = tx_pool_wait_idle_locked(p, tx_pool_queue_wait_budget_ns());
+    if (stats) {
+        phase_wait_ns = bank_monotonic_ns() - t_wait0;
     }
-    if (p->stop || p->has_job) {
+    if (!idle_ready) {
         pthread_mutex_unlock(&p->mu);
         for (size_t i = start; i < end; i++) {
             results[i] = sol_bank_process_transaction(bank, &txs[i]);
@@ -7513,6 +8337,7 @@ tx_pool_run_range(sol_bank_t* bank,
     p->tx_ptrs = NULL;
     p->use_ptrs = false;
     p->skip_tx_status = false;
+    p->replay_sigs_preverified = (g_tls_replay_signatures_preverified != 0);
     p->results = results;
     p->lthash_entries = NULL;
     p->lthash_parent = NULL;
@@ -7530,13 +8355,18 @@ tx_pool_run_range(sol_bank_t* bank,
     pthread_mutex_unlock(&p->mu);
 
     /* Caller thread participates. */
+    uint64_t t_caller0 = stats ? bank_monotonic_ns() : 0;
     for (;;) {
         size_t off = __atomic_fetch_add(&p->next, 1u, __ATOMIC_RELAXED);
         if (off >= len) break;
-        size_t idx = start + off;
+        size_t idx = tx_pool_job_index(start, len, off, false);
         results[idx] = sol_bank_process_transaction(bank, &txs[idx]);
     }
+    if (stats) {
+        phase_caller_ns = bank_monotonic_ns() - t_caller0;
+    }
 
+    uint64_t t_join0 = stats ? bank_monotonic_ns() : 0;
     pthread_mutex_lock(&p->mu);
     if (--p->active == 0) {
         p->has_job = false;
@@ -7546,12 +8376,19 @@ tx_pool_run_range(sol_bank_t* bank,
         pthread_cond_wait(&p->done, &p->mu);
     }
     pthread_mutex_unlock(&p->mu);
+    if (stats) {
+        phase_join_ns = bank_monotonic_ns() - t_join0;
+    }
 
     if (stats && ran_parallel) {
         uint64_t dt = bank_monotonic_ns() - t0;
         stats->par_calls++;
         stats->par_txs += (uint64_t)len;
         stats->par_ns += dt;
+        stats->par_lock_ns += phase_lock_ns;
+        stats->par_wait_ns += phase_wait_ns;
+        stats->par_caller_ns += phase_caller_ns;
+        stats->par_join_ns += phase_join_ns;
     }
 }
 
@@ -7568,6 +8405,10 @@ tx_pool_run_range_ptrs(sol_bank_t* bank,
     size_t len = end - start;
     tx_pool_stats_t* stats = g_tls_tx_pool_stats;
     uint64_t t0 = stats ? bank_monotonic_ns() : 0;
+    uint64_t phase_lock_ns = 0;
+    uint64_t phase_wait_ns = 0;
+    uint64_t phase_caller_ns = 0;
+    uint64_t phase_join_ns = 0;
     bool ran_parallel = false;
     size_t exec_txs = len;
     if (stats) {
@@ -7603,7 +8444,12 @@ tx_pool_run_range_ptrs(sol_bank_t* bank,
 
     ran_parallel = true;
 
-    p = tx_pool_lock_for_job(p, bank);
+    bool throughput_mode = skip_tx_status;
+    uint64_t t_lock0 = stats ? bank_monotonic_ns() : 0;
+    p = tx_pool_lock_for_job(p, bank, len, throughput_mode);
+    if (stats && p) {
+        phase_lock_ns = bank_monotonic_ns() - t_lock0;
+    }
     if (!p) {
         for (size_t i = start; i < end; i++) {
             const sol_transaction_t* tx = tx_ptrs[i];
@@ -7621,10 +8467,42 @@ tx_pool_run_range_ptrs(sol_bank_t* bank,
         return;
     }
 
-    while (!p->stop && p->has_job) {
-        pthread_cond_wait(&p->done, &p->mu);
+    uint64_t queue_wait_budget_ns = throughput_mode
+        ? tx_pool_replay_queue_wait_budget_ns()
+        : tx_pool_queue_wait_budget_ns();
+    uint64_t t_wait0 = stats ? bank_monotonic_ns() : 0;
+    bool idle_ready = tx_pool_wait_idle_locked(p, queue_wait_budget_ns);
+    if (!idle_ready &&
+        throughput_mode &&
+        len >= tx_pool_replay_no_seq_fallback_batch()) {
+        uint64_t long_budget_ns = tx_pool_replay_queue_wait_long_budget_ns();
+        if (long_budget_ns > queue_wait_budget_ns) {
+            idle_ready = tx_pool_wait_idle_locked(p, long_budget_ns);
+        }
+        if (!idle_ready && tx_pool_replay_force_wait_on_busy()) {
+            uint64_t cap_ns = tx_pool_replay_force_wait_cap_ns();
+            if (cap_ns == 0u) {
+                while (!p->stop && p->has_job) {
+                    pthread_cond_wait(&p->done, &p->mu);
+                }
+                idle_ready = !p->stop && !p->has_job;
+            } else {
+                idle_ready = tx_pool_wait_idle_locked(p, cap_ns);
+            }
+        }
+        if (!idle_ready) {
+            sol_tx_pool_t* alt = tx_pool_try_lock_idle_shard(bank, p);
+            if (alt) {
+                pthread_mutex_unlock(&p->mu);
+                p = alt;
+                idle_ready = true;
+            }
+        }
     }
-    if (p->stop || p->has_job) {
+    if (stats) {
+        phase_wait_ns = bank_monotonic_ns() - t_wait0;
+    }
+    if (!idle_ready) {
         pthread_mutex_unlock(&p->mu);
         for (size_t i = start; i < end; i++) {
             const sol_transaction_t* tx = tx_ptrs[i];
@@ -7649,6 +8527,7 @@ tx_pool_run_range_ptrs(sol_bank_t* bank,
     p->tx_ptrs = tx_ptrs;
     p->use_ptrs = true;
     p->skip_tx_status = skip_tx_status;
+    p->replay_sigs_preverified = (g_tls_replay_signatures_preverified != 0);
     p->results = results;
     p->lthash_entries = NULL;
     p->lthash_parent = NULL;
@@ -7666,10 +8545,11 @@ tx_pool_run_range_ptrs(sol_bank_t* bank,
     pthread_mutex_unlock(&p->mu);
 
     /* Caller thread participates. */
+    uint64_t t_caller0 = stats ? bank_monotonic_ns() : 0;
     for (;;) {
         size_t off = __atomic_fetch_add(&p->next, 1u, __ATOMIC_RELAXED);
         if (off >= len) break;
-        size_t idx = start + off;
+        size_t idx = tx_pool_job_index(start, len, off, throughput_mode);
         const sol_transaction_t* tx = tx_ptrs[idx];
         if (!tx) {
             /* A NULL tx pointer means the caller already filled results[idx]. */
@@ -7679,7 +8559,11 @@ tx_pool_run_range_ptrs(sol_bank_t* bank,
             ? sol_bank_process_transaction_parallel(bank, tx)
             : sol_bank_process_transaction(bank, tx);
     }
+    if (stats) {
+        phase_caller_ns = bank_monotonic_ns() - t_caller0;
+    }
 
+    uint64_t t_join0 = stats ? bank_monotonic_ns() : 0;
     pthread_mutex_lock(&p->mu);
     if (--p->active == 0) {
         p->has_job = false;
@@ -7689,12 +8573,19 @@ tx_pool_run_range_ptrs(sol_bank_t* bank,
         pthread_cond_wait(&p->done, &p->mu);
     }
     pthread_mutex_unlock(&p->mu);
+    if (stats) {
+        phase_join_ns = bank_monotonic_ns() - t_join0;
+    }
 
     if (stats && ran_parallel) {
         uint64_t dt = bank_monotonic_ns() - t0;
         stats->par_calls++;
         stats->par_txs += (uint64_t)exec_txs;
         stats->par_ns += dt;
+        stats->par_lock_ns += phase_lock_ns;
+        stats->par_wait_ns += phase_wait_ns;
+        stats->par_caller_ns += phase_caller_ns;
+        stats->par_join_ns += phase_join_ns;
     }
 }
 
@@ -7718,6 +8609,10 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
 
     tx_pool_stats_t* stats = g_tls_tx_pool_stats;
     uint64_t t0 = stats ? bank_monotonic_ns() : 0;
+    uint64_t phase_lock_ns = 0;
+    uint64_t phase_wait_ns = 0;
+    uint64_t phase_caller_ns = 0;
+    uint64_t phase_join_ns = 0;
 
     size_t min_batch = tx_pool_min_batch();
     sol_tx_pool_t* p = tx_pool_select(bank);
@@ -7789,7 +8684,12 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
         return;
     }
 
-    p = tx_pool_lock_for_job(p, bank);
+    bool throughput_mode = skip_tx_status;
+    uint64_t t_lock0 = stats ? bank_monotonic_ns() : 0;
+    p = tx_pool_lock_for_job(p, bank, seg_len, throughput_mode);
+    if (stats && p) {
+        phase_lock_ns = bank_monotonic_ns() - t_lock0;
+    }
     if (!p) {
         for (size_t i = 0; i < seg_len; i++) {
             uint32_t node = seg_nodes[i];
@@ -7808,10 +8708,42 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
         return;
     }
 
-    while (!p->stop && p->has_job) {
-        pthread_cond_wait(&p->done, &p->mu);
+    uint64_t queue_wait_budget_ns = throughput_mode
+        ? tx_pool_replay_queue_wait_budget_ns()
+        : tx_pool_queue_wait_budget_ns();
+    uint64_t t_wait0 = stats ? bank_monotonic_ns() : 0;
+    bool idle_ready = tx_pool_wait_idle_locked(p, queue_wait_budget_ns);
+    if (!idle_ready &&
+        throughput_mode &&
+        seg_len >= tx_pool_replay_no_seq_fallback_batch()) {
+        uint64_t long_budget_ns = tx_pool_replay_queue_wait_long_budget_ns();
+        if (long_budget_ns > queue_wait_budget_ns) {
+            idle_ready = tx_pool_wait_idle_locked(p, long_budget_ns);
+        }
+        if (!idle_ready && tx_pool_replay_force_wait_on_busy()) {
+            uint64_t cap_ns = tx_pool_replay_force_wait_cap_ns();
+            if (cap_ns == 0u) {
+                while (!p->stop && p->has_job) {
+                    pthread_cond_wait(&p->done, &p->mu);
+                }
+                idle_ready = !p->stop && !p->has_job;
+            } else {
+                idle_ready = tx_pool_wait_idle_locked(p, cap_ns);
+            }
+        }
+        if (!idle_ready) {
+            sol_tx_pool_t* alt = tx_pool_try_lock_idle_shard(bank, p);
+            if (alt) {
+                pthread_mutex_unlock(&p->mu);
+                p = alt;
+                idle_ready = true;
+            }
+        }
     }
-    if (p->stop || p->has_job) {
+    if (stats) {
+        phase_wait_ns = bank_monotonic_ns() - t_wait0;
+    }
+    if (!idle_ready) {
         pthread_mutex_unlock(&p->mu);
         for (size_t i = 0; i < seg_len; i++) {
             uint32_t node = seg_nodes[i];
@@ -7836,6 +8768,7 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
     p->tx_ptrs = tx_ptrs;
     p->use_ptrs = true;
     p->skip_tx_status = skip_tx_status;
+    p->replay_sigs_preverified = (g_tls_replay_signatures_preverified != 0);
     p->results = results;
     p->dag_adj_head = adj_head;
     p->dag_edge_to = edge_to;
@@ -7860,6 +8793,7 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
     pthread_mutex_unlock(&p->mu);
 
     /* Caller thread participates. */
+    uint64_t t_caller0 = stats ? bank_monotonic_ns() : 0;
     tx_pool_run_dag_worker(bank,
                            tx_ptrs,
                            results,
@@ -7871,7 +8805,11 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
                            ready_next,
                            &p->dag_ready_head,
                            &p->dag_remaining);
+    if (stats) {
+        phase_caller_ns = bank_monotonic_ns() - t_caller0;
+    }
 
+    uint64_t t_join0 = stats ? bank_monotonic_ns() : 0;
     pthread_mutex_lock(&p->mu);
     if (--p->active == 0) {
         p->has_job = false;
@@ -7881,12 +8819,19 @@ tx_pool_run_dag_ptrs(sol_bank_t* bank,
         pthread_cond_wait(&p->done, &p->mu);
     }
     pthread_mutex_unlock(&p->mu);
+    if (stats) {
+        phase_join_ns = bank_monotonic_ns() - t_join0;
+    }
 
     if (stats) {
         uint64_t dt = bank_monotonic_ns() - t0;
         stats->par_calls++;
         stats->par_txs += (uint64_t)seg_len;
         stats->par_ns += dt;
+        stats->par_lock_ns += phase_lock_ns;
+        stats->par_wait_ns += phase_wait_ns;
+        stats->par_caller_ns += phase_caller_ns;
+        stats->par_join_ns += phase_join_ns;
     }
 }
 
@@ -7961,31 +8906,66 @@ tx_pool_run_lthash_delta(sol_accounts_db_t* parent,
     }
     size_t len = count;
 
+    /* Avoid immediate sequential fallback on transiently-busy shards.
+     * Queueing briefly behind an in-flight job is typically much cheaper than
+     * running a large lt-hash delta fully sequentially on the replay thread. */
+    p = tx_pool_lock_for_job(p, NULL, len, true);
+    if (!p) {
+        lthash_delta_seq(parent, entries, count, out_delta);
+        return;
+    }
+
     size_t workers = tx_pool_worker_threads_for_len(p, len);
     if (workers == 0u) {
+        pthread_mutex_unlock(&p->mu);
         lthash_delta_seq(parent, entries, count, out_delta);
         return;
     }
 
     sol_lt_hash_t* partials = sol_calloc(p->nthreads + 1u, sizeof(*partials));
     if (!partials) {
+        pthread_mutex_unlock(&p->mu);
         lthash_delta_seq(parent, entries, count, out_delta);
         return;
     }
 
-    pthread_mutex_lock(&p->mu);
-    if (p->stop || p->has_job) {
+    size_t no_seq_fallback_batch = tx_pool_replay_no_seq_fallback_batch();
+    uint64_t queue_wait_budget_ns = tx_pool_queue_wait_budget_ns();
+    if (len >= no_seq_fallback_batch) {
+        uint64_t long_budget_ns = tx_pool_replay_queue_wait_long_budget_ns();
+        if (long_budget_ns > queue_wait_budget_ns) {
+            queue_wait_budget_ns = long_budget_ns;
+        }
+        uint64_t lt_budget_ns = lthash_queue_wait_budget_ns();
+        if (lt_budget_ns == 0u || lt_budget_ns > queue_wait_budget_ns) {
+            queue_wait_budget_ns = lt_budget_ns;
+        }
+    }
+    bool idle_ready = tx_pool_wait_idle_locked(p, queue_wait_budget_ns);
+    if (!idle_ready || p->stop || p->has_job) {
+        static uint32_t warned_seq_fallback = 0;
+        if (len >= no_seq_fallback_batch) {
+            uint32_t n = __atomic_fetch_add(&warned_seq_fallback, 1u, __ATOMIC_RELAXED);
+            if (n < 8u) {
+                sol_log_warn("lt_hash_delta: sequential fallback (len=%zu wait_budget_ms=%.1f has_job=%d)",
+                             len,
+                             (double)queue_wait_budget_ns / 1000000.0,
+                             p ? (int)p->has_job : -1);
+            }
+        }
         pthread_mutex_unlock(&p->mu);
         sol_free(partials);
         lthash_delta_seq(parent, entries, count, out_delta);
         return;
     }
+
     p->job_kind = TX_POOL_JOB_LT_HASH_DELTA;
     p->bank = NULL;
     p->txs = NULL;
     p->tx_ptrs = NULL;
     p->use_ptrs = false;
     p->skip_tx_status = false;
+    p->replay_sigs_preverified = false;
     p->results = NULL;
     p->lthash_entries = entries;
     p->lthash_parent = parent;
@@ -8737,7 +9717,17 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	         * when the workload contains a few long-running txs that would otherwise
 	         * stall unrelated dependent chains. */
 	        if (use_dag) {
-                    size_t edge_cap = count * 32u;
+                    size_t edge_cap_mul = 32u;
+                    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+                    if (ncpu >= 128) {
+                        edge_cap_mul = 96u;
+                    } else if (ncpu >= 96) {
+                        edge_cap_mul = 80u;
+                    } else if (ncpu >= 64) {
+                        edge_cap_mul = 64u;
+                    }
+                    size_t edge_cap =
+                        (count > (SIZE_MAX / edge_cap_mul)) ? SIZE_MAX : (count * edge_cap_mul);
                     if (edge_cap < 1024u) edge_cap = 1024u;
                     size_t edge_cap_limit = tx_dag_edge_cap_limit(count);
                     if (edge_cap > edge_cap_limit) edge_cap = edge_cap_limit;
@@ -8767,6 +9757,8 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 		                size_t dag_txs_scheduled = 0;
 		                uint64_t dag_exec_ns = 0;
 		                bool dag_abort = false;
+                        bool dag_fallback_to_wave = false;
+                        size_t dag_abort_at = SIZE_MAX;
 
 #define TX_DAG_SEG_RESET() do {                                           \
 		                        seg_len = 0;                                    \
@@ -8968,24 +9960,51 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	                    }
 
 	                    if (dag_abort) {
-	                        /* Flush what we have sequentially and finish in-order. */
-	                        for (size_t si = 0; si < seg_len; si++) {
-	                            uint32_t node = seg_nodes[si];
-	                            const sol_transaction_t* tx2 = tx_ptrs[node];
-	                            if (!tx2) continue;
-	                            results[node] = skip_tx_status
-	                                ? sol_bank_process_transaction_parallel(bank, tx2)
-	                                : sol_bank_process_transaction(bank, tx2);
-	                        }
-	                        seg_len = 0;
-	                        for (size_t j = i; j < count; j++) {
-	                            const sol_transaction_t* tx2 = tx_ptrs[j];
-	                            if (!tx2) continue;
-	                            results[j] = skip_tx_status
-	                                ? sol_bank_process_transaction_parallel(bank, tx2)
-	                                : sol_bank_process_transaction(bank, tx2);
-	                        }
-	                        break;
+                            if (dag_segments == 0u) {
+                                /* No DAG segment was executed yet; fall back to
+                                 * the wave scheduler instead of full sequential
+                                 * replay for the entire slot. */
+                                tx_dag_abort_log_once(bank,
+                                                      count,
+                                                      i,
+                                                      seg_len,
+                                                      dag_segments,
+                                                      edge_len,
+                                                      edge_cap,
+                                                      edge_cap_limit,
+                                                      "fallback_wave");
+                                dag_fallback_to_wave = true;
+                                dag_abort_at = i;
+                            } else {
+                                tx_dag_abort_log_once(bank,
+                                                      count,
+                                                      i,
+                                                      seg_len,
+                                                      dag_segments,
+                                                      edge_len,
+                                                      edge_cap,
+                                                      edge_cap_limit,
+                                                      "finish_sequential");
+	                            /* A prior segment already ran via DAG; preserve
+                                 * correctness by finishing in-order. */
+	                            for (size_t si = 0; si < seg_len; si++) {
+	                                uint32_t node = seg_nodes[si];
+	                                const sol_transaction_t* tx2 = tx_ptrs[node];
+	                                if (!tx2) continue;
+	                                results[node] = skip_tx_status
+	                                    ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                    : sol_bank_process_transaction(bank, tx2);
+	                            }
+	                            seg_len = 0;
+	                            for (size_t j = i; j < count; j++) {
+	                                const sol_transaction_t* tx2 = tx_ptrs[j];
+	                                if (!tx2) continue;
+	                                results[j] = skip_tx_status
+	                                    ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                    : sol_bank_process_transaction(bank, tx2);
+	                            }
+                            }
+                            goto tx_dag_build_done;
 	                    }
 
 	                    /* ALT table accounts are read during v0 resolution. */
@@ -9008,23 +10027,46 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	                            }
 	                        }
 	                        if (dag_abort) {
-	                            for (size_t si = 0; si < seg_len; si++) {
-	                                uint32_t node = seg_nodes[si];
-	                                const sol_transaction_t* tx2 = tx_ptrs[node];
-	                                if (!tx2) continue;
-	                                results[node] = skip_tx_status
-	                                    ? sol_bank_process_transaction_parallel(bank, tx2)
-	                                    : sol_bank_process_transaction(bank, tx2);
-	                            }
-	                            seg_len = 0;
-	                            for (size_t j = i; j < count; j++) {
-	                                const sol_transaction_t* tx2 = tx_ptrs[j];
-	                                if (!tx2) continue;
-	                                results[j] = skip_tx_status
-	                                    ? sol_bank_process_transaction_parallel(bank, tx2)
-	                                    : sol_bank_process_transaction(bank, tx2);
-	                            }
-	                            break;
+                                if (dag_segments == 0u) {
+                                    tx_dag_abort_log_once(bank,
+                                                          count,
+                                                          i,
+                                                          seg_len,
+                                                          dag_segments,
+                                                          edge_len,
+                                                          edge_cap,
+                                                          edge_cap_limit,
+                                                          "fallback_wave");
+                                    dag_fallback_to_wave = true;
+                                    dag_abort_at = i;
+                                } else {
+                                    tx_dag_abort_log_once(bank,
+                                                          count,
+                                                          i,
+                                                          seg_len,
+                                                          dag_segments,
+                                                          edge_len,
+                                                          edge_cap,
+                                                          edge_cap_limit,
+                                                          "finish_sequential");
+	                                for (size_t si = 0; si < seg_len; si++) {
+	                                    uint32_t node = seg_nodes[si];
+	                                    const sol_transaction_t* tx2 = tx_ptrs[node];
+	                                    if (!tx2) continue;
+	                                    results[node] = skip_tx_status
+	                                        ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                        : sol_bank_process_transaction(bank, tx2);
+	                                }
+	                                seg_len = 0;
+	                                for (size_t j = i; j < count; j++) {
+	                                    const sol_transaction_t* tx2 = tx_ptrs[j];
+	                                    if (!tx2) continue;
+	                                    results[j] = skip_tx_status
+	                                        ? sol_bank_process_transaction_parallel(bank, tx2)
+	                                        : sol_bank_process_transaction(bank, tx2);
+	                                }
+                                }
+                                goto tx_dag_build_done;
 	                        }
 	                    }
 
@@ -9045,6 +10087,28 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	                    }
 
 	                    if (dag_abort) {
+                        if (dag_segments == 0u) {
+                            tx_dag_abort_log_once(bank,
+                                                  count,
+                                                  i,
+                                                  seg_len,
+                                                  dag_segments,
+                                                  edge_len,
+                                                  edge_cap,
+                                                  edge_cap_limit,
+                                                  "fallback_wave");
+                            dag_fallback_to_wave = true;
+                            dag_abort_at = i;
+                        } else {
+                            tx_dag_abort_log_once(bank,
+                                                  count,
+                                                  i,
+                                                  seg_len,
+                                                  dag_segments,
+                                                  edge_len,
+                                                  edge_cap,
+                                                  edge_cap_limit,
+                                                  "finish_sequential");
 	                        for (size_t si = 0; si < seg_len; si++) {
 	                            uint32_t node = seg_nodes[si];
 	                            const sol_transaction_t* tx2 = tx_ptrs[node];
@@ -9061,7 +10125,8 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	                                ? sol_bank_process_transaction_parallel(bank, tx2)
 	                                : sol_bank_process_transaction(bank, tx2);
 	                        }
-	                        break;
+                        }
+                        goto tx_dag_build_done;
 	                    }
 
 		                    /* Mark scheduled and update last-access map with tx-index stamps. */
@@ -9104,6 +10169,7 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	                    }
 	                }
 
+tx_dag_build_done:
 	                if (!dag_abort) {
 	                    TX_DAG_FLUSH_EXEC();
 	                }
@@ -9131,7 +10197,19 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
 	                                 (double)dag_exec_ns / 1e6,
 	                                 (double)dag_total_ns / 1e6);
 	                }
-	                goto tx_sched_done;
+                    if (dag_fallback_to_wave) {
+                        if (__builtin_expect(tx_wave_diag, 0)) {
+                            sol_log_info("tx_dag_fallback_wave: slot=%lu txs=%zu abort_at=%zu segments=%zu edges=%zu",
+                                         (unsigned long)bank->slot,
+                                         count,
+                                         dag_abort_at,
+                                         dag_segments,
+                                         dag_edges_total);
+                        }
+                        use_dag = false;
+                    } else {
+	                    goto tx_sched_done;
+                    }
 	            }
 	        }
 
@@ -9677,14 +10755,16 @@ legacy_sched:
 
 tx_sched_done:
     if (skip_tx_status) {
-        uint64_t tx_status_t0 = bank_monotonic_ns();
-        sol_bank_record_tx_status_batch(bank, tx_ptrs, count, results);
-        uint64_t tx_status_ns = bank_monotonic_ns() - tx_status_t0;
-        if (__builtin_expect(tx_status_ns >= 500000000ull, 0)) {
-            sol_log_info("tx_status_slow: slot=%lu txs=%zu time=%.2fms",
-                         (unsigned long)bank->slot,
-                         count,
-                         (double)tx_status_ns / 1000000.0);
+        if (bank_record_tx_status_batch_enabled()) {
+            uint64_t tx_status_t0 = bank_monotonic_ns();
+            sol_bank_record_tx_status_batch(bank, tx_ptrs, count, results);
+            uint64_t tx_status_ns = bank_monotonic_ns() - tx_status_t0;
+            if (__builtin_expect(tx_status_ns >= 500000000ull, 0)) {
+                sol_log_info("tx_status_slow: slot=%lu txs=%zu time=%.2fms",
+                             (unsigned long)bank->slot,
+                             count,
+                             (double)tx_status_ns / 1000000.0);
+            }
         }
     }
 
@@ -9719,15 +10799,23 @@ tx_sched_done:
     if (__builtin_expect(tx_pool_stats, 0)) {
         double seq_ms = (double)pool_stats.seq_ns / 1e6;
         double par_ms = (double)pool_stats.par_ns / 1e6;
+        double par_lock_ms = (double)pool_stats.par_lock_ns / 1e6;
+        double par_wait_ms = (double)pool_stats.par_wait_ns / 1e6;
+        double par_caller_ms = (double)pool_stats.par_caller_ns / 1e6;
+        double par_join_ms = (double)pool_stats.par_join_ns / 1e6;
         fprintf(stderr,
-                "tx_pool_stats(ptrs): slot=%lu seq_calls=%lu seq_txs=%lu seq_ms=%.3f par_calls=%lu par_txs=%lu par_ms=%.3f\n",
+                "tx_pool_stats(ptrs): slot=%lu seq_calls=%lu seq_txs=%lu seq_ms=%.3f par_calls=%lu par_txs=%lu par_ms=%.3f lock_ms=%.3f wait_ms=%.3f caller_ms=%.3f join_ms=%.3f\n",
                 (unsigned long)bank->slot,
                 (unsigned long)pool_stats.seq_calls,
                 (unsigned long)pool_stats.seq_txs,
                 seq_ms,
                 (unsigned long)pool_stats.par_calls,
                 (unsigned long)pool_stats.par_txs,
-                par_ms);
+                par_ms,
+                par_lock_ms,
+                par_wait_ms,
+                par_caller_ms,
+                par_join_ms);
         g_tls_tx_pool_stats = NULL;
     }
 
@@ -9913,6 +11001,7 @@ sol_bank_process_entries_ex(sol_bank_t* bank,
                             sol_bank_process_entries_timing_t* timing) {
     if (!bank || !batch) return SOL_ERR_INVAL;
     if (timing) {
+        timing->prep_ns = 0;
         timing->tx_exec_ns = 0;
         timing->poh_ns = 0;
     }
@@ -9955,6 +11044,7 @@ sol_bank_process_entries_ex(sol_bank_t* bank,
     const sol_transaction_t** tx_ptrs = NULL;
     sol_tx_result_t* results = NULL;
     bool heap_bufs = false;
+    uint64_t prep_t0 = timing ? bank_monotonic_ns() : 0;
 
     if (tx_sched_ensure_batch_bufs(sc, total_txs)) {
         tx_ptrs = sc->batch_tx_ptrs;
@@ -9966,6 +11056,9 @@ sol_bank_process_entries_ex(sol_bank_t* bank,
         if (!tx_ptrs || !results) {
             if (tx_ptrs) sol_free((void*)tx_ptrs);
             if (results) sol_free(results);
+            if (timing) {
+                timing->prep_ns += bank_monotonic_ns() - prep_t0;
+            }
             /* Fall back to conservative entry-by-entry behavior. */
             uint64_t exec_t0 = timing ? bank_monotonic_ns() : 0;
             for (size_t i = 0; i < batch->num_entries; i++) {
@@ -9985,6 +11078,9 @@ sol_bank_process_entries_ex(sol_bank_t* bank,
         for (uint32_t ti = 0; ti < entry->num_transactions; ti++) {
             tx_ptrs[cursor++] = &entry->transactions[ti];
         }
+    }
+    if (timing) {
+        timing->prep_ns += bank_monotonic_ns() - prep_t0;
     }
 
     uint64_t exec_t0 = timing ? bank_monotonic_ns() : 0;

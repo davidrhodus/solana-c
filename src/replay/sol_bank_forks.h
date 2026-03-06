@@ -17,7 +17,7 @@
 /*
  * Maximum number of banks to keep in the forks tree
  */
-#define SOL_MAX_BANK_FORKS 512
+#define SOL_MAX_BANK_FORKS 4096
 
 /*
  * Bank forks configuration
@@ -323,5 +323,10 @@ void sol_bank_forks_stats(
  * Get number of banks
  */
 size_t sol_bank_forks_count(const sol_bank_forks_t* forks);
+
+/*
+ * Get configured bank-forks capacity.
+ */
+size_t sol_bank_forks_capacity(const sol_bank_forks_t* forks);
 
 #endif /* SOL_BANK_FORKS_H */

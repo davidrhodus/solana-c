@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <time.h>
+#include <unistd.h>
+#include <errno.h>
 
 /* Profiling helpers (opt-in via SOL_SBF_PROFILE=1). */
 static inline uint64_t
@@ -84,6 +86,89 @@ sbf_slow_threshold_ns(void) {
 
     __atomic_store_n(&cached, ns, __ATOMIC_RELEASE);
     return ns;
+}
+
+/* Program load diagnostics for cache-miss/load-wait attribution.
+ * Disabled by default; enable with SOL_BPF_LOAD_SLOW_MS=<ms>. */
+static uint64_t
+bpf_load_slow_threshold_ns(void) {
+    static _Atomic uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) {
+        return v;
+    }
+
+    uint64_t ns = 0;
+    const char* env = getenv("SOL_BPF_LOAD_SLOW_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long ms = strtoul(env, &end, 10);
+        if (end != env && ms > 0ul) {
+            ns = (uint64_t)ms * 1000000ull;
+        }
+    }
+
+    __atomic_store_n(&cached, ns, __ATOMIC_RELEASE);
+    return ns;
+}
+
+/* Bound how long execute-path callers wait on an in-flight program load before
+ * falling back to an uncached local load to avoid replay convoy tails.
+ * Set SOL_BPF_LOAD_WAIT_BUDGET_MS=0 for immediate fallback behavior. */
+static uint64_t
+bpf_load_wait_budget_ns(void) {
+    static _Atomic uint64_t cached = UINT64_MAX;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != UINT64_MAX, 1)) {
+        return v;
+    }
+
+    uint64_t budget_ms = 128u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 96) {
+        budget_ms = 64u;
+    } else if (ncpu >= 48) {
+        budget_ms = 96u;
+    }
+
+    const char* env = getenv("SOL_BPF_LOAD_WAIT_BUDGET_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env) {
+            budget_ms = (uint64_t)parsed;
+        }
+    }
+
+    if (budget_ms > 5000u) {
+        budget_ms = 5000u;
+    }
+    uint64_t ns = budget_ms * 1000000ull;
+
+    __atomic_store_n(&cached, ns, __ATOMIC_RELEASE);
+    return ns;
+}
+
+static inline void
+bpf_log_slow_stage(const char* stage,
+                   const sol_pubkey_t* program_id,
+                   uint64_t slot,
+                   uint64_t elapsed_ns,
+                   sol_err_t err,
+                   size_t ro_section_len) {
+    if (!stage || !program_id) return;
+    uint64_t thresh_ns = bpf_load_slow_threshold_ns();
+    if (thresh_ns == 0u || elapsed_ns < thresh_ns) return;
+
+    char p58[SOL_PUBKEY_BASE58_LEN] = {0};
+    sol_pubkey_to_base58(program_id, p58, sizeof(p58));
+    sol_log_info("BPF_LOAD_SLOW: slot=%lu stage=%s ms=%.3f err=%d ro_kb=%.1f program=%s",
+                 (unsigned long)slot,
+                 stage,
+                 (double)elapsed_ns / 1e6,
+                 err,
+                 (double)ro_section_len / 1024.0,
+                 p58);
 }
 
 static _Atomic uint64_t g_sbf_prof_calls = 0;
@@ -246,6 +331,13 @@ sbf_metas_release_retained(sol_sbf_account_meta_t* metas, size_t meta_count) {
             sol_account_destroy(metas[i].ro_account);
             metas[i].ro_account = NULL;
         }
+    }
+}
+
+static inline void
+sbf_destroy_if_not_retained(sol_account_t* account, bool account_owned_by_meta) {
+    if (account && !account_owned_by_meta) {
+        sol_account_destroy(account);
     }
 }
 
@@ -481,6 +573,86 @@ bpf_prog_handle_wait_ready(sol_bpf_prog_handle_t* h) {
     return err;
 }
 
+static inline sol_err_t
+bpf_prog_handle_wait_ready_budget(sol_bpf_prog_handle_t* h,
+                                  uint64_t budget_ns,
+                                  bool* timed_out) {
+    if (timed_out) {
+        *timed_out = false;
+    }
+    if (!h) {
+        return SOL_ERR_INVAL;
+    }
+
+    int st = __atomic_load_n(&h->load_state, __ATOMIC_ACQUIRE);
+    if (st == BPF_PROG_STATE_READY) {
+        return (h->prog != NULL) ? SOL_OK : SOL_ERR_INVAL;
+    }
+    if (!h->load_sync_inited) {
+        return h->load_err ? h->load_err : SOL_ERR_INVAL;
+    }
+
+    pthread_mutex_lock(&h->load_mu);
+
+    if (budget_ns == 0u && h->load_state == BPF_PROG_STATE_LOADING) {
+        pthread_mutex_unlock(&h->load_mu);
+        if (timed_out) {
+            *timed_out = true;
+        }
+        return SOL_ERR_TIMEOUT;
+    }
+
+    uint64_t start_ns = budget_ns ? monotonic_ns() : 0u;
+    while (h->load_state == BPF_PROG_STATE_LOADING) {
+        if (budget_ns == 0u) {
+            pthread_mutex_unlock(&h->load_mu);
+            if (timed_out) {
+                *timed_out = true;
+            }
+            return SOL_ERR_TIMEOUT;
+        }
+
+        uint64_t elapsed_ns = monotonic_ns() - start_ns;
+        if (elapsed_ns >= budget_ns) {
+            pthread_mutex_unlock(&h->load_mu);
+            if (timed_out) {
+                *timed_out = true;
+            }
+            return SOL_ERR_TIMEOUT;
+        }
+
+        uint64_t remain_ns = budget_ns - elapsed_ns;
+        struct timespec deadline;
+        if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+            pthread_cond_wait(&h->load_cv, &h->load_mu);
+            continue;
+        }
+
+        deadline.tv_sec += (time_t)(remain_ns / 1000000000ull);
+        deadline.tv_nsec += (long)(remain_ns % 1000000000ull);
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+
+        int rc = pthread_cond_timedwait(&h->load_cv, &h->load_mu, &deadline);
+        if (rc == ETIMEDOUT && h->load_state == BPF_PROG_STATE_LOADING) {
+            pthread_mutex_unlock(&h->load_mu);
+            if (timed_out) {
+                *timed_out = true;
+            }
+            return SOL_ERR_TIMEOUT;
+        }
+    }
+
+    sol_err_t err = SOL_OK;
+    if (h->load_state != BPF_PROG_STATE_READY || !h->prog) {
+        err = h->load_err ? h->load_err : SOL_ERR_INVAL;
+    }
+    pthread_mutex_unlock(&h->load_mu);
+    return err;
+}
+
 static size_t
 parse_size_env(const char* env, size_t def) {
     if (!env || env[0] == '\0') return def;
@@ -495,10 +667,22 @@ static void
 bpf_prog_cache_do_init(void) {
     (void)pthread_rwlock_init(&g_bpf_prog_cache_lock, NULL);
 
-    /* Default: 1 GiB cache, 8192 entries. Override via env.
+    /* Defaults tuned by host size; still overrideable via env.
      * Set either to 0 to disable caching. */
-    size_t mb = parse_size_env(getenv("SOL_BPF_PROG_CACHE_MB"), 1024u);
-    g_bpf_prog_cache_max_entries = parse_size_env(getenv("SOL_BPF_PROG_CACHE_ENTRIES"), 8192u);
+    size_t default_mb = 1024u;
+    size_t default_entries = 8192u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        default_mb = 8192u;
+        default_entries = 65536u;
+    } else if (ncpu >= 64) {
+        default_mb = 4096u;
+        default_entries = 32768u;
+    }
+
+    size_t mb = parse_size_env(getenv("SOL_BPF_PROG_CACHE_MB"), default_mb);
+    g_bpf_prog_cache_max_entries =
+        parse_size_env(getenv("SOL_BPF_PROG_CACHE_ENTRIES"), default_entries);
     if (mb == 0 || g_bpf_prog_cache_max_entries == 0) {
         g_bpf_prog_cache_max_bytes = 0;
         g_bpf_prog_cache_max_entries = 0;
@@ -1239,6 +1423,9 @@ sbf_apply_output(
         return SOL_ERR_ACCOUNT_LAMPORTS;
     }
 
+    sol_accounts_db_t* accounts_db = sol_bank_get_accounts_db(ctx->bank);
+    bool overlay_bank = accounts_db && sol_accounts_db_is_overlay(accounts_db);
+
     for (size_t i = 0; i < meta_count; i++) {
         const sol_sbf_account_meta_t* m = &metas[i];
         uint8_t key_idx = m->key_index;
@@ -1285,32 +1472,31 @@ sbf_apply_output(
         }
 
         const uint8_t* post_data = buf + m->data_off;
+        uint64_t pre_lamports = m->pre_lamports;
+        uint64_t pre_data_len = m->pre_data_len;
+        sol_pubkey_t pre_owner = SOL_SYSTEM_PROGRAM_ID;
+        const uint8_t* pre_data = NULL;
+        if (m->ro_account) {
+            pre_owner = m->ro_account->meta.owner;
+            pre_data = m->ro_account->data;
+        }
+
+        bool owner_ok = sol_pubkey_eq(&post_owner, &pre_owner);
+        bool lamports_ok = post_lamports == pre_lamports;
+        bool len_ok = post_data_len == pre_data_len;
+        bool data_ok = true;
+        if (post_data_len > 0) {
+            if (!pre_data) {
+                data_ok = false;
+            } else if (memcmp(pre_data, post_data, (size_t)post_data_len) != 0) {
+                data_ok = false;
+            }
+        }
 
         /* Fast path: read-only accounts cannot legally change during a program
          * invocation (including during CPI), so validate against the retained
          * pre-exec snapshot and skip the post-exec reload. */
         if (!m->is_writable) {
-            uint64_t pre_lamports = m->pre_lamports;
-            uint64_t pre_data_len = m->pre_data_len;
-            sol_pubkey_t pre_owner = SOL_SYSTEM_PROGRAM_ID;
-            const uint8_t* pre_data = NULL;
-            if (m->ro_account) {
-                pre_owner = m->ro_account->meta.owner;
-                pre_data = m->ro_account->data;
-            }
-
-            bool owner_ok = sol_pubkey_eq(&post_owner, &pre_owner);
-            bool lamports_ok = post_lamports == pre_lamports;
-            bool len_ok = post_data_len == pre_data_len;
-            bool data_ok = true;
-            if (post_data_len > 0) {
-                if (!pre_data) {
-                    data_ok = false;
-                } else if (memcmp(pre_data, post_data, (size_t)post_data_len) != 0) {
-                    data_ok = false;
-                }
-            }
-
             if (!owner_ok || !lamports_ok || !len_ok || !data_ok) {
                 char k58[SOL_PUBKEY_BASE58_LEN] = {0};
                 sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
@@ -1323,6 +1509,13 @@ sbf_apply_output(
             continue;
         }
 
+        /* Writable fast path: unchanged output means no bank reload/store needed.
+         * This avoids expensive local-kind lookups and data compares on hot
+         * account sets where many writable accounts are untouched. */
+        if (owner_ok && lamports_ok && len_ok && data_ok) {
+            continue;
+        }
+
         sol_account_t* account = NULL;
         bool account_owned_by_meta = false;
 
@@ -1331,8 +1524,7 @@ sbf_apply_output(
          * For overlay banks, CPI/previous-instruction mutations are stored in
          * the local layer. If there's no local entry, the current value is the
          * same as the pre-exec snapshot we already loaded in sbf_build_input(). */
-        sol_accounts_db_t* accounts_db = sol_bank_get_accounts_db(ctx->bank);
-        if (accounts_db && sol_accounts_db_is_overlay(accounts_db)) {
+        if (overlay_bank) {
             sol_account_t* local = NULL;
             sol_accounts_db_local_kind_t kind =
                 sol_accounts_db_get_local_kind(accounts_db, pubkey, &local);
@@ -1377,7 +1569,7 @@ sbf_apply_output(
                                   k58, (unsigned long)account->meta.lamports,
                                   (unsigned long)post_lamports);
                 }
-                sol_account_destroy(account);
+                sbf_destroy_if_not_retained(account, account_owned_by_meta);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
             if (!sol_pubkey_eq(&account->meta.owner, &ctx->program_id) &&
@@ -1389,7 +1581,7 @@ sbf_apply_output(
                                   k58, (unsigned long)account->meta.lamports,
                                   (unsigned long)post_lamports);
                 }
-                sol_account_destroy(account);
+                sbf_destroy_if_not_retained(account, account_owned_by_meta);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
             account->meta.lamports = post_lamports;
@@ -1416,7 +1608,7 @@ sbf_apply_output(
                     sol_log_error("bpf_wb_diag: data_ro acct=%s data_len=%zu post_len=%lu",
                                   k58, account->meta.data_len, (unsigned long)post_data_len);
                 }
-                sol_account_destroy(account);
+                sbf_destroy_if_not_retained(account, account_owned_by_meta);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
             if (!sol_pubkey_eq(&account->meta.owner, &ctx->program_id)) {
@@ -1430,12 +1622,12 @@ sbf_apply_output(
                     sol_log_error("bpf_wb_diag: data_nonowner acct=%s owner=%s prog=%s",
                                   k58, own58, prog58);
                 }
-                sol_account_destroy(account);
+                sbf_destroy_if_not_retained(account, account_owned_by_meta);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
             sol_err_t set_err = sol_account_set_data(account, post_data, (size_t)post_data_len);
             if (set_err != SOL_OK) {
-                sol_account_destroy(account);
+                sbf_destroy_if_not_retained(account, account_owned_by_meta);
                 return set_err;
             }
             touched = true;
@@ -1449,7 +1641,7 @@ sbf_apply_output(
                     sol_pubkey_to_base58(pubkey, k58, sizeof(k58));
                     sol_log_error("bpf_wb_diag: owner_ro acct=%s", k58);
                 }
-                sol_account_destroy(account);
+                sbf_destroy_if_not_retained(account, account_owned_by_meta);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
             if (!sol_pubkey_eq(&account->meta.owner, &ctx->program_id)) {
@@ -1463,7 +1655,7 @@ sbf_apply_output(
                     sol_log_error("bpf_wb_diag: owner_nonowner acct=%s owner=%s prog=%s",
                                   k58, own58, prog58);
                 }
-                sol_account_destroy(account);
+                sbf_destroy_if_not_retained(account, account_owned_by_meta);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
 
@@ -1482,7 +1674,7 @@ sbf_apply_output(
                     sol_log_error("bpf_wb_diag: owner_data_nonzero acct=%s data_len=%zu",
                                   k58, account->meta.data_len);
                 }
-                sol_account_destroy(account);
+                sbf_destroy_if_not_retained(account, account_owned_by_meta);
                 return SOL_ERR_PROGRAM_INVALID_ACCOUNT;
             }
 
@@ -1493,7 +1685,7 @@ sbf_apply_output(
         if (touched) {
             sol_err_t store_err = sol_bank_store_account(ctx->bank, pubkey, account);
             if (store_err != SOL_OK) {
-                sol_account_destroy(account);
+                sbf_destroy_if_not_retained(account, account_owned_by_meta);
                 return store_err;
             }
         }
@@ -3270,6 +3462,251 @@ process_extend_program(sol_invoke_context_t* ctx) {
     return SOL_OK;
 }
 
+static sol_err_t
+bpf_loader_load_program_into_handle(sol_bank_t* bank,
+                                    const sol_pubkey_t* program_id,
+                                    sol_bpf_prog_handle_t* out_handle) {
+    if (!bank || !program_id || !out_handle) {
+        return SOL_ERR_INVAL;
+    }
+
+    sol_err_t ret = SOL_OK;
+    sol_account_t* program_account = NULL;
+    sol_account_t* program_data = NULL;
+    sol_bpf_program_t* loaded = NULL;
+
+    const uint8_t* elf_data = NULL;
+    size_t elf_len = 0;
+    bool has_programdata = false;
+    sol_pubkey_t program_data_address = {0};
+
+    program_account = sol_bank_load_account_view(bank, program_id);
+    if (!program_account || !program_account->meta.executable) {
+        ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+        goto done;
+    }
+
+    bool loader_deprecated = is_bpf_loader_2(&program_account->meta.owner);
+
+    if (is_bpf_loader(&program_account->meta.owner) || loader_deprecated) {
+        elf_data = program_account->data;
+        elf_len = program_account->meta.data_len;
+    } else if (is_bpf_upgradeable_loader(&program_account->meta.owner)) {
+        if (program_account->meta.data_len < UPGRADEABLE_LOADER_PROGRAM_SIZE) {
+            ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            goto done;
+        }
+
+        uint32_t program_type = 0;
+        memcpy(&program_type, program_account->data, 4);
+        if (program_type != UPGRADEABLE_LOADER_STATE_PROGRAM) {
+            ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            goto done;
+        }
+
+        has_programdata = true;
+        memcpy(program_data_address.bytes, program_account->data + 4, 32);
+        program_data = sol_bank_load_account_view(bank, &program_data_address);
+        if (!program_data) {
+            ret = SOL_ERR_ACCOUNT_NOT_FOUND;
+            goto done;
+        }
+
+        if (program_data->meta.data_len < UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE) {
+            ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            goto done;
+        }
+
+        uint32_t program_data_type = 0;
+        memcpy(&program_data_type, program_data->data, 4);
+        if (program_data_type != UPGRADEABLE_LOADER_STATE_PROGRAM_DATA) {
+            ret = SOL_ERR_PROGRAM_INVALID_ACCOUNT;
+            goto done;
+        }
+
+        elf_data = program_data->data + UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE;
+        elf_len = program_data->meta.data_len - UPGRADEABLE_LOADER_PROGRAMDATA_METADATA_SIZE;
+        loader_deprecated = false;
+    } else {
+        ret = SOL_ERR_PROGRAM_INVALID_OWNER;
+        goto done;
+    }
+
+    loaded = sol_bpf_program_new();
+    if (!loaded) {
+        ret = SOL_ERR_NOMEM;
+        goto done;
+    }
+
+    sol_err_t load_err = sol_bpf_elf_load(loaded, elf_data, elf_len);
+    if (load_err != SOL_OK) {
+        ret = load_err;
+        goto done;
+    }
+
+    out_handle->prog = loaded;
+    loaded = NULL;
+    out_handle->has_programdata = has_programdata;
+    out_handle->programdata = program_data_address;
+    out_handle->loader_deprecated = loader_deprecated;
+    out_handle->ro_section_len = out_handle->prog ? out_handle->prog->ro_section_len : 0;
+
+done:
+    if (loaded) {
+        sol_bpf_program_destroy(loaded);
+    }
+    if (program_data) {
+        sol_account_destroy(program_data);
+    }
+    if (program_account) {
+        sol_account_destroy(program_account);
+    }
+    return ret;
+}
+
+sol_err_t
+sol_bpf_loader_prewarm_program_budget(sol_bank_t* bank,
+                                      const sol_pubkey_t* program_id,
+                                      uint64_t wait_budget_ns) {
+    if (!bank || !program_id) {
+        return SOL_ERR_INVAL;
+    }
+
+    bpf_prog_cache_init();
+    if (!g_bpf_prog_cache) {
+        return SOL_OK;
+    }
+    const bool bounded_wait = (wait_budget_ns != UINT64_MAX);
+
+    pthread_rwlock_rdlock(&g_bpf_prog_cache_lock);
+    sol_bpf_prog_handle_t* cached = bpf_prog_cache_get_locked(program_id);
+    pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+    if (cached) {
+        uint64_t wait_t0 = monotonic_ns();
+        bool wait_timed_out = false;
+        sol_err_t werr = bounded_wait
+            ? bpf_prog_handle_wait_ready_budget(cached, wait_budget_ns, &wait_timed_out)
+            : bpf_prog_handle_wait_ready(cached);
+        bpf_log_slow_stage("prewarm_wait_cached",
+                           program_id,
+                           sol_bank_slot(bank),
+                           monotonic_ns() - wait_t0,
+                           werr,
+                           cached->prog ? cached->ro_section_len : 0u);
+        bpf_prog_handle_release(cached);
+        return werr;
+    }
+
+    sol_bpf_prog_handle_t* inflight = NULL;
+    bool inflight_loader = false;
+
+    sol_bpf_prog_handle_t* placeholder = bpf_prog_handle_new(BPF_PROG_STATE_LOADING);
+    if (!placeholder) {
+        return SOL_ERR_NOMEM;
+    }
+
+    pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
+    inflight = bpf_prog_cache_get_locked(program_id);
+    if (!inflight) {
+        inflight = bpf_prog_cache_insert_locked(program_id, placeholder);
+        if (!inflight) {
+            pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+            bpf_prog_handle_release(placeholder);
+            return SOL_ERR_NOMEM;
+        } else if (inflight == placeholder) {
+            inflight_loader = true;
+        } else {
+            bpf_prog_handle_release(placeholder);
+            placeholder = NULL;
+        }
+    } else {
+        bpf_prog_handle_release(placeholder);
+        placeholder = NULL;
+    }
+    pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+
+    if (!inflight) {
+        return SOL_ERR_NOMEM;
+    }
+
+    if (!inflight_loader) {
+        uint64_t wait_t0 = monotonic_ns();
+        bool wait_timed_out = false;
+        sol_err_t werr = bounded_wait
+            ? bpf_prog_handle_wait_ready_budget(inflight, wait_budget_ns, &wait_timed_out)
+            : bpf_prog_handle_wait_ready(inflight);
+        bpf_log_slow_stage("prewarm_wait_inflight",
+                           program_id,
+                           sol_bank_slot(bank),
+                           monotonic_ns() - wait_t0,
+                           werr,
+                           inflight->prog ? inflight->ro_section_len : 0u);
+        bpf_prog_handle_release(inflight);
+        return werr;
+    }
+
+    uint64_t load_t0 = monotonic_ns();
+    sol_err_t ret = bpf_loader_load_program_into_handle(bank, program_id, inflight);
+    bpf_log_slow_stage("prewarm_load_parse",
+                       program_id,
+                       sol_bank_slot(bank),
+                       monotonic_ns() - load_t0,
+                       ret,
+                       inflight->prog ? inflight->ro_section_len : 0u);
+    if (ret == SOL_OK) {
+        pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
+        if (g_bpf_prog_cache) {
+            sol_bpf_prog_handle_t** slot =
+                (sol_bpf_prog_handle_t**)sol_pubkey_map_get(g_bpf_prog_cache, program_id);
+            if (slot && *slot == inflight) {
+                if (inflight->ro_section_len > g_bpf_prog_cache_max_bytes) {
+                    size_t saved = inflight->ro_section_len;
+                    inflight->ro_section_len = 0;
+                    bpf_prog_cache_remove_locked(program_id);
+                    inflight->ro_section_len = saved;
+                } else {
+                    bpf_prog_cache_evict_if_needed_locked(inflight->ro_section_len);
+                    g_bpf_prog_cache_total_bytes += inflight->ro_section_len;
+                }
+            }
+        }
+        pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+
+        pthread_mutex_lock(&inflight->load_mu);
+        inflight->load_err = SOL_OK;
+        __atomic_store_n(&inflight->load_state, BPF_PROG_STATE_READY, __ATOMIC_RELEASE);
+        pthread_cond_broadcast(&inflight->load_cv);
+        pthread_mutex_unlock(&inflight->load_mu);
+
+        bpf_prog_handle_release(inflight);
+        return SOL_OK;
+    }
+
+    pthread_mutex_lock(&inflight->load_mu);
+    inflight->load_err = ret;
+    __atomic_store_n(&inflight->load_state, BPF_PROG_STATE_FAILED, __ATOMIC_RELEASE);
+    pthread_cond_broadcast(&inflight->load_cv);
+    pthread_mutex_unlock(&inflight->load_mu);
+
+    pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
+    if (g_bpf_prog_cache) {
+        sol_bpf_prog_handle_t** slot =
+            (sol_bpf_prog_handle_t**)sol_pubkey_map_get(g_bpf_prog_cache, program_id);
+        if (slot && *slot == inflight) {
+            bpf_prog_cache_remove_locked(program_id);
+        }
+    }
+    pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
+
+    bpf_prog_handle_release(inflight);
+    return ret;
+}
+
+sol_err_t
+sol_bpf_loader_prewarm_program(sol_bank_t* bank, const sol_pubkey_t* program_id) {
+    return sol_bpf_loader_prewarm_program_budget(bank, program_id, UINT64_MAX);
+}
+
 /*
  * Execute a deployed BPF program
  */
@@ -3291,6 +3728,9 @@ sol_err_t sol_bpf_loader_execute_program(
     bpf_prog_cache_init();
     sol_bpf_prog_handle_t* inflight = NULL;
     bool inflight_loader = false;
+    const uint64_t load_diag_thresh_ns = bpf_load_slow_threshold_ns();
+    const uint64_t wait_budget_ns = bpf_load_wait_budget_ns();
+    bool force_uncached_load = false;
 
     /* Fast path: execute from cache (or wait for an in-flight load). */
     if (g_bpf_prog_cache) {
@@ -3298,20 +3738,33 @@ sol_err_t sol_bpf_loader_execute_program(
         sol_bpf_prog_handle_t* cached = bpf_prog_cache_get_locked(program_id);
         pthread_rwlock_unlock(&g_bpf_prog_cache_lock);
         if (cached) {
-            sol_err_t werr = bpf_prog_handle_wait_ready(cached);
+            uint64_t wait_t0 = monotonic_ns();
+            bool wait_timed_out = false;
+            sol_err_t werr =
+                bpf_prog_handle_wait_ready_budget(cached, wait_budget_ns, &wait_timed_out);
+            bpf_log_slow_stage("exec_wait_cached",
+                               program_id,
+                               sol_bank_slot(ctx->bank),
+                               monotonic_ns() - wait_t0,
+                               werr,
+                               cached->prog ? cached->ro_section_len : 0u);
             if (werr == SOL_OK) {
                 sol_err_t err = execute_sbf_program(ctx, cached->prog, cached->loader_deprecated);
                 bpf_prog_handle_release(cached);
                 return err;
             }
             bpf_prog_handle_release(cached);
-            return werr;
+            if (wait_timed_out) {
+                force_uncached_load = true;
+            } else {
+                return werr;
+            }
         }
     }
 
     /* Cache miss: install an in-flight placeholder so only one thread performs
      * AccountsDB loads + ELF parsing for this program. */
-    if (g_bpf_prog_cache) {
+    if (g_bpf_prog_cache && !force_uncached_load) {
         sol_bpf_prog_handle_t* placeholder = bpf_prog_handle_new(BPF_PROG_STATE_LOADING);
         if (placeholder) {
             pthread_rwlock_wrlock(&g_bpf_prog_cache_lock);
@@ -3335,14 +3788,28 @@ sol_err_t sol_bpf_loader_execute_program(
         }
 
         if (inflight && !inflight_loader) {
-            sol_err_t werr = bpf_prog_handle_wait_ready(inflight);
+            uint64_t wait_t0 = monotonic_ns();
+            bool wait_timed_out = false;
+            sol_err_t werr =
+                bpf_prog_handle_wait_ready_budget(inflight, wait_budget_ns, &wait_timed_out);
+            bpf_log_slow_stage("exec_wait_inflight",
+                               program_id,
+                               sol_bank_slot(ctx->bank),
+                               monotonic_ns() - wait_t0,
+                               werr,
+                               inflight->prog ? inflight->ro_section_len : 0u);
             if (werr == SOL_OK) {
                 sol_err_t err = execute_sbf_program(ctx, inflight->prog, inflight->loader_deprecated);
                 bpf_prog_handle_release(inflight);
                 return err;
             }
             bpf_prog_handle_release(inflight);
-            return werr;
+            if (wait_timed_out) {
+                force_uncached_load = true;
+                inflight = NULL;
+            } else {
+                return werr;
+            }
         }
     }
 
@@ -3356,6 +3823,7 @@ sol_err_t sol_bpf_loader_execute_program(
     size_t elf_len = 0;
     bool has_programdata = false;
     sol_pubkey_t program_data_address = {0};
+    uint64_t load_t0 = load_diag_thresh_ns ? monotonic_ns() : 0u;
 
     /* Cache miss (or inflight loader): load program account, fetch ELF, parse once. */
     program_account = sol_bank_load_account_view(ctx->bank, program_id);
@@ -3503,6 +3971,12 @@ sol_err_t sol_bpf_loader_execute_program(
 
     sol_err_t load_err = sol_bpf_elf_load(loaded, elf_data, elf_len);
     if (load_err != SOL_OK) {
+        bpf_log_slow_stage(inflight_loader ? "exec_load_parse_owner" : "exec_load_parse_fallback",
+                           program_id,
+                           sol_bank_slot(ctx->bank),
+                           load_t0 ? (monotonic_ns() - load_t0) : 0u,
+                           load_err,
+                           0u);
         if (sbf_vm_diag_enabled() || sol_log_get_level() <= SOL_LOG_DEBUG) {
             char p58[SOL_PUBKEY_BASE58_LEN] = {0};
             sol_pubkey_to_base58(program_id, p58, sizeof(p58));
@@ -3517,6 +3991,12 @@ sol_err_t sol_bpf_loader_execute_program(
         ret = load_err;
         goto fail;
     }
+    bpf_log_slow_stage(inflight_loader ? "exec_load_parse_owner" : "exec_load_parse_fallback",
+                       program_id,
+                       sol_bank_slot(ctx->bank),
+                       load_t0 ? (monotonic_ns() - load_t0) : 0u,
+                       SOL_OK,
+                       loaded ? loaded->ro_section_len : 0u);
 
     if (program_data) {
         sol_account_destroy(program_data);
@@ -3564,6 +4044,13 @@ sol_err_t sol_bpf_loader_execute_program(
 
         sol_err_t err = execute_sbf_program(ctx, inflight->prog, inflight->loader_deprecated);
         bpf_prog_handle_release(inflight);
+        return err;
+    }
+
+    if (force_uncached_load) {
+        sol_err_t err = execute_sbf_program(ctx, loaded, loader_deprecated);
+        sol_bpf_program_destroy(loaded);
+        loaded = NULL;
         return err;
     }
 
@@ -4515,6 +5002,30 @@ sol_bpf_loader_cpi_dispatch(
     }
 
     if (caller->bank != NULL) {
+        bool synced_info[SOL_BPF_CPI_MAX_ACCOUNTS];
+        memset(synced_info, 0, sizeof(synced_info));
+
+        int16_t caller_key_map[CPI_PUBKEY_MAP_SZ];
+        cpi_pubkey_map_init(caller_key_map);
+        for (size_t ki = 0; ki < caller->account_keys_len; ki++) {
+            cpi_pubkey_map_insert(caller_key_map, caller->account_keys, ki);
+        }
+
+        int16_t caller_meta_by_key_idx[256];
+        for (size_t k = 0; k < 256u; k++) {
+            caller_meta_by_key_idx[k] = -1;
+        }
+        const sol_sbf_account_meta_t* caller_metas =
+            (const sol_sbf_account_meta_t*)vm->caller_metas;
+        if (caller_metas != NULL) {
+            for (size_t mi = 0; mi < vm->caller_meta_count; mi++) {
+                uint8_t ckey = caller_metas[mi].key_index;
+                if (ckey < caller->account_keys_len && caller_meta_by_key_idx[ckey] < 0) {
+                    caller_meta_by_key_idx[ckey] = (int16_t)mi;
+                }
+            }
+        }
+
         for (size_t i = 0; i < count; i++) {
             if (!instr->accounts[i].is_writable) {
                 continue;
@@ -4546,6 +5057,27 @@ sol_bpf_loader_cpi_dispatch(
                 continue;
             }
 
+            if ((size_t)info_idx < info_count && synced_info[info_idx]) {
+                continue;
+            }
+            if ((size_t)info_idx < info_count) {
+                synced_info[info_idx] = true;
+            }
+
+            const sol_sbf_account_meta_t* caller_meta = NULL;
+            size_t caller_meta_idx = 0;
+            int caller_key_idx = cpi_pubkey_map_lookup(caller_key_map,
+                                                       caller->account_keys,
+                                                       caller->account_keys_len,
+                                                       &instr->accounts[i].pubkey);
+            if (caller_key_idx >= 0) {
+                int16_t mi = caller_meta_by_key_idx[(uint8_t)caller_key_idx];
+                if (mi >= 0 && (size_t)mi < vm->caller_meta_count) {
+                    caller_meta_idx = (size_t)mi;
+                    caller_meta = &caller_metas[caller_meta_idx];
+                }
+            }
+
             sol_account_t* account = sol_bank_load_account_view(caller->bank, &instr->accounts[i].pubkey);
             if (account == NULL) {
                 continue;
@@ -4557,19 +5089,7 @@ sol_bpf_loader_cpi_dispatch(
             /* Look up original_data_len from caller serialization metadata.
                Agave checks realloc bounds against the data length at the start
                of the caller instruction, not the current (possibly grown) length. */
-            uint64_t original_data_len = 0;
-            if (vm->caller_metas != NULL) {
-                const sol_sbf_account_meta_t* cmetas =
-                    (const sol_sbf_account_meta_t*)vm->caller_metas;
-                for (size_t mi = 0; mi < vm->caller_meta_count; mi++) {
-                    if (cmetas[mi].key_index < caller->account_keys_len &&
-                        sol_pubkey_eq(&caller->account_keys[cmetas[mi].key_index],
-                                      &instr->accounts[i].pubkey)) {
-                        original_data_len = cmetas[mi].pre_data_len;
-                        break;
-                    }
-                }
-            }
+            uint64_t original_data_len = caller_meta ? caller_meta->pre_data_len : 0;
 
             if (!instr->account_infos_are_rust) {
                 sol_bpf_account_info_t* info = &infos[info_idx];
@@ -4709,62 +5229,50 @@ sol_bpf_loader_cpi_dispatch(
              * sbf_apply_output sees the correct post-CPI lamport values,
              * matching the account_info pointer writes above.
              */
-            if (vm->caller_metas != NULL && vm->caller_input_buf != NULL) {
-                const sol_sbf_account_meta_t* cmetas =
-                    (const sol_sbf_account_meta_t*)vm->caller_metas;
-                bool found_meta = false;
-                for (size_t mi = 0; mi < vm->caller_meta_count; mi++) {
-                    if (cmetas[mi].key_index < caller->account_keys_len &&
-                        sol_pubkey_eq(&caller->account_keys[cmetas[mi].key_index],
-                                      &instr->accounts[i].pubkey)) {
-                        found_meta = true;
-                        /* Update lamports in serialized buffer */
-                        if (cmetas[mi].lamports_off + sizeof(uint64_t) <= vm->caller_input_len) {
-                            uint64_t buf_old = 0;
-                            memcpy(&buf_old, vm->caller_input_buf + cmetas[mi].lamports_off, sizeof(uint64_t));
-                            memcpy(vm->caller_input_buf + cmetas[mi].lamports_off,
-                                   &account->meta.lamports, sizeof(uint64_t));
-                            if (buf_old != account->meta.lamports) {
-                                if (__builtin_expect(log_debug, 0)) {
-                                    char _k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                                    sol_pubkey_to_base58(&instr->accounts[i].pubkey, _k58, sizeof(_k58));
-                                    sol_log_debug("CPI_BUF_WRITE: key=%s buf_old=%lu new=%lu off=%zu mi=%zu",
-                                                 _k58, (unsigned long)buf_old, (unsigned long)account->meta.lamports,
-                                                 cmetas[mi].lamports_off, mi);
-                                }
-                            }
+            if (caller_meta != NULL && vm->caller_input_buf != NULL) {
+                /* Update lamports in serialized buffer */
+                if (caller_meta->lamports_off + sizeof(uint64_t) <= vm->caller_input_len) {
+                    uint64_t buf_old = 0;
+                    memcpy(&buf_old, vm->caller_input_buf + caller_meta->lamports_off, sizeof(uint64_t));
+                    memcpy(vm->caller_input_buf + caller_meta->lamports_off,
+                           &account->meta.lamports, sizeof(uint64_t));
+                    if (buf_old != account->meta.lamports) {
+                        if (__builtin_expect(log_debug, 0)) {
+                            char _k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                            sol_pubkey_to_base58(&instr->accounts[i].pubkey, _k58, sizeof(_k58));
+                            sol_log_debug("CPI_BUF_WRITE: key=%s buf_old=%lu new=%lu off=%zu mi=%zu",
+                                         _k58, (unsigned long)buf_old, (unsigned long)account->meta.lamports,
+                                         caller_meta->lamports_off, caller_meta_idx);
                         }
-                        /* Update data_len in serialized buffer */
-                        if (cmetas[mi].data_len_off + sizeof(uint64_t) <= vm->caller_input_len) {
-                            uint64_t post_data_len = (uint64_t)account->meta.data_len;
-                            memcpy(vm->caller_input_buf + cmetas[mi].data_len_off,
-                                   &post_data_len, sizeof(uint64_t));
-                        }
-                        /* Update owner in serialized buffer */
-                        if (cmetas[mi].owner_off + 32 <= vm->caller_input_len) {
-                            memcpy(vm->caller_input_buf + cmetas[mi].owner_off,
-                                   account->meta.owner.bytes, 32);
-                        }
-                        /* Update data in serialized buffer */
-                        if (account->meta.data_len > 0 && account->data != NULL &&
-                            cmetas[mi].data_off + account->meta.data_len <= vm->caller_input_len) {
-                            memcpy(vm->caller_input_buf + cmetas[mi].data_off,
-                                   account->data, account->meta.data_len);
-                        }
-                        /* Zero-fill freed data in serialized buffer on shrink */
-                        if ((uint64_t)account->meta.data_len < pre_len &&
-                            cmetas[mi].data_off + pre_len <= vm->caller_input_len) {
-                            memset(vm->caller_input_buf + cmetas[mi].data_off + account->meta.data_len,
-                                   0, (size_t)(pre_len - account->meta.data_len));
-                        }
-                        break;
                     }
                 }
-                if (!found_meta) {
-                    char _k58[SOL_PUBKEY_BASE58_LEN] = {0};
-                    sol_pubkey_to_base58(&instr->accounts[i].pubkey, _k58, sizeof(_k58));
-                    sol_log_warn("CPI_BUF_NOMATCH: key=%s meta_count=%zu", _k58, vm->caller_meta_count);
+                /* Update data_len in serialized buffer */
+                if (caller_meta->data_len_off + sizeof(uint64_t) <= vm->caller_input_len) {
+                    uint64_t post_data_len = (uint64_t)account->meta.data_len;
+                    memcpy(vm->caller_input_buf + caller_meta->data_len_off,
+                           &post_data_len, sizeof(uint64_t));
                 }
+                /* Update owner in serialized buffer */
+                if (caller_meta->owner_off + 32 <= vm->caller_input_len) {
+                    memcpy(vm->caller_input_buf + caller_meta->owner_off,
+                           account->meta.owner.bytes, 32);
+                }
+                /* Update data in serialized buffer */
+                if (account->meta.data_len > 0 && account->data != NULL &&
+                    caller_meta->data_off + account->meta.data_len <= vm->caller_input_len) {
+                    memcpy(vm->caller_input_buf + caller_meta->data_off,
+                           account->data, account->meta.data_len);
+                }
+                /* Zero-fill freed data in serialized buffer on shrink */
+                if ((uint64_t)account->meta.data_len < pre_len &&
+                    caller_meta->data_off + pre_len <= vm->caller_input_len) {
+                    memset(vm->caller_input_buf + caller_meta->data_off + account->meta.data_len,
+                           0, (size_t)(pre_len - account->meta.data_len));
+                }
+            } else if (vm->caller_metas != NULL && vm->caller_input_buf != NULL) {
+                char _k58[SOL_PUBKEY_BASE58_LEN] = {0};
+                sol_pubkey_to_base58(&instr->accounts[i].pubkey, _k58, sizeof(_k58));
+                sol_log_warn("CPI_BUF_NOMATCH: key=%s meta_count=%zu", _k58, vm->caller_meta_count);
             }
 
             sol_account_destroy(account);

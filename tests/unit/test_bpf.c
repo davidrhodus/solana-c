@@ -187,6 +187,50 @@ TEST(bpf_loader_compute_meter) {
     sol_bank_destroy(bank);
 }
 
+TEST(bpf_loader_prewarm_program) {
+    sol_bank_t* bank = sol_bank_new(0, NULL, NULL, NULL);
+    TEST_ASSERT_NOT_NULL(bank);
+
+    sol_pubkey_t program_id = {0};
+    program_id.bytes[0] = 0x43;
+
+    sol_account_t* program_account = sol_account_new(1, sizeof(test_bpf_loop_elf),
+                                                     &SOL_BPF_LOADER_V2_ID);
+    TEST_ASSERT_NOT_NULL(program_account);
+    program_account->meta.executable = true;
+
+    sol_err_t err = sol_account_set_data(program_account, test_bpf_loop_elf,
+                                         sizeof(test_bpf_loop_elf));
+    TEST_ASSERT_EQ(err, SOL_OK);
+
+    err = sol_bank_store_account(bank, &program_id, program_account);
+    TEST_ASSERT_EQ(err, SOL_OK);
+    sol_account_destroy(program_account);
+
+    TEST_ASSERT_EQ(sol_bpf_loader_prewarm_program(NULL, &program_id), SOL_ERR_INVAL);
+    TEST_ASSERT_EQ(sol_bpf_loader_prewarm_program(bank, NULL), SOL_ERR_INVAL);
+    TEST_ASSERT_EQ(sol_bpf_loader_prewarm_program(bank, &program_id), SOL_OK);
+    TEST_ASSERT_EQ(sol_bpf_loader_prewarm_program(bank, &program_id), SOL_OK);
+
+    sol_compute_budget_t budget;
+    sol_compute_budget_init(&budget);
+
+    sol_compute_meter_t meter;
+    sol_compute_meter_init(&meter, 10000);
+
+    sol_invoke_context_t ctx = {0};
+    ctx.bank = bank;
+    ctx.program_id = program_id;
+    ctx.compute_budget = &budget;
+    ctx.compute_meter = &meter;
+
+    err = sol_bpf_loader_execute_program(&ctx, &program_id);
+    TEST_ASSERT_EQ(err, SOL_OK);
+    TEST_ASSERT(meter.consumed > 1000);
+
+    sol_bank_destroy(bank);
+}
+
 /*
  * Test simple program: mov r0, 42; exit
  */
@@ -1494,6 +1538,7 @@ TEST(cpi_account_propagation) {
 static test_case_t bpf_tests[] = {
     TEST_CASE(vm_create),
     TEST_CASE(bpf_loader_compute_meter),
+    TEST_CASE(bpf_loader_prewarm_program),
     TEST_CASE(simple_exit),
     TEST_CASE(arithmetic),
     TEST_CASE(reg_move),

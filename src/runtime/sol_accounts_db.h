@@ -172,6 +172,25 @@ sol_account_t* sol_accounts_db_load_view_ex(
     sol_slot_t*             out_stored_slot
 );
 
+/*
+ * Lookup visible account rent metadata (lamports/data_len/rent_epoch)
+ * without loading account data.
+ *
+ * Returns SOL_OK when the lookup completed (found or not found). In that case,
+ * `*out_found` indicates whether a non-tombstone account is visible.
+ *
+ * Returns a non-OK error on transient lookup failures (for example IO errors),
+ * allowing callers to fall back to a full account load path.
+ */
+sol_err_t sol_accounts_db_lookup_visible_rent_meta(
+    sol_accounts_db_t*      db,
+    const sol_pubkey_t*     pubkey,
+    bool*                   out_found,
+    uint64_t*               out_lamports,
+    uint64_t*               out_data_len,
+    uint64_t*               out_rent_epoch
+);
+
 /* Debug: trace account lookup through parent chain */
 void sol_accounts_db_trace_load(
     sol_accounts_db_t*      db,
@@ -543,6 +562,8 @@ sol_err_t sol_accounts_db_iterate_local(
 typedef struct {
     sol_pubkey_t   pubkey;
     sol_account_t* account; /* NULL for tombstone */
+    sol_slot_t     slot;
+    uint64_t       write_version;
 } sol_accounts_db_local_entry_t;
 
 typedef struct {
@@ -575,6 +596,13 @@ typedef struct {
 sol_err_t
 sol_accounts_db_snapshot_local_view(sol_accounts_db_t* db,
                                     sol_accounts_db_local_snapshot_view_t* out);
+
+/* Variant for immutable overlays (for example frozen banks during root
+ * advancement / hash computation). This uses a shared DB lock to avoid
+ * globally blocking concurrent readers while snapshotting bucket chains. */
+sol_err_t
+sol_accounts_db_snapshot_local_view_immutable(sol_accounts_db_t* db,
+                                              sol_accounts_db_local_snapshot_view_t* out);
 
 void
 sol_accounts_db_local_snapshot_view_free(sol_accounts_db_local_snapshot_view_t* snap);
@@ -743,6 +771,14 @@ sol_err_t sol_accounts_db_apply_delta(sol_accounts_db_t* dst, sol_accounts_db_t*
 sol_err_t sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
                                                   sol_accounts_db_t* src,
                                                   sol_slot_t default_slot);
+
+/* Extended variant for callers that know src is immutable (for example, a
+ * frozen rooted bank). This allows apply-delta implementations to snapshot
+ * source entries and avoid long-lived source write locks during bulk commit. */
+sol_err_t sol_accounts_db_apply_delta_default_slot_ex(sol_accounts_db_t* dst,
+                                                      sol_accounts_db_t* src,
+                                                      sol_slot_t default_slot,
+                                                      bool src_immutable);
 
 /*
  * Seal an AppendVec slot file after rooting.

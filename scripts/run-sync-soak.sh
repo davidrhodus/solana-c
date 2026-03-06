@@ -10,6 +10,7 @@
 #   REMOTE_RPC=https://api.mainnet-beta.solana.com
 #   LOG_FILE=ledger.mainnet/validator.log
 #   INTERVAL_SEC=10
+#   SLOT_COMMITMENT=processed
 #   MAX_P95_MS=220
 #   MAX_P99_MS=350
 #
@@ -21,6 +22,7 @@ LOCAL_RPC="${LOCAL_RPC:-http://127.0.0.1:8899}"
 REMOTE_RPC="${REMOTE_RPC:-https://api.mainnet-beta.solana.com}"
 LOG_FILE="${LOG_FILE:-ledger.mainnet/validator.log}"
 INTERVAL_SEC="${INTERVAL_SEC:-10}"
+SLOT_COMMITMENT="${SLOT_COMMITMENT:-processed}"
 MAX_P95_MS="${MAX_P95_MS:-220}"
 MAX_P99_MS="${MAX_P99_MS:-350}"
 
@@ -48,7 +50,7 @@ slot_query() {
   local url="$1"
   curl -s --max-time 4 \
     -H 'Content-Type: application/json' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"getSlot"}' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getSlot\",\"params\":[{\"commitment\":\"${SLOT_COMMITMENT}\"}]}" \
     "${url}" | sed -n 's/.*"result":\([0-9][0-9]*\).*/\1/p'
 }
 
@@ -70,7 +72,7 @@ start_line="$(( $(wc -l < "${LOG_FILE}") + 1 ))"
 start_ts="$(date +%s)"
 end_ts="$((start_ts + DURATION_SEC))"
 
-echo "sync_soak: duration=${DURATION_SEC}s interval=${INTERVAL_SEC}s local=${LOCAL_RPC} remote=${REMOTE_RPC}" >&2
+echo "sync_soak: duration=${DURATION_SEC}s interval=${INTERVAL_SEC}s commitment=${SLOT_COMMITMENT} local=${LOCAL_RPC} remote=${REMOTE_RPC}" >&2
 echo "sync_soak: log=${LOG_FILE} start_line=${start_line}" >&2
 
 while :; do

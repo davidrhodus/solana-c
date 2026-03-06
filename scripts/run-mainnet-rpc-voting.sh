@@ -34,7 +34,8 @@ export HALT_AT
 : "${TVU_PORT:=8004}"
 : "${RPC_PORT:=8899}"
 : "${RPC_BIND:=127.0.0.1}"
-export GOSSIP_PORT TPU_PORT TVU_PORT RPC_PORT RPC_BIND
+: "${ENTRYPOINTS:=entrypoint.mainnet-beta.solana.com:8001,entrypoint2.mainnet-beta.solana.com:8001,entrypoint3.mainnet-beta.solana.com:8001,entrypoint4.mainnet-beta.solana.com:8001,entrypoint5.mainnet-beta.solana.com:8001}"
+export GOSSIP_PORT TPU_PORT TVU_PORT RPC_PORT RPC_BIND ENTRYPOINTS
 
 # Path defaults.
 : "${ROCKSDB_PATH:=${LEDGER_DIR}/rocksdb}"
@@ -60,6 +61,87 @@ export ROCKSDB_PATH LOG_FILE
 : "${SOL_TVU_REPLAY_PARENT_PROBE_LIMIT:=48}"
 : "${SOL_TVU_REPLAY_PARENT_PROBE_HIGH_LAG:=192}"
 : "${SOL_TVU_REPLAY_PARENT_PROBE_SEVERE_LAG:=768}"
+# Keep TVU intake and replay selection tighter under backlog so replay threads
+# stay focused on near-frontier slots on combined RPC+voting nodes.
+: "${SOL_TVU_MAX_SHRED_AHEAD_SLOTS:=3072}"
+: "${SOL_TVU_MAX_SHRED_AHEAD_HIGH_LAG:=1024}"
+: "${SOL_TVU_MAX_SHRED_AHEAD_HIGH_SLOTS:=768}"
+: "${SOL_TVU_MAX_SHRED_AHEAD_SEVERE_LAG:=4096}"
+: "${SOL_TVU_MAX_SHRED_AHEAD_SEVERE_SLOTS:=384}"
+: "${SOL_TVU_MAX_REPLAY_AHEAD_SLOTS:=768}"
+: "${SOL_TVU_MAX_REPLAY_AHEAD_HIGH_LAG:=384}"
+: "${SOL_TVU_MAX_REPLAY_AHEAD_HIGH_SLOTS:=48}"
+: "${SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_LAG:=896}"
+: "${SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_SLOTS:=16}"
+: "${SOL_TVU_PRIMARY_DEAD_REPLAY_AHEAD_SLOTS:=4}"
+: "${SOL_TVU_PRIMARY_INCOMPLETE_RETRY_MS:=500}"
+# Reduce duplicate-repair amplification while retaining dead-primary recovery.
+: "${SOL_TVU_DEAD_PRIMARY_DUPLICATE_FANOUT:=32}"
+: "${SOL_TVU_DEAD_PRIMARY_HIGHEST_FANOUT:=24}"
+: "${SOL_TVU_DEAD_PRIMARY_ORPHAN_FANOUT:=4}"
+: "${SOL_TVU_DEAD_PRIMARY_ANCESTOR_FANOUT:=4}"
+# Repair pacing tuned for WAN entrypoints: reduce timeout/retry churn.
+: "${SOL_REPAIR_REQUEST_TIMEOUT_MS:=120}"
+: "${SOL_REPAIR_MAX_PENDING:=16384}"
+: "${SOL_REPAIR_MAX_RETRIES:=6}"
+# Keep replay-thread fanout conservative on combined RPC+voting nodes to avoid
+# cross-slot replay convoy stalls under backlog.
+: "${SOL_TVU_REPLAY_THREADS:=8}"
+# Prefer deterministic verify latency on large-core combined nodes.
+: "${SOL_REPLAY_VERIFY_ASYNC:=0}"
+# Keep replay verify workers below CPU-count scaling on combined RPC+voting
+# nodes to leave headroom for replay + networking threads.
+: "${SOL_REPLAY_VERIFY_WORKERS:=24}"
+# Bound async-verify wait before local fallback. Tune lower (or 0) when
+# prioritizing strict latency over duplicate verify work.
+: "${SOL_REPLAY_VERIFY_WAIT_BUDGET_MS:=256}"
+# Keep replay tx-pool on the parallel path under shard contention; sequential
+# fallback on busy slots creates multi-second execute tails. Use a longer
+# bounded wait on large-core hosts before dropping to local sequential replay.
+: "${SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS:=1500}"
+# Apply the long-wait retry to smaller replay segments too; many mainnet
+# hotspots currently manifest in medium-sized DAG segments.
+: "${SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH:=16}"
+# On 96+ core hosts, waiting for an in-flight shard is usually cheaper than
+# falling back to sequential replay for medium/large segments.
+: "${SOL_TX_POOL_REPLAY_FORCE_WAIT_ON_BUSY:=1}"
+# Replay/tx scheduler tuning for large-core combined nodes: avoid oversubscription
+# starvation while keeping enough execution throughput.
+: "${SOL_TX_WORKERS:=96}"
+: "${SOL_TX_PER_WORKER:=8}"
+# Keep enough tx-pool shards for concurrent replay threads; too few shards can
+# create multi-second queue convoys on busy mainnet slots.
+: "${SOL_TX_POOL_SHARDS:=8}"
+# Keep DAG ready-queue pop batches small to reduce worker work-hoarding and
+# replay straggler tails on large-core hosts.
+: "${SOL_TX_DAG_POP_BATCH:=1}"
+# With tx indexing disabled on canary nodes, skip replay batch tx-status cache
+# writes to avoid mutex-heavy tail spikes in process_tx.
+: "${SOL_TX_STATUS_BATCH_RECORD:=0}"
+# BPF ELF cache sizing for large-memory validator hosts. Small caches can thrash
+# on mainnet's long-tail program set and trigger load/parse stalls on replay.
+: "${SOL_BPF_PROG_CACHE_MB:=8192}"
+: "${SOL_BPF_PROG_CACHE_ENTRIES:=131072}"
+# Replay prewarm: parse/cache a bounded number of instruction program ELFs
+# ahead of execute to reduce cold-load replay tail spikes.
+: "${SOL_REPLAY_PREWARM_BPF_PROGRAMS:=1}"
+# On large-memory combined RPC+voting hosts, a higher replay prewarm program
+# budget materially reduces BPF cold-load replay outliers during catchup.
+: "${SOL_REPLAY_PREWARM_MAX_PROGRAMS:=16384}"
+# Prewarm more program variants up-front to reduce first-hit variant stalls.
+: "${SOL_REPLAY_PREWARM_MAX_VARIANTS:=64}"
+# Also prewarm readonly account views to reduce deep-CPI cold-load stalls.
+: "${SOL_REPLAY_PREWARM_INCLUDE_READONLY:=1}"
+# Bound in-flight BPF load wait before local fallback. A tighter budget avoids
+# rare multi-second replay execute stalls on cold-loader contention.
+: "${SOL_BPF_LOAD_WAIT_BUDGET_MS:=128}"
+
+# Keep restart/catchup deterministic by default: reuse local snapshot archives
+# and avoid long auto-refresh/download churn. Set
+# SOL_AUTO_SNAPSHOT_ALLOW_NETWORK_DOWNLOAD=1 when bootstrapping a fresh ledger.
+: "${SOL_AUTO_SNAPSHOT_MAX_LAG_SLOTS:=0}"
+: "${SOL_AUTO_SNAPSHOT_FORCE_REFRESH_LAG_SLOTS:=0}"
+: "${SOL_AUTO_SNAPSHOT_ALLOW_NETWORK_DOWNLOAD:=0}"
 
 export SOL_SKIP_TX_INDEX
 export SOL_RPC_BACKPRESSURE SOL_RPC_BACKPRESSURE_ADAPTIVE_GROWTH
@@ -69,5 +151,23 @@ export SOL_RPC_BACKPRESSURE_HIGH_RPS SOL_RPC_BACKPRESSURE_SEVERE_RPS
 export SOL_RPC_BACKPRESSURE_HIGH_MAX_CONN SOL_RPC_BACKPRESSURE_SEVERE_MAX_CONN
 export SOL_RPC_BACKPRESSURE_REJECT_MODE
 export SOL_TVU_REPLAY_PARENT_PROBE_LIMIT SOL_TVU_REPLAY_PARENT_PROBE_HIGH_LAG SOL_TVU_REPLAY_PARENT_PROBE_SEVERE_LAG
+export SOL_TVU_MAX_SHRED_AHEAD_SLOTS SOL_TVU_MAX_SHRED_AHEAD_HIGH_LAG SOL_TVU_MAX_SHRED_AHEAD_HIGH_SLOTS
+export SOL_TVU_MAX_SHRED_AHEAD_SEVERE_LAG SOL_TVU_MAX_SHRED_AHEAD_SEVERE_SLOTS
+export SOL_TVU_MAX_REPLAY_AHEAD_SLOTS SOL_TVU_MAX_REPLAY_AHEAD_HIGH_LAG SOL_TVU_MAX_REPLAY_AHEAD_HIGH_SLOTS
+export SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_LAG SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_SLOTS
+export SOL_TVU_PRIMARY_DEAD_REPLAY_AHEAD_SLOTS SOL_TVU_PRIMARY_INCOMPLETE_RETRY_MS
+export SOL_TVU_DEAD_PRIMARY_DUPLICATE_FANOUT SOL_TVU_DEAD_PRIMARY_HIGHEST_FANOUT
+export SOL_TVU_DEAD_PRIMARY_ORPHAN_FANOUT SOL_TVU_DEAD_PRIMARY_ANCESTOR_FANOUT
+export SOL_REPAIR_REQUEST_TIMEOUT_MS SOL_REPAIR_MAX_PENDING SOL_REPAIR_MAX_RETRIES
+export SOL_TVU_REPLAY_THREADS
+export SOL_REPLAY_VERIFY_ASYNC SOL_REPLAY_VERIFY_WORKERS SOL_REPLAY_VERIFY_WAIT_BUDGET_MS
+export SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH SOL_TX_POOL_REPLAY_FORCE_WAIT_ON_BUSY
+export SOL_TX_WORKERS SOL_TX_PER_WORKER SOL_TX_POOL_SHARDS
+export SOL_TX_DAG_POP_BATCH SOL_TX_STATUS_BATCH_RECORD
+export SOL_BPF_PROG_CACHE_MB SOL_BPF_PROG_CACHE_ENTRIES
+export SOL_REPLAY_PREWARM_BPF_PROGRAMS SOL_REPLAY_PREWARM_MAX_PROGRAMS SOL_REPLAY_PREWARM_MAX_VARIANTS SOL_REPLAY_PREWARM_INCLUDE_READONLY
+export SOL_BPF_LOAD_WAIT_BUDGET_MS
+export SOL_AUTO_SNAPSHOT_MAX_LAG_SLOTS SOL_AUTO_SNAPSHOT_FORCE_REFRESH_LAG_SLOTS
+export SOL_AUTO_SNAPSHOT_ALLOW_NETWORK_DOWNLOAD
 
 exec "$(dirname "$0")/run-mainnet-smoke.sh" "${LEDGER_DIR}"

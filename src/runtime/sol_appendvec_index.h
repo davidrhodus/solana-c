@@ -30,6 +30,11 @@ typedef struct {
 } sol_appendvec_index_val_t;
 
 typedef struct {
+    sol_pubkey_t              pubkey;
+    sol_appendvec_index_val_t value;
+} sol_appendvec_index_update_t;
+
+typedef struct {
     pthread_rwlock_t   lock;
     sol_pubkey_map_t*  map;
 } sol_appendvec_index_shard_t;
@@ -71,6 +76,16 @@ sol_appendvec_index_update(sol_appendvec_index_t* idx,
                            uint64_t file_key,
                            uint64_t record_offset,
                            const sol_hash_t* leaf_hash);
+
+/* Batch insert/update entries.
+ *
+ * Updates preserve input order for entries that hash to the same shard.
+ * For each pubkey, Solana-style (slot,write_version) ordering is enforced.
+ */
+sol_err_t
+sol_appendvec_index_update_batch(sol_appendvec_index_t* idx,
+                                 const sol_appendvec_index_update_t* updates,
+                                 size_t count);
 
 /* Lookup an entry and copy it into `out`.
  *

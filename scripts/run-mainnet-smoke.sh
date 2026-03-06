@@ -14,6 +14,7 @@
 #   LOG_FILE=ledger.mainnet/validator.log
 #   HALT_AT=123   # set empty to run continuously
 #   MANIFEST_URL=https://data.pipedev.network/snapshot-manifest.json
+#   ENTRYPOINTS="host1:port,host2:port,..."   # comma or space separated
 #   ENABLE_VOTING=1   # default: 0 (smoke/non-voting mode)
 #   IDENTITY_PATH=/path/to/identity.json   # required when ENABLE_VOTING=1
 #   VOTE_ACCOUNT=/path/to/vote-account.json|<base58-pubkey>   # required when ENABLE_VOTING=1
@@ -36,6 +37,7 @@ TPU_PORT="${TPU_PORT:-8026}"
 TVU_PORT="${TVU_PORT:-8028}"
 RPC_PORT="${RPC_PORT:-8899}"
 RPC_BIND="${RPC_BIND:-127.0.0.1}"
+ENTRYPOINTS="${ENTRYPOINTS:-entrypoint.mainnet-beta.solana.com:8001,entrypoint2.mainnet-beta.solana.com:8001,entrypoint3.mainnet-beta.solana.com:8001,entrypoint4.mainnet-beta.solana.com:8001,entrypoint5.mainnet-beta.solana.com:8001}"
 ENABLE_VOTING="${ENABLE_VOTING:-0}"
 IDENTITY_PATH="${IDENTITY_PATH:-${IDENTITY:-}}"
 VOTE_ACCOUNT="${VOTE_ACCOUNT:-}"
@@ -85,16 +87,22 @@ ulimit -n 1000000 >/dev/null 2>&1 || true
 # Best-effort: keep CPUs at max frequency during bootstrap/replay.
 # On some hosts the default governor ("schedutil") can leave cores stuck at low
 # clocks, making snapshot load and replay look artificially slow.
-if [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
-  if [[ -w /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
-    echo "Setting CPU governor to performance (best-effort)..." >&2
-    for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-      [[ -w "${gov}" ]] || continue
-      echo performance > "${gov}" 2>/dev/null || true
-    done
-  elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-    echo "Setting CPU governor to performance via sudo (best-effort)..." >&2
-    echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null 2>&1 || true
+if [[ "${SOL_SET_CPU_GOVERNOR:-1}" != "0" ]]; then
+  if [[ -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
+    if [[ -w /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+      echo "Setting CPU governor to performance (best-effort)..." >&2
+      for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        [[ -w "${gov}" ]] || continue
+        echo performance > "${gov}" 2>/dev/null || true
+      done
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+      echo "Setting CPU governor to performance via sudo (best-effort)..." >&2
+      # Iterate per-cpu instead of one large tee call so failures/hangs on a
+      # subset of policies don't block validator startup.
+      for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        sudo sh -c "echo performance > '${gov}'" >/dev/null 2>&1 || true
+      done
+    fi
   fi
 fi
 
@@ -173,11 +181,16 @@ args=(
   --rpc-port "${RPC_PORT}"
   --log-level info
   --log-file "${LOG_FILE}"
-  --entrypoint entrypoint.mainnet-beta.solana.com:8001
   --gossip-port "${GOSSIP_PORT}"
   --tpu-port "${TPU_PORT}"
   --tvu-port "${TVU_PORT}"
 )
+
+entrypoints_norm="${ENTRYPOINTS//,/ }"
+for ep in ${entrypoints_norm}; do
+  [[ -n "${ep}" ]] || continue
+  args+=(--entrypoint "${ep}")
+done
 
 if [[ "${ENABLE_VOTING}" == "1" ]]; then
   if [[ -z "${IDENTITY_PATH}" ]]; then

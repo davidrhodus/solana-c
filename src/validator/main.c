@@ -154,6 +154,34 @@ snapshot_effective_slot_from_paths(const char* full_snapshot_path,
     return 0;
 }
 
+static bool
+validator_env_value_false(const char* value) {
+    if (!value) return false;
+    while (*value && isspace((unsigned char)*value)) value++;
+    if (value[0] == '\0') return false;
+
+    if (strcmp(value, "0") == 0) return true;
+    if (strcmp(value, "false") == 0 || strcmp(value, "FALSE") == 0) return true;
+    if (strcmp(value, "no") == 0 || strcmp(value, "NO") == 0) return true;
+    if (strcmp(value, "off") == 0 || strcmp(value, "OFF") == 0) return true;
+    return false;
+}
+
+static bool
+validator_snapshot_network_downloads_enabled(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached != 0;
+
+    bool enabled = true;
+    const char* env = getenv("SOL_AUTO_SNAPSHOT_ALLOW_NETWORK_DOWNLOAD");
+    if (env && env[0] != '\0') {
+        enabled = !validator_env_value_false(env);
+    }
+
+    cached = enabled ? 1 : 0;
+    return enabled;
+}
+
 /*
  * Version information
  */
@@ -264,6 +292,11 @@ typedef struct {
     sol_tvu_t*          tvu;
 
     /* Service pump threads */
+    pthread_t           gossip_pump_thread;
+    bool                gossip_pump_started;
+    pthread_t           turbine_pump_threads[32];
+    size_t              turbine_pump_thread_count;
+    bool                turbine_pump_started;
     pthread_t           repair_pump_thread;
     bool                repair_pump_started;
 
@@ -1038,11 +1071,15 @@ auto_download_incremental_snapshot_for_base_best_effort(const char* manifest_url
                                                         size_t out_incremental_path_len,
                                                         sol_slot_t* out_incremental_slot,
                                                         sol_io_ctx_t* io_ctx);
+static sol_slot_t validator_snapshot_auto_prefer_rpc_lag_slots(void);
 
 static bool
 snapshot_rpc_fallback_enabled(void) {
     const char* env = getenv("SOL_SNAPSHOT_ALLOW_RPC_FALLBACK");
-    return (env && env[0] != '\0' && strcmp(env, "0") != 0);
+    /* RPC fallback is enabled by default when RPC snapshot sources are
+     * configured. Set SOL_SNAPSHOT_ALLOW_RPC_FALLBACK=0 to disable. */
+    if (!env || env[0] == '\0') return true;
+    return strcmp(env, "0") != 0;
 }
 
 static sol_err_t
@@ -1089,24 +1126,9 @@ auto_download_snapshot_archives_best_effort(const char* manifest_url,
         }
     }
 
-    /* Default behavior: remain snapshot-service-first (manifest-first).
-     *
-     * Automatic RPC preference is opt-in via SOL_SNAPSHOT_AUTO_PREFER_RPC_LAG_SLOTS.
-     * This keeps default bootstrap sourcing on the configured manifest service
-     * unless operators explicitly override. */
-    sol_slot_t auto_prefer_rpc_lag = 0;
-    const char* auto_prefer_rpc_env = getenv("SOL_SNAPSHOT_AUTO_PREFER_RPC_LAG_SLOTS");
-    if (auto_prefer_rpc_env && auto_prefer_rpc_env[0] != '\0') {
-        errno = 0;
-        char* end = NULL;
-        unsigned long long lag = strtoull(auto_prefer_rpc_env, &end, 10);
-        if (errno == 0 && end && end != auto_prefer_rpc_env) {
-            while (*end && isspace((unsigned char)*end)) end++;
-            if (*end == '\0') {
-                auto_prefer_rpc_lag = (sol_slot_t)lag;
-            }
-        }
-    }
+    /* Manifest-first by default, with automatic RPC freshness preference when
+     * lag crosses a threshold. */
+    sol_slot_t auto_prefer_rpc_lag = validator_snapshot_auto_prefer_rpc_lag_slots();
 
     if (!prefer_rpc &&
         have_manifest &&
@@ -1341,6 +1363,9 @@ auto_download_incremental_snapshot_for_base_best_effort(const char* manifest_url
     const bool have_manifest = (manifest_url && manifest_url[0] != '\0');
     const bool allow_rpc_fallback = (!have_manifest) || snapshot_rpc_fallback_enabled();
 
+    sol_available_snapshot_t manifest_incr = {0};
+    bool have_manifest_incr = false;
+
     if (have_manifest) {
         sol_available_snapshot_t full = {0};
         sol_available_snapshot_t incr = {0};
@@ -1352,23 +1377,19 @@ auto_download_incremental_snapshot_for_base_best_effort(const char* manifest_url
             incr.url &&
             incr.base_slot == base_slot &&
             incr.slot > base_slot) {
-            err = sol_snapshot_download(&incr, &opts, out_incremental_path, out_incremental_path_len);
-            if (err == SOL_OK && out_incremental_slot) {
-                *out_incremental_slot = incr.slot;
-            }
-            sol_available_snapshot_free(&full);
-            sol_available_snapshot_free(&incr);
-            return err;
+            manifest_incr = incr;
+            incr.url = NULL; /* transfer ownership */
+            have_manifest_incr = true;
         }
 
         sol_available_snapshot_free(&full);
         sol_available_snapshot_free(&incr);
     }
 
-    if (allow_rpc_fallback && rpc_urls && rpc_url_count > 0) {
-        sol_available_snapshot_t best_incr = {0};
-        bool have_best = false;
+    sol_available_snapshot_t best_incr = {0};
+    bool have_best = false;
 
+    if (allow_rpc_fallback && rpc_urls && rpc_url_count > 0) {
         for (size_t i = 0; i < rpc_url_count; i++) {
             const char* rpc_url = rpc_urls[i];
             if (!rpc_url || rpc_url[0] == '\0') continue;
@@ -1405,18 +1426,38 @@ auto_download_incremental_snapshot_for_base_best_effort(const char* manifest_url
 
             sol_available_snapshots_free(candidates, 4);
         }
-
-        if (have_best && best_incr.url) {
-            sol_err_t err = sol_snapshot_download(&best_incr, &opts, out_incremental_path, out_incremental_path_len);
-            if (err == SOL_OK && out_incremental_slot) {
-                *out_incremental_slot = best_incr.slot;
-            }
-            sol_available_snapshot_free(&best_incr);
-            return err;
-        }
-
-        sol_available_snapshot_free(&best_incr);
     }
+
+    /* Choose the freshest incremental for this base slot across all sources. */
+    sol_available_snapshot_t* selected = NULL;
+    if (have_manifest_incr && have_best) {
+        if (best_incr.slot > manifest_incr.slot) {
+            selected = &best_incr;
+            sol_log_info("Incremental snapshot refresh: preferring fresher RPC incremental slot %lu over service slot %lu (base=%lu)",
+                         (unsigned long)best_incr.slot,
+                         (unsigned long)manifest_incr.slot,
+                         (unsigned long)base_slot);
+        } else {
+            selected = &manifest_incr;
+        }
+    } else if (have_best) {
+        selected = &best_incr;
+    } else if (have_manifest_incr) {
+        selected = &manifest_incr;
+    }
+
+    if (selected && selected->url) {
+        sol_err_t err = sol_snapshot_download(selected, &opts, out_incremental_path, out_incremental_path_len);
+        if (err == SOL_OK && out_incremental_slot) {
+            *out_incremental_slot = selected->slot;
+        }
+        sol_available_snapshot_free(&manifest_incr);
+        sol_available_snapshot_free(&best_incr);
+        return err;
+    }
+
+    sol_available_snapshot_free(&manifest_incr);
+    sol_available_snapshot_free(&best_incr);
 
     return SOL_ERR_NOTFOUND;
 }
@@ -1437,6 +1478,8 @@ validator_maybe_apply_followup_incremental_snapshot(validator_t* v,
                                                     char* const* rpc_urls,
                                                     size_t rpc_url_count,
                                                     const char* archive_dir) {
+    static sol_slot_t s_followup_last_applied_or_checked_slot = 0;
+
     if (!v || !io_root_bank || !*io_root_bank || !v->accounts_db || !archive_dir) {
         return SOL_OK;
     }
@@ -1447,6 +1490,9 @@ validator_maybe_apply_followup_incremental_snapshot(validator_t* v,
         return SOL_OK;
     }
     if (cur_slot < base_slot) {
+        return SOL_OK;
+    }
+    if (cur_slot <= s_followup_last_applied_or_checked_slot) {
         return SOL_OK;
     }
 
@@ -1465,8 +1511,9 @@ validator_maybe_apply_followup_incremental_snapshot(validator_t* v,
 
     char dl_incr_path[PATH_MAX] = {0};
     sol_slot_t dl_incr_slot = 0;
-    if ((manifest_url && manifest_url[0] != '\0') ||
-        (rpc_urls && rpc_url_count > 0)) {
+    if (validator_snapshot_network_downloads_enabled() &&
+        ((manifest_url && manifest_url[0] != '\0') ||
+         (rpc_urls && rpc_url_count > 0))) {
         sol_err_t dl_err = auto_download_incremental_snapshot_for_base_best_effort(
             manifest_url,
             rpc_urls,
@@ -1503,6 +1550,7 @@ validator_maybe_apply_followup_incremental_snapshot(validator_t* v,
     }
 
     if (!apply_path || apply_slot <= cur_slot) {
+        s_followup_last_applied_or_checked_slot = cur_slot;
         return SOL_OK;
     }
 
@@ -1562,6 +1610,7 @@ validator_maybe_apply_followup_incremental_snapshot(validator_t* v,
                  (unsigned long)base_slot,
                  apply_path);
 
+    s_followup_last_applied_or_checked_slot = sol_bank_slot(new_bank);
     sol_bank_destroy(*io_root_bank);
     *io_root_bank = new_bank;
     return SOL_OK;
@@ -1631,6 +1680,84 @@ repair_shred_callback(const sol_shred_t* shred, void* ctx) {
     sol_tvu_t* tvu = (sol_tvu_t*)ctx;
     if (!tvu || !shred || !shred->raw_data || shred->raw_len == 0) return;
     sol_tvu_process_shred(tvu, shred->raw_data, shred->raw_len);
+}
+
+static void*
+gossip_pump_thread_main(void* arg) {
+    validator_t* v = (validator_t*)arg;
+    if (!v || !v->gossip) return NULL;
+
+    while (!g_shutdown && sol_gossip_is_running(v->gossip)) {
+        sol_err_t err = sol_gossip_run_once(v->gossip, 0);
+        if (err == SOL_ERR_SHUTDOWN) {
+            break;
+        }
+        sched_yield();
+    }
+
+    return NULL;
+}
+
+static void*
+turbine_pump_thread_main(void* arg) {
+    validator_t* v = (validator_t*)arg;
+    if (!v || !v->turbine) return NULL;
+
+    static int yield_cached = -1;
+    int do_yield = __atomic_load_n(&yield_cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(do_yield < 0, 0)) {
+        do_yield = 1;
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu >= 64) {
+            do_yield = 0;
+        }
+        const char* env = getenv("SOL_TURBINE_PUMP_YIELD");
+        if (env && env[0] != '\0') {
+            while (*env && isspace((unsigned char)*env)) env++;
+            if (*env == '0' || *env == 'n' || *env == 'N' || *env == 'f' || *env == 'F') {
+                do_yield = 0;
+            } else {
+                do_yield = 1;
+            }
+        }
+        __atomic_store_n(&yield_cached, do_yield, __ATOMIC_RELEASE);
+    }
+
+    while (!g_shutdown && sol_turbine_is_running(v->turbine)) {
+        sol_err_t err = sol_turbine_run_once(v->turbine, 0);
+        if (err == SOL_ERR_SHUTDOWN) {
+            break;
+        }
+        if (do_yield) {
+            sched_yield();
+        }
+    }
+
+    return NULL;
+}
+
+static size_t
+validator_turbine_pump_threads_target(void) {
+    const char* env = getenv("SOL_TURBINE_PUMP_THREADS");
+    if (env && env[0] != '\0') {
+        errno = 0;
+        char* end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (errno == 0 && end && end != env) {
+            while (*end && isspace((unsigned char)*end)) end++;
+            if (*end == '\0') {
+                if (parsed < 1ul) parsed = 1ul;
+                if (parsed > 32ul) parsed = 32ul;
+                return (size_t)parsed;
+            }
+        }
+    }
+
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) return 16u;
+    if (ncpu >= 64)  return 8u;
+    if (ncpu >= 32)  return 4u;
+    return 1u;
 }
 
 static void*
@@ -1791,7 +1918,7 @@ static void
         "Options:\n"
         "  -c, --config PATH         Path to configuration file (TOML format)\n"
         "  -i, --identity PATH       Path to identity keypair\n"
-        "  -v, --vote-account PATH   Path to vote account address file\n"
+        "  -v, --vote-account VALUE  Vote account (base58 pubkey or keypair JSON path)\n"
         "  -l, --ledger PATH         Path to ledger directory (default: ./ledger)\n"
         "  --rocksdb-path PATH       Path to RocksDB base directory (defaults to <ledger>/rocksdb when built with RocksDB)\n"
         "  --tower-path PATH         Path to tower persistence file (defaults to <ledger>/tower.bin)\n"
@@ -2274,6 +2401,66 @@ infer_cluster_network_name(void) {
     return "mainnet-beta";
 }
 
+static sol_slot_t
+validator_snapshot_auto_prefer_rpc_lag_slots(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* Manifest-first is stable, but if the manifest lags far behind RPC head
+     * we should automatically trust fresher RPC slot information for bootstrap
+     * target selection. Set to 0 to disable auto-prefer behavior. */
+    long lag = 256;
+    const char* env = getenv("SOL_SNAPSHOT_AUTO_PREFER_RPC_LAG_SLOTS");
+    if (env && env[0] != '\0') {
+        errno = 0;
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (errno == 0 && end && end != env) {
+            while (*end && isspace((unsigned char)*end)) end++;
+            if (*end == '\0') {
+                lag = parsed;
+            }
+        }
+    }
+
+    if (lag < 0) lag = 0;
+    if (lag > 10000000L) lag = 10000000L;
+    cached = lag;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+validator_snapshot_force_refresh_lag_slots(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* Safety rail: even when explicit auto-refresh lag threshold is disabled,
+     * force a refresh on severe bootstrap staleness so nodes do not spend many
+     * hours trying to repair historical gaps. Set to 0 to disable. */
+    long lag = 16384;
+    const char* env = getenv("SOL_AUTO_SNAPSHOT_FORCE_REFRESH_LAG_SLOTS");
+    if (env && env[0] != '\0') {
+        errno = 0;
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (errno == 0 && end && end != env) {
+            while (*end && isspace((unsigned char)*end)) end++;
+            if (*end == '\0') {
+                lag = parsed;
+            }
+        }
+    }
+
+    if (lag < 0) lag = 0;
+    if (lag > 10000000L) lag = 10000000L;
+    cached = lag;
+    return (sol_slot_t)cached;
+}
+
 static void
 validator_apply_implicit_defaults(void) {
     /* Entry point defaults */
@@ -2334,6 +2521,20 @@ validator_apply_implicit_defaults(void) {
                 }
             }
         }
+    }
+
+    if (g_config.snapshot_max_bootstrap_lag_slots == 0) {
+        sol_slot_t force_lag = validator_snapshot_force_refresh_lag_slots();
+        if (force_lag != 0) {
+            sol_log_warn("Auto snapshot lag threshold disabled, but severe-lag refresh guard is active at %lu slots "
+                         "(set SOL_AUTO_SNAPSHOT_FORCE_REFRESH_LAG_SLOTS=0 to disable)",
+                         (unsigned long)force_lag);
+        }
+    }
+
+    if (!validator_snapshot_network_downloads_enabled()) {
+        sol_log_warn("Auto snapshot network downloads disabled "
+                     "(SOL_AUTO_SNAPSHOT_ALLOW_NETWORK_DOWNLOAD=0)");
     }
 
 #ifdef SOL_HAS_ROCKSDB
@@ -3500,7 +3701,7 @@ validator_init(validator_t* v) {
     sol_pubkey_to_base58(&v->identity_pubkey, pubkey_str, sizeof(pubkey_str));
     sol_log_info("Identity: %s", pubkey_str);
 
-    /* Load vote account address */
+    /* Load vote account address (accept base58 pubkey, pubkey file, or keypair JSON). */
     v->vote_account_initialized = false;
     if (g_config.vote_account_path != NULL && !g_config.no_voting) {
         sol_log_info("Loading vote account (path or base58): %s", g_config.vote_account_path);
@@ -3508,6 +3709,15 @@ validator_init(validator_t* v) {
         if (err != SOL_OK) {
             /* Allow specifying a base58 pubkey string directly in config. */
             err = sol_pubkey_from_base58(g_config.vote_account_path, &v->vote_account);
+        }
+        if (err != SOL_OK) {
+            /* Also accept a keypair JSON file path and derive the pubkey. */
+            sol_keypair_t vote_kp;
+            sol_err_t kp_err = sol_ed25519_keypair_load(g_config.vote_account_path, &vote_kp);
+            if (kp_err == SOL_OK) {
+                sol_ed25519_pubkey_from_keypair(&vote_kp, &v->vote_account);
+                err = SOL_OK;
+            }
         }
         if (err != SOL_OK) {
             sol_log_error("Failed to load vote account: %s", sol_err_str(err));
@@ -3659,6 +3869,11 @@ validator_init(validator_t* v) {
         g_config.snapshot_manifest_url && g_config.snapshot_manifest_url[0] != '\0';
     bool have_snapshot_rpc_fallback =
         g_config.snapshot_rpc_urls && g_config.snapshot_rpc_urls_count > 0;
+    const bool snapshot_network_downloads_enabled =
+        validator_snapshot_network_downloads_enabled();
+    const bool can_auto_redownload =
+        snapshot_network_downloads_enabled &&
+        (have_snapshot_manifest || have_snapshot_rpc_fallback);
     if (have_snapshot_rpc_fallback) {
         sol_log_info("Snapshot RPC fallback enabled (%lu endpoints)",
                      (unsigned long)g_config.snapshot_rpc_urls_count);
@@ -3712,6 +3927,11 @@ validator_init(validator_t* v) {
 
         /* No local snapshot archives: download now. */
         if (!snapshot_path) {
+            if (!can_auto_redownload) {
+                sol_log_error("No local snapshot archives found and auto snapshot network downloads are disabled "
+                              "(set SOL_AUTO_SNAPSHOT_ALLOW_NETWORK_DOWNLOAD=1)");
+                return SOL_ERR_NOTFOUND;
+            }
             sol_err_t dl_err = auto_download_snapshot_archives_best_effort(
                 have_snapshot_manifest ? g_config.snapshot_manifest_url : NULL,
                 have_snapshot_rpc_fallback ? g_config.snapshot_rpc_urls : NULL,
@@ -3746,7 +3966,7 @@ validator_init(validator_t* v) {
 
         if (!used_bootstrap_state &&
             auto_snapshot_bootstrap &&
-            (have_snapshot_manifest || have_snapshot_rpc_fallback)) {
+            can_auto_redownload) {
             sol_slot_t manifest_best_slot = 0;
             sol_slot_t rpc_best_slot = 0;
 
@@ -3764,23 +3984,9 @@ validator_init(validator_t* v) {
             bool prefer_rpc_if_fresher =
                 (prefer_rpc_env && prefer_rpc_env[0] != '\0' && strcmp(prefer_rpc_env, "0") != 0);
 
-            /* Default: remain manifest-first for bootstrap target selection.
-             *
-             * Automatic RPC preference is opt-in via
-             * SOL_SNAPSHOT_AUTO_PREFER_RPC_LAG_SLOTS (>0). */
-            sol_slot_t auto_prefer_rpc_lag = 0;
-            const char* auto_prefer_rpc_env = getenv("SOL_SNAPSHOT_AUTO_PREFER_RPC_LAG_SLOTS");
-            if (auto_prefer_rpc_env && auto_prefer_rpc_env[0] != '\0') {
-                errno = 0;
-                char* end = NULL;
-                unsigned long long lag = strtoull(auto_prefer_rpc_env, &end, 10);
-                if (errno == 0 && end && end != auto_prefer_rpc_env) {
-                    while (*end && isspace((unsigned char)*end)) end++;
-                    if (*end == '\0') {
-                        auto_prefer_rpc_lag = (sol_slot_t)lag;
-                    }
-                }
-            }
+            /* Prefer manifest by default, but auto-select RPC freshness when
+             * manifest lag exceeds a threshold. */
+            sol_slot_t auto_prefer_rpc_lag = validator_snapshot_auto_prefer_rpc_lag_slots();
 
             if (have_snapshot_manifest && have_snapshot_rpc_fallback && rpc_best_slot != 0) {
                 if (prefer_rpc_if_fresher) {
@@ -3991,14 +4197,33 @@ validator_init(validator_t* v) {
 
 		                        if (existing_db && !used_bootstrap_state && best_bootstrap_slot != 0) {
 		                            const sol_slot_t max_bootstrap_lag = g_config.snapshot_max_bootstrap_lag_slots;
-		                            if (max_bootstrap_lag != 0 &&
-		                                best_bootstrap_slot > bs.slot &&
-		                                (best_bootstrap_slot - bs.slot) > max_bootstrap_lag) {
+                                    const sol_slot_t force_refresh_lag =
+                                        validator_snapshot_force_refresh_lag_slots();
+                                    const sol_slot_t bootstrap_lag =
+                                        (best_bootstrap_slot > bs.slot)
+                                            ? (best_bootstrap_slot - bs.slot)
+                                            : 0;
+                                    bool force_refresh = false;
+                                    bool severe_guard = false;
+                                    if (bootstrap_lag > 0) {
+                                        if (max_bootstrap_lag != 0 &&
+                                            bootstrap_lag > max_bootstrap_lag) {
+                                            force_refresh = true;
+                                        } else if (max_bootstrap_lag == 0 &&
+                                                   force_refresh_lag != 0 &&
+                                                   bootstrap_lag > force_refresh_lag) {
+                                            force_refresh = true;
+                                            severe_guard = true;
+                                        }
+                                    }
+
+		                            if (force_refresh) {
 	                                sol_log_warn("Persisted AccountsDB bootstrap state lags best snapshot slot by %lu "
-	                                             "slots (bootstrap=%lu best=%lu); attempting incremental refresh",
-	                                             (unsigned long)(best_bootstrap_slot - bs.slot),
+	                                             "slots (bootstrap=%lu best=%lu)%s; attempting incremental refresh",
+	                                             (unsigned long)bootstrap_lag,
 	                                             (unsigned long)bs.slot,
-	                                             (unsigned long)best_bootstrap_slot);
+	                                             (unsigned long)best_bootstrap_slot,
+                                                 severe_guard ? " (severe-lag guard)" : "");
 
 	                                sol_bank_t* refreshed_bank = NULL;
 	                                bool refreshed = false;
@@ -4056,7 +4281,7 @@ validator_init(validator_t* v) {
 		                                    sol_slot_t dl_incr_slot = 0;
 		                                    if (refresh_base_slot != 0 &&
 		                                        (incr_slot == 0 || incr_slot < best_bootstrap_slot) &&
-		                                        (have_snapshot_manifest || have_snapshot_rpc_fallback)) {
+		                                        can_auto_redownload) {
 		                                        sol_err_t dl_err =
 		                                            auto_download_incremental_snapshot_for_base_best_effort(
 		                                                have_snapshot_manifest ? g_config.snapshot_manifest_url : NULL,
@@ -4364,20 +4589,35 @@ validator_init(validator_t* v) {
             }
         }
 
-        const bool can_auto_redownload = have_snapshot_manifest || have_snapshot_rpc_fallback;
         if (!used_bootstrap_state) {
             if (auto_snapshot_bootstrap && best_bootstrap_slot != 0 && can_auto_redownload) {
                 const sol_slot_t max_snapshot_lag = g_config.snapshot_max_bootstrap_lag_slots;
+                const sol_slot_t force_refresh_lag = validator_snapshot_force_refresh_lag_slots();
                 sol_slot_t effective_slot = snapshot_effective_slot_from_paths(snapshot_path, incremental_snapshot_path);
-                if (max_snapshot_lag != 0 &&
-                    effective_slot != 0 &&
-                    best_bootstrap_slot > effective_slot &&
-                    (best_bootstrap_slot - effective_slot) > max_snapshot_lag) {
+                const sol_slot_t snapshot_lag =
+                    (effective_slot != 0 && best_bootstrap_slot > effective_slot)
+                        ? (best_bootstrap_slot - effective_slot)
+                        : 0;
+                bool force_redownload = false;
+                bool severe_guard = false;
+                if (snapshot_lag > 0) {
+                    if (max_snapshot_lag != 0 && snapshot_lag > max_snapshot_lag) {
+                        force_redownload = true;
+                    } else if (max_snapshot_lag == 0 &&
+                               force_refresh_lag != 0 &&
+                               snapshot_lag > force_refresh_lag) {
+                        force_redownload = true;
+                        severe_guard = true;
+                    }
+                }
+
+                if (force_redownload) {
                     sol_log_warn("Local snapshot archives lag best snapshot slot by %lu slots (local=%lu best=%lu); "
-                                 "re-downloading snapshot archives",
-                                 (unsigned long)(best_bootstrap_slot - effective_slot),
+                                 "re-downloading snapshot archives%s",
+                                 (unsigned long)snapshot_lag,
                                  (unsigned long)effective_slot,
-                                 (unsigned long)best_bootstrap_slot);
+                                 (unsigned long)best_bootstrap_slot,
+                                 severe_guard ? " (severe-lag guard)" : "");
 
                     const char* ledger_dir = g_config.ledger_path ? g_config.ledger_path : ".";
                     char archive_dir[PATH_MAX];
@@ -4797,7 +5037,27 @@ validator_init(validator_t* v) {
     maybe_autodiscover_shred_version_and_genesis_hash(root_bank);
 
     sol_bank_forks_config_t forks_config = SOL_BANK_FORKS_CONFIG_DEFAULT;
-    sol_log_info("Initializing bank forks...");
+    bool forks_cfg_env = false;
+    {
+        const char* env = getenv("SOL_BANK_FORKS_MAX_BANKS");
+        if (env && env[0] != '\0') {
+            errno = 0;
+            char* end = NULL;
+            unsigned long long parsed = strtoull(env, &end, 10);
+            if (errno == 0 && end && end != env) {
+                while (*end && isspace((unsigned char)*end)) end++;
+                if (*end == '\0') {
+                    if (parsed < 256ull) parsed = 256ull;
+                    if (parsed > 65536ull) parsed = 65536ull;
+                    forks_config.max_banks = (uint32_t)parsed;
+                    forks_cfg_env = true;
+                }
+            }
+        }
+    }
+    sol_log_info("Initializing bank forks (max_banks=%u)%s",
+                 forks_config.max_banks,
+                 forks_cfg_env ? " (env SOL_BANK_FORKS_MAX_BANKS)" : "");
     v->bank_forks = sol_bank_forks_new(root_bank, &forks_config);
     if (!v->bank_forks) {
         sol_log_error("Failed to create bank forks");
@@ -4817,6 +5077,16 @@ validator_init(validator_t* v) {
         return SOL_ERR_NOMEM;
     }
     sol_replay_set_callback(v->replay, validator_replay_slot_callback, v);
+
+    /* Avoid first-slot replay stalls from lazy tx-pool thread creation. */
+    uint64_t tx_pool_prewarm_t0 = monotonic_time_ns();
+    sol_bank_tx_pool_prewarm();
+    uint64_t tx_pool_prewarm_ns = monotonic_time_ns() - tx_pool_prewarm_t0;
+    if (tx_pool_prewarm_ns >= 1000000ULL) {
+        sol_log_info("Replay prewarm: tx pool ready in %.2fms",
+                     (double)tx_pool_prewarm_ns / 1000000.0);
+    }
+
     if (g_config.dev_halt_at_slot > 0) {
         sol_log_info("Dev halt armed at slot %lu", (unsigned long)g_config.dev_halt_at_slot);
     }
@@ -4918,11 +5188,14 @@ validator_init(validator_t* v) {
     /* Initialize repair */
     sol_log_info("Initializing repair service...");
     sol_repair_config_t repair_config = SOL_REPAIR_CONFIG_DEFAULT;
-    /* Keep repair responsive, but avoid queue-flood behavior from very low
-     * timeout + very high pending/retry settings on high-bandwidth hosts. */
-    repair_config.request_timeout_ms = 25;
+    /* Keep repair responsive on WAN RTT while avoiding timeout/flood churn from
+     * extremely aggressive timeout+retry settings. */
+    repair_config.request_timeout_ms = 50;
+    /* Very large pending tables inflate timeout scans and duplicate traffic
+     * under catchup. Keep defaults moderate and rely on env overrides for
+     * hardware-specific tuning. */
     repair_config.max_pending_requests = 32768;
-    repair_config.max_retries = 32;
+    repair_config.max_retries = 10;
 
     {
         const char* env = getenv("SOL_REPAIR_REQUEST_TIMEOUT_MS");
@@ -5158,6 +5431,14 @@ validator_start(validator_t* v) {
         sol_log_error("Failed to start gossip: %s", sol_err_str(err));
         return err;
     }
+    if (!v->gossip_pump_started) {
+        int rc = pthread_create(&v->gossip_pump_thread, NULL, gossip_pump_thread_main, v);
+        if (rc != 0) {
+            sol_log_error("Failed to start gossip pump thread: %s", strerror(rc));
+            return SOL_ERR_IO;
+        }
+        v->gossip_pump_started = true;
+    }
 
     /* Start turbine */
     sol_log_info("Starting turbine...");
@@ -5167,6 +5448,29 @@ validator_start(validator_t* v) {
     if (err != SOL_OK) {
         sol_log_error("Failed to start turbine: %s", sol_err_str(err));
         return err;
+    }
+    if (!v->turbine_pump_started) {
+        size_t target = validator_turbine_pump_threads_target();
+        v->turbine_pump_thread_count = 0u;
+
+        for (size_t i = 0; i < target; i++) {
+            int rc = pthread_create(&v->turbine_pump_threads[i], NULL, turbine_pump_thread_main, v);
+            if (rc != 0) {
+                sol_log_error("Failed to start turbine pump thread %lu/%lu: %s",
+                              (unsigned long)(i + 1u),
+                              (unsigned long)target,
+                              strerror(rc));
+                for (size_t j = 0; j < v->turbine_pump_thread_count; j++) {
+                    (void)pthread_join(v->turbine_pump_threads[j], NULL);
+                }
+                v->turbine_pump_thread_count = 0u;
+                return SOL_ERR_IO;
+            }
+            v->turbine_pump_thread_count++;
+        }
+
+        sol_log_info("Turbine pump threads: %lu", (unsigned long)v->turbine_pump_thread_count);
+        v->turbine_pump_started = true;
     }
 
     /* Start repair service */
@@ -5316,6 +5620,13 @@ validator_stop(validator_t* v) {
     if (v->turbine) {
         sol_turbine_stop(v->turbine);
     }
+    if (v->turbine_pump_started) {
+        for (size_t i = 0; i < v->turbine_pump_thread_count; i++) {
+            (void)pthread_join(v->turbine_pump_threads[i], NULL);
+        }
+        v->turbine_pump_thread_count = 0u;
+        v->turbine_pump_started = false;
+    }
 
     /* Stop repair */
     if (v->repair) {
@@ -5329,6 +5640,10 @@ validator_stop(validator_t* v) {
     /* Stop gossip */
     if (v->gossip) {
         sol_gossip_stop(v->gossip);
+    }
+    if (v->gossip_pump_started) {
+        (void)pthread_join(v->gossip_pump_thread, NULL);
+        v->gossip_pump_started = false;
     }
 
     sol_log_info("All services stopped");
@@ -6074,7 +6389,7 @@ validator_run(validator_t* v) {
         bool did_work = false;
 
         /* Pump gossip + repair sockets (both are non-blocking). */
-        if (v->gossip) {
+        if (v->gossip && !v->gossip_pump_started) {
             sol_err_t err = sol_gossip_run_once(v->gossip, 0);
             if (err == SOL_OK) did_work = true;
         }
@@ -6084,7 +6399,7 @@ validator_run(validator_t* v) {
         }
 
         /* Pump turbine/shred ingress */
-        if (v->turbine) {
+        if (v->turbine && !v->turbine_pump_started) {
             sol_err_t err = sol_turbine_run_once(v->turbine, 0);
             if (err == SOL_OK) did_work = true;
         }
@@ -6173,19 +6488,24 @@ validator_run(validator_t* v) {
             }
         }
 
-        /* Non-voting or fast-replay mode: advance root based on replay progress
-         * so bank_forks doesn't grow without bound. */
-        /* If we aren't actually voting (either via --no-voting or because no
-         * vote account is configured), fork-choice roots may not advance and
-         * AccountsDB fork chains can grow without bound, which tanks replay
-         * throughput. Keep the root moving in that case. */
-        if ((g_config.no_voting || g_config.fast_replay || !v->vote_account_initialized) &&
-            v->replay && v->bank_forks) {
+        /* Keep bank_forks bounded when root progression stalls.
+         *
+         * Baseline mode mirrors historical behavior for non-voting/fast-replay
+         * operation. Emergency mode can also engage during combined RPC+voting
+         * catchup when root is stuck and forks approach capacity. */
+        if (v->replay && v->bank_forks) {
             static uint64_t last_auto_root_ns = 0;
             static uint64_t auto_root_period_ns = 0;
             static sol_slot_t auto_root_window = 0;
+            static sol_slot_t auto_root_max_advance = 0;
             static bool auto_root_adaptive = true;
             static bool auto_root_cfg_logged = false;
+            static bool auto_root_emergency = true;
+            static uint64_t auto_root_emergency_stall_ns = 0;
+            static sol_slot_t auto_root_emergency_lag_slots = 0;
+            static sol_slot_t auto_root_emergency_headroom = 0;
+            static sol_slot_t emergency_last_root_slot = 0;
+            static uint64_t emergency_last_root_progress_ns = 0;
 
             if (auto_root_period_ns == 0) {
                 /* Root advancement commits AccountsDB deltas and can be
@@ -6244,16 +6564,122 @@ validator_run(validator_t* v) {
                 }
             }
 
-            if (last_auto_root_ns == 0 || (now_ns - last_auto_root_ns) >= auto_root_period_ns) {
+            if (auto_root_max_advance == 0) {
+                /* Bound per-cycle root jumps so one set_root call doesn't try to
+                 * merge thousands of slots and stall replay for seconds. */
+                sol_slot_t max_advance = 16u;
+                const char* env = getenv("SOL_AUTO_ROOT_MAX_ADVANCE");
+                if (env && env[0] != '\0') {
+                    errno = 0;
+                    char* end = NULL;
+                    unsigned long long parsed = strtoull(env, &end, 10);
+                    if (errno == 0 && end && end != env) {
+                        while (*end && isspace((unsigned char)*end)) end++;
+                        if (*end == '\0') {
+                            max_advance = (sol_slot_t)parsed;
+                        }
+                    }
+                }
+                if (max_advance < 8u) max_advance = 8u;
+                if (max_advance > 8192u) max_advance = 8192u;
+                auto_root_max_advance = max_advance;
+            }
+
+            if (auto_root_emergency_stall_ns == 0) {
+                uint64_t stall_ms = 30000u;
+                const char* stall_env = getenv("SOL_AUTO_ROOT_EMERGENCY_STALL_MS");
+                if (stall_env && stall_env[0] != '\0') {
+                    errno = 0;
+                    char* end = NULL;
+                    unsigned long long parsed = strtoull(stall_env, &end, 10);
+                    if (errno == 0 && end && end != stall_env) {
+                        while (*end && isspace((unsigned char)*end)) end++;
+                        if (*end == '\0') stall_ms = (uint64_t)parsed;
+                    }
+                }
+                if (stall_ms < 1000u) stall_ms = 1000u;
+                if (stall_ms > 300000u) stall_ms = 300000u;
+                auto_root_emergency_stall_ns = stall_ms * 1000ull * 1000ull;
+
+                sol_slot_t lag_slots = 256u;
+                const char* lag_env = getenv("SOL_AUTO_ROOT_EMERGENCY_LAG_SLOTS");
+                if (lag_env && lag_env[0] != '\0') {
+                    errno = 0;
+                    char* end = NULL;
+                    unsigned long long parsed = strtoull(lag_env, &end, 10);
+                    if (errno == 0 && end && end != lag_env) {
+                        while (*end && isspace((unsigned char)*end)) end++;
+                        if (*end == '\0') lag_slots = (sol_slot_t)parsed;
+                    }
+                }
+                if (lag_slots < 32u) lag_slots = 32u;
+                if (lag_slots > 16384u) lag_slots = 16384u;
+                auto_root_emergency_lag_slots = lag_slots;
+
+                sol_slot_t headroom = 64u;
+                const char* headroom_env = getenv("SOL_AUTO_ROOT_EMERGENCY_HEADROOM");
+                if (headroom_env && headroom_env[0] != '\0') {
+                    errno = 0;
+                    char* end = NULL;
+                    unsigned long long parsed = strtoull(headroom_env, &end, 10);
+                    if (errno == 0 && end && end != headroom_env) {
+                        while (*end && isspace((unsigned char)*end)) end++;
+                        if (*end == '\0') headroom = (sol_slot_t)parsed;
+                    }
+                }
+                if (headroom < 8u) headroom = 8u;
+                if (headroom > 1024u) headroom = 1024u;
+                auto_root_emergency_headroom = headroom;
+
+                const char* enable_env = getenv("SOL_AUTO_ROOT_EMERGENCY");
+                if (enable_env && enable_env[0] != '\0' && strcmp(enable_env, "0") == 0) {
+                    auto_root_emergency = false;
+                }
+            }
+
+            sol_slot_t current_root = sol_replay_root_slot(v->replay);
+            if (emergency_last_root_progress_ns == 0 || current_root != emergency_last_root_slot) {
+                emergency_last_root_slot = current_root;
+                emergency_last_root_progress_ns = now_ns;
+            }
+
+            bool baseline_auto_root_mode =
+                (g_config.no_voting || g_config.fast_replay || !v->vote_account_initialized);
+            bool emergency_auto_root_mode = false;
+            sol_slot_t highest_replayed = sol_replay_highest_replayed_slot(v->replay);
+            sol_slot_t root_lag = highest_replayed > current_root
+                ? (highest_replayed - current_root)
+                : 0;
+
+            if (!baseline_auto_root_mode && auto_root_emergency) {
+                size_t forks_count = sol_bank_forks_count(v->bank_forks);
+                size_t forks_capacity = sol_bank_forks_capacity(v->bank_forks);
+                bool forks_near_full = false;
+                if (forks_capacity > 0) {
+                    size_t threshold = (forks_capacity > (size_t)auto_root_emergency_headroom)
+                        ? (forks_capacity - (size_t)auto_root_emergency_headroom)
+                        : 1u;
+                    forks_near_full = forks_count >= threshold;
+                }
+
+                bool root_stalled =
+                    (emergency_last_root_progress_ns > 0) &&
+                    ((now_ns - emergency_last_root_progress_ns) >= auto_root_emergency_stall_ns);
+
+                bool voting_progress_blocked =
+                    (!v->snapshot_verified || !v->tower_initialized || votes_count == 0);
+
+                emergency_auto_root_mode = voting_progress_blocked &&
+                                           (forks_near_full ||
+                                            (root_stalled &&
+                                             root_lag >= auto_root_emergency_lag_slots));
+            }
+
+            if ((baseline_auto_root_mode || emergency_auto_root_mode) &&
+                (last_auto_root_ns == 0 || (now_ns - last_auto_root_ns) >= auto_root_period_ns)) {
                 last_auto_root_ns = now_ns;
 
-                sol_slot_t highest_replayed = sol_replay_highest_replayed_slot(v->replay);
-                sol_slot_t current_root = sol_replay_root_slot(v->replay);
-                sol_slot_t root_lag = highest_replayed > current_root
-                    ? (highest_replayed - current_root)
-                    : 0;
                 sol_slot_t effective_window = auto_root_window;
-
                 if (auto_root_adaptive) {
                     /* Tighten the root window under backlog to reduce fork depth. */
                     if (root_lag >= 2048u) effective_window = 16u;
@@ -6266,22 +6692,42 @@ validator_run(validator_t* v) {
 
                 if (!auto_root_cfg_logged) {
                     auto_root_cfg_logged = true;
-                    sol_log_info("Auto root config: window=%lu slots period_ms=%lu adaptive=%d%s",
+                    sol_log_info("Auto root config: window=%lu slots period_ms=%lu adaptive=%d "
+                                 "max_advance=%lu emergency=%d stall_ms=%lu lag_slots=%lu headroom=%lu%s",
                                  (unsigned long)auto_root_window,
                                  (unsigned long)(auto_root_period_ns / 1000000ull),
                                  auto_root_adaptive ? 1 : 0,
+                                 (unsigned long)auto_root_max_advance,
+                                 auto_root_emergency ? 1 : 0,
+                                 (unsigned long)(auto_root_emergency_stall_ns / 1000000ull),
+                                 (unsigned long)auto_root_emergency_lag_slots,
+                                 (unsigned long)auto_root_emergency_headroom,
                                  getenv("SOL_AUTO_ROOT_WINDOW") ? " (env SOL_AUTO_ROOT_WINDOW)" : "");
                 }
 
                 if (root_lag > effective_window) {
                     sol_slot_t target_root = highest_replayed - effective_window;
+                    if (target_root > current_root && auto_root_max_advance > 0) {
+                        sol_slot_t max_target = current_root + auto_root_max_advance;
+                        if (max_target < current_root || max_target > highest_replayed) {
+                            max_target = highest_replayed;
+                        }
+                        if (target_root > max_target) {
+                            target_root = max_target;
+                        }
+                    }
+                    if (target_root <= current_root) {
+                        continue;
+                    }
                     sol_err_t err = sol_replay_set_root(v->replay, target_root);
                     if (err == SOL_OK) {
-                        sol_log_info("Auto root advanced to slot %lu (highest_replayed=%lu lag=%lu window=%lu)",
+                        sol_log_info("Auto root advanced to slot %lu (highest_replayed=%lu lag=%lu "
+                                     "window=%lu mode=%s)",
                                      (unsigned long)target_root,
                                      (unsigned long)highest_replayed,
                                      (unsigned long)root_lag,
-                                     (unsigned long)effective_window);
+                                     (unsigned long)effective_window,
+                                     baseline_auto_root_mode ? "baseline" : "emergency");
                         if (v->blockstore) {
                             (void)sol_blockstore_set_rooted(v->blockstore, target_root);
                             bool slot_gate = (last_root_purge_slot == 0) ||
@@ -6874,6 +7320,7 @@ main(int argc, char* argv[]) {
     err = validator_start(&validator);
     if (err != SOL_OK) {
         sol_log_error("Failed to start validator: %s", sol_err_str(err));
+        validator_stop(&validator);
         validator_cleanup(&validator);
         return 1;
     }

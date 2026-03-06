@@ -17,6 +17,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -28,6 +29,49 @@
 #include <unistd.h>
 
 static uint64_t g_accounts_db_id_gen = 1;
+
+static inline uint64_t
+accounts_db_monotonic_ns(void) {
+    struct timespec ts = {0};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t
+appendvec_map_slow_threshold_ns(void) {
+    static int cached = 0;
+    static uint64_t threshold_ns = 0;
+    if (__builtin_expect(!cached, 0)) {
+        const char* env = getenv("SOL_APPENDVEC_MAP_SLOW_MS");
+        if (env && env[0] != '\0') {
+            char* end = NULL;
+            unsigned long long ms = strtoull(env, &end, 10);
+            if (end != env && ms > 0ull) {
+                threshold_ns = ms * 1000000ull;
+            }
+        }
+        cached = 1;
+    }
+    return threshold_ns;
+}
+
+static uint64_t
+appendvec_map_wait_slow_threshold_ns(void) {
+    static int cached = 0;
+    static uint64_t threshold_ns = 0;
+    if (__builtin_expect(!cached, 0)) {
+        const char* env = getenv("SOL_APPENDVEC_MAP_WAIT_SLOW_MS");
+        if (env && env[0] != '\0') {
+            char* end = NULL;
+            unsigned long long ms = strtoull(env, &end, 10);
+            if (end != env && ms > 0ull) {
+                threshold_ns = ms * 1000000ull;
+            }
+        }
+        cached = 1;
+    }
+    return threshold_ns;
+}
 
 /*
  * Hash table entry for account storage (legacy in-memory mode)
@@ -71,6 +115,7 @@ typedef struct {
     int      fd;
     uint8_t  writable;
     uint8_t  sealed;
+    uint8_t  map_inflight; /* another thread is currently mmap-ing this file */
     /* Current file end (bytes). Written with atomic ops by concurrent writers. */
     uint64_t size;
     uint8_t* map;      /* read-only mmap base (NULL if not mapped) */
@@ -333,6 +378,35 @@ accounts_db_can_use_owner_index(sol_accounts_db_t* root, const sol_pubkey_t* own
     if ((state & OWNER_INDEX_STATE_CORE) && owner_index_is_core_owner(owner)) {
         return true;
     }
+    return false;
+}
+
+typedef enum {
+    OWNER_TRACK_MODE_NONE = 0,
+    OWNER_TRACK_MODE_CORE = 1,
+    OWNER_TRACK_MODE_FULL = 2,
+} owner_track_mode_t;
+
+static owner_track_mode_t
+accounts_db_owner_track_mode(sol_accounts_db_t* root) {
+    if (!root || !root->owner_index_backend) return OWNER_TRACK_MODE_NONE;
+
+    uint8_t state = accounts_db_owner_index_state(root);
+    if (state & OWNER_INDEX_STATE_FULL) {
+        return OWNER_TRACK_MODE_FULL;
+    }
+    if (state & OWNER_INDEX_STATE_CORE) {
+        return OWNER_TRACK_MODE_CORE;
+    }
+    return OWNER_TRACK_MODE_NONE;
+}
+
+static inline bool
+accounts_db_should_track_owner_live(sol_accounts_db_t* db, const sol_pubkey_t* owner) {
+    if (!db || !owner) return false;
+    owner_track_mode_t mode = accounts_db_owner_track_mode(db);
+    if (mode == OWNER_TRACK_MODE_FULL) return true;
+    if (mode == OWNER_TRACK_MODE_CORE) return owner_index_is_core_owner(owner);
     return false;
 }
 
@@ -1797,6 +1871,73 @@ appendvec_get_fd(sol_accounts_db_t* db,
 }
 
 static sol_err_t
+appendvec_wait_for_inflight_map(sol_accounts_db_t* db,
+                                uint64_t file_key,
+                                const uint8_t** out_base,
+                                uint64_t* out_size) {
+    if (!db || !out_base || !out_size) return SOL_ERR_INVAL;
+
+    const uint64_t slow_wait_ns = appendvec_map_wait_slow_threshold_ns();
+    const uint64_t wait_t0 = slow_wait_ns ? accounts_db_monotonic_ns() : 0u;
+    uint32_t spins = 0;
+    for (;;) {
+        pthread_rwlock_rdlock(&db->appendvec_lock);
+        appendvec_file_t** curp =
+            (appendvec_file_t**)sol_map_get(db->appendvec_files, &file_key);
+        appendvec_file_t* cur = curp ? *curp : NULL;
+        if (cur && cur->map && cur->map_size != 0) {
+            *out_base = cur->map;
+            *out_size = cur->map_size;
+            pthread_rwlock_unlock(&db->appendvec_lock);
+            if (wait_t0) {
+                uint64_t waited_ns = accounts_db_monotonic_ns() - wait_t0;
+                if (waited_ns >= slow_wait_ns) {
+                    sol_log_info("appendvec_map_wait: file=%lu wait_ms=%.3f spins=%u result=ready",
+                                 (unsigned long)file_key,
+                                 (double)waited_ns / 1000000.0,
+                                 (unsigned)spins);
+                }
+            }
+            return SOL_OK;
+        }
+        bool inflight = (cur && cur->map_inflight != 0);
+        pthread_rwlock_unlock(&db->appendvec_lock);
+
+        if (!inflight) {
+            if (wait_t0) {
+                uint64_t waited_ns = accounts_db_monotonic_ns() - wait_t0;
+                if (waited_ns >= slow_wait_ns) {
+                    sol_log_info("appendvec_map_wait: file=%lu wait_ms=%.3f spins=%u result=gone",
+                                 (unsigned long)file_key,
+                                 (double)waited_ns / 1000000.0,
+                                 (unsigned)spins);
+                }
+            }
+            return SOL_ERR_NOTFOUND;
+        }
+
+        if (++spins < 256u) {
+            sched_yield();
+        } else {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000 };
+            nanosleep(&ts, NULL);
+        }
+        if (spins > 200000u) {
+            if (wait_t0) {
+                uint64_t waited_ns = accounts_db_monotonic_ns() - wait_t0;
+                if (waited_ns >= slow_wait_ns) {
+                    sol_log_warn("appendvec_map_wait: file=%lu wait_ms=%.3f spins=%u result=timeout",
+                                 (unsigned long)file_key,
+                                 (double)waited_ns / 1000000.0,
+                                 (unsigned)spins);
+                }
+            }
+            return SOL_ERR_TIMEOUT;
+        }
+    }
+}
+
+static sol_err_t
 appendvec_get_map_ro(sol_accounts_db_t* db,
                      uint64_t file_key,
                      const uint8_t** out_base,
@@ -1814,11 +1955,11 @@ appendvec_get_map_ro(sol_accounts_db_t* db,
     sol_err_t ferr = appendvec_get_fd(db, file_key, false, &fd, &ephemeral, NULL);
     if (ferr != SOL_OK) return ferr;
     if (fd < 0) return SOL_ERR_IO;
+
     if (ephemeral) {
         /* We're at the FD cache cap. Still try to mmap for fast account loads,
          * but don't keep the FD open. Store the mmap in the tracked entry so
          * subsequent loads avoid open/pread/close. */
-
         off_t end = lseek(fd, 0, SEEK_END);
         if (end < 0) {
             close(fd);
@@ -1832,8 +1973,124 @@ appendvec_get_map_ro(sol_accounts_db_t* db,
             close(fd);
             return SOL_ERR_TOO_LARGE;
         }
+        uint64_t cur_size = (uint64_t)end;
 
-        pthread_rwlock_wrlock(&db->appendvec_lock);
+        for (;;) {
+            pthread_rwlock_wrlock(&db->appendvec_lock);
+            appendvec_file_t** curp =
+                (appendvec_file_t**)sol_map_get(db->appendvec_files, &file_key);
+            appendvec_file_t* cur = curp ? *curp : NULL;
+            if (cur && cur->map && cur->map_size != 0) {
+                *out_base = cur->map;
+                *out_size = cur->map_size;
+                pthread_rwlock_unlock(&db->appendvec_lock);
+                close(fd);
+                return SOL_OK;
+            }
+
+            if (!cur) {
+                appendvec_file_t* f = sol_calloc(1, sizeof(*f));
+                if (!f) {
+                    pthread_rwlock_unlock(&db->appendvec_lock);
+                    close(fd);
+                    return SOL_ERR_NOMEM;
+                }
+                f->fd = -1;
+                f->writable = 0u;
+                f->sealed = 1u;
+                f->map_inflight = 0u;
+                __atomic_store_n(&f->size, cur_size, __ATOMIC_RELAXED);
+                f->map = NULL;
+                f->map_size = 0;
+
+                appendvec_file_t* tmp = f;
+                appendvec_file_t** slot =
+                    (appendvec_file_t**)sol_map_insert(db->appendvec_files, &file_key, &tmp);
+                if (!slot) {
+                    sol_free(f);
+                    pthread_rwlock_unlock(&db->appendvec_lock);
+                    close(fd);
+                    return SOL_ERR_NOMEM;
+                }
+                cur = f;
+            } else if (cur->writable) {
+                pthread_rwlock_unlock(&db->appendvec_lock);
+                close(fd);
+                return SOL_ERR_UNSUPPORTED;
+            } else if (__atomic_load_n(&cur->size, __ATOMIC_RELAXED) == 0u) {
+                __atomic_store_n(&cur->size, cur_size, __ATOMIC_RELAXED);
+            }
+            cur_size = __atomic_load_n(&cur->size, __ATOMIC_RELAXED);
+
+            if (cur->map_inflight) {
+                pthread_rwlock_unlock(&db->appendvec_lock);
+                sol_err_t werr =
+                    appendvec_wait_for_inflight_map(db, file_key, out_base, out_size);
+                if (werr == SOL_OK) {
+                    close(fd);
+                    return SOL_OK;
+                }
+                continue;
+            }
+
+            cur->map_inflight = 1u;
+            pthread_rwlock_unlock(&db->appendvec_lock);
+
+            size_t map_len = (size_t)cur_size;
+            const uint64_t slow_map_ns = appendvec_map_slow_threshold_ns();
+            uint64_t map_t0 = slow_map_ns ? accounts_db_monotonic_ns() : 0u;
+            void* map = mmap(NULL, map_len, PROT_READ, MAP_SHARED, fd, 0);
+            if (map_t0) {
+                uint64_t map_ns = accounts_db_monotonic_ns() - map_t0;
+                if (map_ns >= slow_map_ns) {
+                    sol_log_info("appendvec_map_slow: file=%lu ephemeral=1 size_mb=%.2f map_ms=%.3f ok=%d",
+                                 (unsigned long)file_key,
+                                 (double)map_len / (1024.0 * 1024.0),
+                                 (double)map_ns / 1000000.0,
+                                 map != MAP_FAILED);
+                }
+            }
+
+            pthread_rwlock_wrlock(&db->appendvec_lock);
+            curp = (appendvec_file_t**)sol_map_get(db->appendvec_files, &file_key);
+            cur = curp ? *curp : NULL;
+
+            if (cur && cur->map && cur->map_size != 0) {
+                *out_base = cur->map;
+                *out_size = cur->map_size;
+                if (cur->map_inflight) cur->map_inflight = 0u;
+                pthread_rwlock_unlock(&db->appendvec_lock);
+                if (map != MAP_FAILED) munmap(map, map_len);
+                close(fd);
+                return SOL_OK;
+            }
+
+            if (map != MAP_FAILED && cur && !cur->writable) {
+                cur->map = (uint8_t*)map;
+                cur->map_size = cur_size;
+                cur->sealed = 1u;
+                cur->writable = 0u;
+                cur->map_inflight = 0u;
+                *out_base = cur->map;
+                *out_size = cur->map_size;
+                pthread_rwlock_unlock(&db->appendvec_lock);
+                close(fd);
+                return SOL_OK;
+            }
+
+            if (cur) cur->map_inflight = 0u;
+            pthread_rwlock_unlock(&db->appendvec_lock);
+
+            if (map != MAP_FAILED) munmap(map, map_len);
+            close(fd);
+            return (map == MAP_FAILED) ? SOL_ERR_IO : SOL_ERR_UNSUPPORTED;
+        }
+    }
+
+    close(fd);
+
+    for (;;) {
+        pthread_rwlock_rdlock(&db->appendvec_lock);
         appendvec_file_t** curp =
             (appendvec_file_t**)sol_map_get(db->appendvec_files, &file_key);
         appendvec_file_t* cur = curp ? *curp : NULL;
@@ -1841,112 +2098,91 @@ appendvec_get_map_ro(sol_accounts_db_t* db,
             *out_base = cur->map;
             *out_size = cur->map_size;
             pthread_rwlock_unlock(&db->appendvec_lock);
-            close(fd);
+            return SOL_OK;
+        }
+        pthread_rwlock_unlock(&db->appendvec_lock);
+
+        pthread_rwlock_wrlock(&db->appendvec_lock);
+        curp = (appendvec_file_t**)sol_map_get(db->appendvec_files, &file_key);
+        cur = curp ? *curp : NULL;
+        if (cur && cur->map && cur->map_size != 0) {
+            *out_base = cur->map;
+            *out_size = cur->map_size;
+            pthread_rwlock_unlock(&db->appendvec_lock);
             return SOL_OK;
         }
 
-        if (!cur) {
-            appendvec_file_t* f = sol_calloc(1, sizeof(*f));
-            if (!f) {
-                pthread_rwlock_unlock(&db->appendvec_lock);
-                close(fd);
-                return SOL_ERR_NOMEM;
-            }
-            f->fd = -1;
-            f->writable = 0u;
-            f->sealed = 1u;
-            __atomic_store_n(&f->size, (uint64_t)end, __ATOMIC_RELAXED);
-            f->map = NULL;
-            f->map_size = 0;
-
-            appendvec_file_t* tmp = f;
-            appendvec_file_t** slot =
-                (appendvec_file_t**)sol_map_insert(db->appendvec_files, &file_key, &tmp);
-            if (!slot) {
-                sol_free(f);
-                pthread_rwlock_unlock(&db->appendvec_lock);
-                close(fd);
-                return SOL_ERR_NOMEM;
-            }
-            cur = f;
-        } else if (cur->writable) {
-            /* Don't mmap files that may grow. */
+        uint64_t cur_size = cur ? __atomic_load_n(&cur->size, __ATOMIC_RELAXED) : 0u;
+        if (!cur || cur->fd < 0 || cur_size == 0 || cur->writable) {
             pthread_rwlock_unlock(&db->appendvec_lock);
-            close(fd);
             return SOL_ERR_UNSUPPORTED;
-        } else if (__atomic_load_n(&cur->size, __ATOMIC_RELAXED) == 0u) {
-            __atomic_store_n(&cur->size, (uint64_t)end, __ATOMIC_RELAXED);
         }
 
-        uint64_t cur_size = __atomic_load_n(&cur->size, __ATOMIC_RELAXED);
-        size_t map_len = (size_t)cur_size;
-        void* map = mmap(NULL, map_len, PROT_READ, MAP_SHARED, fd, 0);
-        if (map == MAP_FAILED) {
+        if (cur->map_inflight) {
             pthread_rwlock_unlock(&db->appendvec_lock);
-            close(fd);
+            sol_err_t werr =
+                appendvec_wait_for_inflight_map(db, file_key, out_base, out_size);
+            if (werr == SOL_OK) return SOL_OK;
+            continue;
+        }
+
+        if (cur_size > (uint64_t)SIZE_MAX) {
+            pthread_rwlock_unlock(&db->appendvec_lock);
+            return SOL_ERR_TOO_LARGE;
+        }
+
+        int map_fd = dup(cur->fd);
+        if (map_fd < 0) {
+            pthread_rwlock_unlock(&db->appendvec_lock);
             return SOL_ERR_IO;
         }
-
-        cur->map = (uint8_t*)map;
-        cur->map_size = cur_size;
-        cur->sealed = 1u;
-        cur->writable = 0u;
-        *out_base = cur->map;
-        *out_size = cur->map_size;
+        size_t map_len = (size_t)cur_size;
+        cur->map_inflight = 1u;
         pthread_rwlock_unlock(&db->appendvec_lock);
-        close(fd);
-        return SOL_OK;
-    }
 
-    pthread_rwlock_rdlock(&db->appendvec_lock);
-    appendvec_file_t** curp =
-        (appendvec_file_t**)sol_map_get(db->appendvec_files, &file_key);
-    appendvec_file_t* cur = curp ? *curp : NULL;
-    if (cur && cur->map && cur->map_size != 0) {
-        *out_base = cur->map;
-        *out_size = cur->map_size;
+        const uint64_t slow_map_ns = appendvec_map_slow_threshold_ns();
+        uint64_t map_t0 = slow_map_ns ? accounts_db_monotonic_ns() : 0u;
+        void* map = mmap(NULL, map_len, PROT_READ, MAP_SHARED, map_fd, 0);
+        close(map_fd);
+        if (map_t0) {
+            uint64_t map_ns = accounts_db_monotonic_ns() - map_t0;
+            if (map_ns >= slow_map_ns) {
+                sol_log_info("appendvec_map_slow: file=%lu ephemeral=0 size_mb=%.2f map_ms=%.3f ok=%d",
+                             (unsigned long)file_key,
+                             (double)map_len / (1024.0 * 1024.0),
+                             (double)map_ns / 1000000.0,
+                             map != MAP_FAILED);
+            }
+        }
+
+        pthread_rwlock_wrlock(&db->appendvec_lock);
+        curp = (appendvec_file_t**)sol_map_get(db->appendvec_files, &file_key);
+        cur = curp ? *curp : NULL;
+        if (cur && cur->map && cur->map_size != 0) {
+            *out_base = cur->map;
+            *out_size = cur->map_size;
+            if (cur->map_inflight) cur->map_inflight = 0u;
+            pthread_rwlock_unlock(&db->appendvec_lock);
+            if (map != MAP_FAILED) munmap(map, map_len);
+            return SOL_OK;
+        }
+        if (map != MAP_FAILED && cur && !cur->writable) {
+            cur->map = (uint8_t*)map;
+            cur->map_size = cur_size;
+            cur->sealed = 1u;
+            cur->writable = 0u;
+            cur->map_inflight = 0u;
+            *out_base = cur->map;
+            *out_size = cur->map_size;
+            pthread_rwlock_unlock(&db->appendvec_lock);
+            return SOL_OK;
+        }
+        if (cur) cur->map_inflight = 0u;
         pthread_rwlock_unlock(&db->appendvec_lock);
-        return SOL_OK;
-    }
-    pthread_rwlock_unlock(&db->appendvec_lock);
 
-    pthread_rwlock_wrlock(&db->appendvec_lock);
-    curp = (appendvec_file_t**)sol_map_get(db->appendvec_files, &file_key);
-    cur = curp ? *curp : NULL;
-    if (cur && cur->map && cur->map_size != 0) {
-        *out_base = cur->map;
-        *out_size = cur->map_size;
-        pthread_rwlock_unlock(&db->appendvec_lock);
-        return SOL_OK;
+        if (map != MAP_FAILED) munmap(map, map_len);
+        return (map == MAP_FAILED) ? SOL_ERR_IO : SOL_ERR_UNSUPPORTED;
     }
-
-    /* Only map stable, read-only files. Writable appendvec files grow while
-     * running; keeping mmap in sync would require remapping. */
-    uint64_t cur_size = cur ? __atomic_load_n(&cur->size, __ATOMIC_RELAXED) : 0u;
-    if (!cur || cur->fd < 0 || cur_size == 0 || cur->writable) {
-        pthread_rwlock_unlock(&db->appendvec_lock);
-        return SOL_ERR_UNSUPPORTED;
-    }
-
-    if (cur_size > (uint64_t)SIZE_MAX) {
-        pthread_rwlock_unlock(&db->appendvec_lock);
-        return SOL_ERR_TOO_LARGE;
-    }
-
-    void* map = mmap(NULL, (size_t)cur_size, PROT_READ, MAP_SHARED, cur->fd, 0);
-    if (map == MAP_FAILED) {
-        pthread_rwlock_unlock(&db->appendvec_lock);
-        return SOL_ERR_IO;
-    }
-
-    cur->map = (uint8_t*)map;
-    cur->map_size = cur_size;
-    cur->sealed = 1u;
-    cur->writable = 0u;
-    *out_base = cur->map;
-    *out_size = cur->map_size;
-    pthread_rwlock_unlock(&db->appendvec_lock);
-    return SOL_OK;
 }
 
 sol_err_t
@@ -2542,9 +2778,11 @@ appendvec_load_account_meta_by_ref(sol_accounts_db_t* db,
                                    const sol_pubkey_t* expected_pubkey,
                                    const sol_accountsdb_appendvec_ref_v1_t* ref,
                                    uint64_t* out_lamports,
-                                   uint64_t* out_data_len) {
+                                   uint64_t* out_data_len,
+                                   uint64_t* out_rent_epoch) {
     if (out_lamports) *out_lamports = 0;
     if (out_data_len) *out_data_len = 0;
+    if (out_rent_epoch) *out_rent_epoch = 0;
     if (!db || !expected_pubkey || !ref) return SOL_ERR_INVAL;
 
     if (sol_hash_is_zero(&ref->account_hash)) {
@@ -2568,11 +2806,12 @@ appendvec_load_account_meta_by_ref(sol_accounts_db_t* db,
 
     uint64_t lamports = 0;
     uint64_t data_len_u64 = 0;
+    uint64_t rent_epoch = 0;
     if (!appendvec_parse_record_header_any(hdr, sizeof(hdr),
                                            expected_pubkey,
                                            NULL,
                                            &lamports,
-                                           NULL,
+                                           &rent_epoch,
                                            NULL,
                                            &data_len_u64,
                                            NULL,
@@ -2588,6 +2827,7 @@ appendvec_load_account_meta_by_ref(sol_accounts_db_t* db,
 
     if (out_lamports) *out_lamports = lamports;
     if (out_data_len) *out_data_len = data_len_u64;
+    if (out_rent_epoch) *out_rent_epoch = rent_epoch;
     ret = SOL_OK;
 
 cleanup:
@@ -2853,7 +3093,7 @@ accounts_db_lookup_meta_local(sol_accounts_db_t* db,
 
             uint64_t lamports = 0;
             uint64_t data_len = 0;
-            sol_err_t merr = appendvec_load_account_meta_by_ref(db, pubkey, &ref, &lamports, &data_len);
+            sol_err_t merr = appendvec_load_account_meta_by_ref(db, pubkey, &ref, &lamports, &data_len, NULL);
             if (merr == SOL_OK) {
                 out->found = true;
                 out->lamports = lamports;
@@ -2944,6 +3184,217 @@ accounts_db_lookup_meta_visible(sol_accounts_db_t* db,
     }
 
     return false;
+}
+
+typedef struct {
+    bool     found;      /* local layer has a non-tombstone account */
+    bool     local_miss; /* local layer missing and should consult parent */
+    uint64_t lamports;
+    uint64_t data_len;
+    uint64_t rent_epoch;
+} accounts_db_rent_meta_lookup_t;
+
+static sol_err_t
+accounts_db_lookup_rent_meta_local(sol_accounts_db_t* db,
+                                   const sol_pubkey_t* pubkey,
+                                   accounts_db_rent_meta_lookup_t* out) {
+    if (!out) return SOL_ERR_INVAL;
+    out->found = false;
+    out->local_miss = true;
+    out->lamports = 0;
+    out->data_len = 0;
+    out->rent_epoch = 0;
+    if (!db || !pubkey) return SOL_OK;
+
+    if (db->backend) {
+        if (db->config.storage_type == SOL_ACCOUNTS_STORAGE_APPENDVEC &&
+            db->appendvec_index) {
+            sol_appendvec_index_val_t v = {0};
+            if (sol_appendvec_index_get(db->appendvec_index, pubkey, &v)) {
+                out->local_miss = false;
+                if (v.lamports == 0 || sol_hash_is_zero(&v.leaf_hash)) {
+                    out->found = false;
+                    return SOL_OK;
+                }
+                sol_accountsdb_appendvec_ref_v1_t ref = {
+                    .file_key = v.file_key,
+                    .record_offset = v.record_offset,
+                    .account_hash = v.leaf_hash,
+                };
+                uint64_t lamports = 0;
+                uint64_t data_len = 0;
+                uint64_t rent_epoch = 0;
+                sol_err_t merr = appendvec_load_account_meta_by_ref(db,
+                                                                    pubkey,
+                                                                    &ref,
+                                                                    &lamports,
+                                                                    &data_len,
+                                                                    &rent_epoch);
+                if (merr == SOL_OK) {
+                    out->found = true;
+                    out->lamports = lamports;
+                    out->data_len = data_len;
+                    out->rent_epoch = rent_epoch;
+                    return SOL_OK;
+                }
+                if (merr == SOL_ERR_NOTFOUND) {
+                    out->found = false;
+                    return SOL_OK;
+                }
+                return merr;
+            }
+        }
+
+        uint8_t* value = NULL;
+        size_t value_len = 0;
+        sol_err_t err = db->backend->get(db->backend->ctx,
+                                         pubkey->bytes,
+                                         sizeof(pubkey->bytes),
+                                         &value,
+                                         &value_len);
+        if (err != SOL_OK || !value) {
+            if (value) sol_free(value);
+            out->local_miss = true;
+            return SOL_OK;
+        }
+
+        out->local_miss = false;
+        const uint8_t* payload = NULL;
+        size_t payload_len = 0;
+        decode_backend_value(value,
+                             value_len,
+                             NULL,
+                             NULL,
+                             &payload,
+                             &payload_len);
+
+        if (db->config.storage_type == SOL_ACCOUNTS_STORAGE_APPENDVEC) {
+            sol_accountsdb_appendvec_ref_v1_t ref = {0};
+            if (!appendvec_ref_decode(payload, payload_len, &ref)) {
+                sol_free(value);
+                return SOL_ERR_TRUNCATED;
+            }
+            if (sol_hash_is_zero(&ref.account_hash)) {
+                out->found = false;
+                sol_free(value);
+                return SOL_OK;
+            }
+
+            uint64_t lamports = 0;
+            uint64_t data_len = 0;
+            uint64_t rent_epoch = 0;
+            sol_err_t merr = appendvec_load_account_meta_by_ref(db,
+                                                                pubkey,
+                                                                &ref,
+                                                                &lamports,
+                                                                &data_len,
+                                                                &rent_epoch);
+            sol_free(value);
+            if (merr == SOL_OK) {
+                out->found = true;
+                out->lamports = lamports;
+                out->data_len = data_len;
+                out->rent_epoch = rent_epoch;
+                return SOL_OK;
+            }
+            if (merr == SOL_ERR_NOTFOUND) {
+                out->found = false;
+                return SOL_OK;
+            }
+            return merr;
+        }
+
+        sol_account_t* account = sol_account_alloc();
+        if (!account) {
+            sol_free(value);
+            return SOL_ERR_NOMEM;
+        }
+        size_t consumed = 0;
+        sol_err_t derr = sol_account_deserialize(account, payload, payload_len, &consumed);
+        sol_free(value);
+        if (derr != SOL_OK) {
+            sol_account_destroy(account);
+            return derr;
+        }
+        if (account->meta.lamports == 0) {
+            sol_account_destroy(account);
+            out->found = false;
+            return SOL_OK;
+        }
+        out->found = true;
+        out->lamports = account->meta.lamports;
+        out->data_len = account->meta.data_len;
+        out->rent_epoch = (uint64_t)account->meta.rent_epoch;
+        sol_account_destroy(account);
+        return SOL_OK;
+    }
+
+    pthread_rwlock_rdlock(&db->lock);
+    size_t idx = pubkey_hash(pubkey, db->bucket_count);
+    size_t stripe = stripe_for_bucket(db, idx);
+    if (db->stripe_locks) {
+        pthread_rwlock_rdlock(&db->stripe_locks[stripe]);
+    }
+
+    sol_account_entry_t* entry = find_entry(db->buckets[idx], pubkey);
+    if (!entry) {
+        out->local_miss = true;
+        out->found = false;
+    } else {
+        out->local_miss = false;
+        if (entry->account) {
+            out->found = true;
+            out->lamports = entry->account->meta.lamports;
+            out->data_len = entry->account->meta.data_len;
+            out->rent_epoch = (uint64_t)entry->account->meta.rent_epoch;
+        } else {
+            out->found = false;
+        }
+    }
+
+    if (db->stripe_locks) {
+        pthread_rwlock_unlock(&db->stripe_locks[stripe]);
+    }
+    pthread_rwlock_unlock(&db->lock);
+    return SOL_OK;
+}
+
+sol_err_t
+sol_accounts_db_lookup_visible_rent_meta(sol_accounts_db_t* db,
+                                         const sol_pubkey_t* pubkey,
+                                         bool* out_found,
+                                         uint64_t* out_lamports,
+                                         uint64_t* out_data_len,
+                                         uint64_t* out_rent_epoch) {
+    if (out_found) *out_found = false;
+    if (out_lamports) *out_lamports = 0;
+    if (out_data_len) *out_data_len = 0;
+    if (out_rent_epoch) *out_rent_epoch = 0;
+    if (!db || !pubkey) return SOL_ERR_INVAL;
+
+    accounts_db_rent_meta_lookup_t m = {0};
+    sol_err_t err = accounts_db_lookup_rent_meta_local(db, pubkey, &m);
+    if (err != SOL_OK) return err;
+
+    if (m.found) {
+        if (out_found) *out_found = true;
+        if (out_lamports) *out_lamports = m.lamports;
+        if (out_data_len) *out_data_len = m.data_len;
+        if (out_rent_epoch) *out_rent_epoch = m.rent_epoch;
+        return SOL_OK;
+    }
+
+    if (m.local_miss && db->parent) {
+        return sol_accounts_db_lookup_visible_rent_meta(db->parent,
+                                                        pubkey,
+                                                        out_found,
+                                                        out_lamports,
+                                                        out_data_len,
+                                                        out_rent_epoch);
+    }
+
+    if (out_found) *out_found = false;
+    return SOL_OK;
 }
 
 sol_accounts_db_t*
@@ -3189,10 +3640,22 @@ sol_accounts_db_new(const sol_accounts_db_config_t* config) {
             sol_free(db);
             return NULL;
         }
+
+        pthread_rwlockattr_t stripe_lock_attr;
+        pthread_rwlockattr_t* stripe_lock_attr_p = NULL;
+        if (pthread_rwlockattr_init(&stripe_lock_attr) == 0) {
+#if defined(SOL_OS_LINUX) && defined(__GLIBC__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
+            (void)pthread_rwlockattr_setkind_np(&stripe_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+            stripe_lock_attr_p = &stripe_lock_attr;
+        }
         for (size_t i = 0; i < stripes; i++) {
-            if (pthread_rwlock_init(&db->stripe_locks[i], NULL) != 0) {
+            if (pthread_rwlock_init(&db->stripe_locks[i], stripe_lock_attr_p) != 0) {
                 for (size_t j = 0; j < i; j++) {
                     pthread_rwlock_destroy(&db->stripe_locks[j]);
+                }
+                if (stripe_lock_attr_p) {
+                    (void)pthread_rwlockattr_destroy(&stripe_lock_attr);
                 }
                 sol_free(db->stripe_locks);
                 db->stripe_locks = NULL;
@@ -3204,6 +3667,9 @@ sol_accounts_db_new(const sol_accounts_db_config_t* config) {
                 sol_free(db);
                 return NULL;
             }
+        }
+        if (stripe_lock_attr_p) {
+            (void)pthread_rwlockattr_destroy(&stripe_lock_attr);
         }
 
         if (!db->config.quiet) {
@@ -3234,12 +3700,27 @@ sol_accounts_db_new(const sol_accounts_db_config_t* config) {
             sol_accounts_db_destroy(db);
             return NULL;
         }
+
+        pthread_rwlockattr_t stripe_lock_attr;
+        pthread_rwlockattr_t* stripe_lock_attr_p = NULL;
+        if (pthread_rwlockattr_init(&stripe_lock_attr) == 0) {
+#if defined(SOL_OS_LINUX) && defined(__GLIBC__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
+            (void)pthread_rwlockattr_setkind_np(&stripe_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+            stripe_lock_attr_p = &stripe_lock_attr;
+        }
         for (size_t i = 0; i < stripes; i++) {
-            if (pthread_rwlock_init(&db->stripe_locks[i], NULL) != 0) {
+            if (pthread_rwlock_init(&db->stripe_locks[i], stripe_lock_attr_p) != 0) {
+                if (stripe_lock_attr_p) {
+                    (void)pthread_rwlockattr_destroy(&stripe_lock_attr);
+                }
                 sol_log_error("Failed to init AccountsDB stripe lock");
                 sol_accounts_db_destroy(db);
                 return NULL;
             }
+        }
+        if (stripe_lock_attr_p) {
+            (void)pthread_rwlockattr_destroy(&stripe_lock_attr);
         }
 
         if (!db->config.quiet) {
@@ -4207,8 +4688,36 @@ sol_accounts_db_store_versioned(sol_accounts_db_t* db,
             uint64_t existing_lamports = 0;
             uint64_t existing_data_len = 0;
             bool existed_visible = false;
+            bool existing_idx_hit = false;
+            sol_appendvec_index_val_t existing_idx = {0};
 
-            if (db->owner_reverse_backend) {
+            /* Hot path: avoid extra RocksDB reads on every store by sourcing
+             * previous account metadata directly from the in-memory AppendVec index. */
+            if (db->appendvec_index &&
+                sol_appendvec_index_get(db->appendvec_index, pubkey, &existing_idx)) {
+                existing_idx_hit = true;
+
+                if (write_version != 0 &&
+                    (existing_idx.write_version > write_version ||
+                     (existing_idx.write_version == write_version && existing_idx.slot >= slot))) {
+                    ret = SOL_OK;
+                    goto out_backend;
+                }
+
+                existing_rev_found = true;
+                existing_rev.owner = existing_idx.owner;
+                existing_rev.lamports = existing_idx.lamports;
+                existing_rev.data_len = existing_idx.data_len;
+
+                if (existing_idx.lamports != 0 && !sol_hash_is_zero(&existing_idx.leaf_hash)) {
+                    existed_visible = true;
+                    existing_owner_ok = true;
+                    existing_lamports = existing_idx.lamports;
+                    existing_data_len = existing_idx.data_len;
+                }
+            }
+
+            if (!existing_idx_hit && db->owner_reverse_backend) {
                 sol_err_t rerr = owner_reverse_get(db->owner_reverse_backend,
                                                    pubkey,
                                                    &existing_rev,
@@ -4228,7 +4737,7 @@ sol_accounts_db_store_versioned(sol_accounts_db_t* db,
                 }
             }
 
-            if (write_version != 0) {
+            if (write_version != 0 && !existing_idx_hit) {
                 uint8_t* existing_value = NULL;
                 size_t existing_value_len = 0;
                 sol_err_t gerr = db->backend->get(db->backend->ctx,
@@ -4305,17 +4814,25 @@ sol_accounts_db_store_versioned(sol_accounts_db_t* db,
 
             if (db->owner_index_backend) {
                 const sol_pubkey_t* new_owner = &account->meta.owner;
-                if (existed_visible && existing_owner_ok && !sol_pubkey_eq(&existing_rev.owner, new_owner)) {
+                const bool track_new_owner = accounts_db_should_track_owner_live(db, new_owner);
+                const bool track_old_owner =
+                    existed_visible && existing_owner_ok &&
+                    accounts_db_should_track_owner_live(db, &existing_rev.owner);
+
+                if (track_old_owner &&
+                    (!track_new_owner || !sol_pubkey_eq(&existing_rev.owner, new_owner))) {
                     sol_err_t derr = owner_index_del(db->owner_index_backend, &existing_rev.owner, pubkey);
                     if (derr != SOL_OK) {
                         ret = derr;
                         goto out_backend;
                     }
                 }
-                sol_err_t ierr = owner_index_put(db->owner_index_backend, new_owner, pubkey);
-                if (ierr != SOL_OK) {
-                    ret = ierr;
-                    goto out_backend;
+                if (track_new_owner) {
+                    sol_err_t ierr = owner_index_put(db->owner_index_backend, new_owner, pubkey);
+                    if (ierr != SOL_OK) {
+                        ret = ierr;
+                        goto out_backend;
+                    }
                 }
             }
 
@@ -4461,17 +4978,25 @@ sol_accounts_db_store_versioned(sol_accounts_db_t* db,
 
             if (db->owner_index_backend) {
                 const sol_pubkey_t* new_owner = &account->meta.owner;
-                if (existed_visible && existing_owner_ok && !sol_pubkey_eq(&existing_rev.owner, new_owner)) {
+                const bool track_new_owner = accounts_db_should_track_owner_live(db, new_owner);
+                const bool track_old_owner =
+                    existed_visible && existing_owner_ok &&
+                    accounts_db_should_track_owner_live(db, &existing_rev.owner);
+
+                if (track_old_owner &&
+                    (!track_new_owner || !sol_pubkey_eq(&existing_rev.owner, new_owner))) {
                     sol_err_t derr = owner_index_del(db->owner_index_backend, &existing_rev.owner, pubkey);
                     if (derr != SOL_OK) {
                         ret = derr;
                         goto out_backend;
                     }
                 }
-                sol_err_t perr = owner_index_put(db->owner_index_backend, new_owner, pubkey);
-                if (perr != SOL_OK) {
-                    ret = perr;
-                    goto out_backend;
+                if (track_new_owner) {
+                    sol_err_t perr = owner_index_put(db->owner_index_backend, new_owner, pubkey);
+                    if (perr != SOL_OK) {
+                        ret = perr;
+                        goto out_backend;
+                    }
                 }
             }
 
@@ -4775,8 +5300,33 @@ sol_accounts_db_delete_versioned(sol_accounts_db_t* db,
             bool existing_owner_ok = false;
             uint64_t existing_lamports = 0;
             uint64_t existing_data_len = 0;
+            bool existing_idx_hit = false;
+            sol_appendvec_index_val_t existing_idx = {0};
 
-            if (db->owner_reverse_backend) {
+            if (db->appendvec_index &&
+                sol_appendvec_index_get(db->appendvec_index, pubkey, &existing_idx)) {
+                existing_idx_hit = true;
+
+                if (write_version != 0 &&
+                    (existing_idx.write_version > write_version ||
+                     (existing_idx.write_version == write_version && existing_idx.slot >= slot))) {
+                    ret = SOL_OK;
+                    goto out_backend;
+                }
+
+                existing_rev_found = true;
+                existing_rev.owner = existing_idx.owner;
+                existing_rev.lamports = existing_idx.lamports;
+                existing_rev.data_len = existing_idx.data_len;
+
+                if (existing_idx.lamports != 0 && !sol_hash_is_zero(&existing_idx.leaf_hash)) {
+                    existing_owner_ok = true;
+                    existing_lamports = existing_idx.lamports;
+                    existing_data_len = existing_idx.data_len;
+                }
+            }
+
+            if (!existing_idx_hit && db->owner_reverse_backend) {
                 sol_err_t rerr = owner_reverse_get(db->owner_reverse_backend,
                                                    pubkey,
                                                    &existing_rev,
@@ -4795,7 +5345,7 @@ sol_accounts_db_delete_versioned(sol_accounts_db_t* db,
                 }
             }
 
-            if (write_version != 0) {
+            if (write_version != 0 && !existing_idx_hit) {
                 uint8_t* existing_value = NULL;
                 size_t existing_value_len = 0;
                 sol_err_t gerr = db->backend->get(db->backend->ctx,
@@ -4852,7 +5402,8 @@ sol_accounts_db_delete_versioned(sol_accounts_db_t* db,
                 atomic_sub_u64(&db->stats.total_data_bytes, existing_data_len);
             }
 
-            if (db->owner_index_backend && existed_visible && existing_owner_ok) {
+            if (db->owner_index_backend && existed_visible && existing_owner_ok &&
+                accounts_db_should_track_owner_live(db, &existing_rev.owner)) {
                 sol_err_t derr = owner_index_del(db->owner_index_backend, &existing_rev.owner, pubkey);
                 if (derr != SOL_OK) {
                     ret = derr;
@@ -4965,7 +5516,8 @@ sol_accounts_db_delete_versioned(sol_accounts_db_t* db,
                 atomic_sub_u64(&db->stats.total_data_bytes, existing_data_len);
             }
 
-            if (db->owner_index_backend && existed_visible && existing_owner_ok) {
+            if (db->owner_index_backend && existed_visible && existing_owner_ok &&
+                accounts_db_should_track_owner_live(db, &existing_rev.owner)) {
                 sol_err_t derr = owner_index_del(db->owner_index_backend, &existing_rev.owner, pubkey);
                 if (derr != SOL_OK) {
                     ret = derr;
@@ -6860,6 +7412,18 @@ sol_accounts_db_snapshot_local(sol_accounts_db_t* db,
      * exclusive lock while snapshotting bucket chains without stripe locks. */
     pthread_rwlock_wrlock(&db->lock);
     out->parent = db->parent;
+    if (db->account_count > 0) {
+        if (db->account_count > (SIZE_MAX / sizeof(*out->entries))) {
+            err = SOL_ERR_OVERFLOW;
+        } else {
+            cap = db->account_count;
+            out->entries = sol_alloc(cap * sizeof(*out->entries));
+            if (!out->entries) {
+                err = SOL_ERR_NOMEM;
+                cap = 0;
+            }
+        }
+    }
 
     for (size_t i = 0; i < db->bucket_count && err == SOL_OK; i++) {
         sol_account_entry_t* entry = db->buckets[i];
@@ -6884,6 +7448,8 @@ sol_accounts_db_snapshot_local(sol_accounts_db_t* db,
             sol_accounts_db_local_entry_t* dst = &out->entries[out->len++];
             dst->pubkey = entry->pubkey;
             dst->account = entry->account ? sol_account_clone(entry->account) : NULL;
+            dst->slot = entry->slot;
+            dst->write_version = entry->write_version;
             if (entry->account && !dst->account) {
                 err = SOL_ERR_NOMEM;
                 break;
@@ -6923,9 +7489,10 @@ sol_accounts_db_local_snapshot_free(sol_accounts_db_local_snapshot_t* snap) {
     snap->parent = NULL;
 }
 
-sol_err_t
-sol_accounts_db_snapshot_local_view(sol_accounts_db_t* db,
-                                    sol_accounts_db_local_snapshot_view_t* out) {
+static sol_err_t
+sol_accounts_db_snapshot_local_view_impl(sol_accounts_db_t* db,
+                                         sol_accounts_db_local_snapshot_view_t* out,
+                                         bool immutable_overlay) {
     if (!db || !out) return SOL_ERR_INVAL;
 
     out->parent = NULL;
@@ -6939,10 +7506,27 @@ sol_accounts_db_snapshot_local_view(sol_accounts_db_t* db,
     size_t cap = 0;
     sol_err_t err = SOL_OK;
 
-    /* Overlay writers only take a shared lock plus stripe locks; take an
-     * exclusive lock while snapshotting bucket chains without stripe locks. */
-    pthread_rwlock_wrlock(&db->lock);
+    /* Mutable overlays need an exclusive lock while walking bucket chains
+     * without stripe locks. Immutable overlays can safely use a shared lock to
+     * avoid blocking concurrent readers during large snapshots. */
+    if (immutable_overlay) {
+        pthread_rwlock_rdlock(&db->lock);
+    } else {
+        pthread_rwlock_wrlock(&db->lock);
+    }
     out->parent = db->parent;
+    if (db->account_count > 0) {
+        if (db->account_count > (SIZE_MAX / sizeof(*out->entries))) {
+            err = SOL_ERR_OVERFLOW;
+        } else {
+            cap = db->account_count;
+            out->entries = sol_alloc(cap * sizeof(*out->entries));
+            if (!out->entries) {
+                err = SOL_ERR_NOMEM;
+                cap = 0;
+            }
+        }
+    }
 
     for (size_t i = 0; i < db->bucket_count && err == SOL_OK; i++) {
         sol_account_entry_t* entry = db->buckets[i];
@@ -6967,6 +7551,8 @@ sol_accounts_db_snapshot_local_view(sol_accounts_db_t* db,
             sol_accounts_db_local_entry_t* dst = &out->entries[out->len++];
             dst->pubkey = entry->pubkey;
             dst->account = entry->account; /* borrowed */
+            dst->slot = entry->slot;
+            dst->write_version = entry->write_version;
 
             entry = entry->next;
         }
@@ -6980,6 +7566,18 @@ sol_accounts_db_snapshot_local_view(sol_accounts_db_t* db,
     }
 
     return SOL_OK;
+}
+
+sol_err_t
+sol_accounts_db_snapshot_local_view(sol_accounts_db_t* db,
+                                    sol_accounts_db_local_snapshot_view_t* out) {
+    return sol_accounts_db_snapshot_local_view_impl(db, out, false);
+}
+
+sol_err_t
+sol_accounts_db_snapshot_local_view_immutable(sol_accounts_db_t* db,
+                                              sol_accounts_db_local_snapshot_view_t* out) {
+    return sol_accounts_db_snapshot_local_view_impl(db, out, true);
 }
 
 void
@@ -7622,19 +8220,81 @@ sol_accounts_db_fork(sol_accounts_db_t* parent) {
     return fork;
 }
 
+static sol_err_t
+appendvec_index_updates_push(sol_appendvec_index_update_t** updates,
+                             size_t* len,
+                             size_t* cap,
+                             const sol_pubkey_t* pubkey,
+                             sol_slot_t slot,
+                             uint64_t write_version,
+                             const sol_pubkey_t* owner,
+                             uint64_t lamports,
+                             uint64_t data_len,
+                             uint64_t file_key,
+                             uint64_t record_offset,
+                             const sol_hash_t* leaf_hash) {
+    if (!updates || !len || !cap || !pubkey) return SOL_ERR_INVAL;
+
+    if (*len == *cap) {
+        size_t new_cap = (*cap != 0) ? (*cap * 2u) : 4096u;
+        if (new_cap < *cap) return SOL_ERR_OVERFLOW;
+        sol_appendvec_index_update_t* next =
+            sol_realloc(*updates, new_cap * sizeof(*next));
+        if (!next) return SOL_ERR_NOMEM;
+        *updates = next;
+        *cap = new_cap;
+    }
+
+    sol_appendvec_index_update_t* upd = &(*updates)[*len];
+    upd->pubkey = *pubkey;
+    upd->value.slot = (uint64_t)slot;
+    upd->value.write_version = write_version;
+    upd->value.file_key = file_key;
+    upd->value.record_offset = record_offset;
+    upd->value.lamports = lamports;
+    upd->value.data_len = data_len;
+    if (owner) {
+        upd->value.owner = *owner;
+    } else {
+        memset(upd->value.owner.bytes, 0, sizeof(upd->value.owner.bytes));
+    }
+    if (lamports != 0 && leaf_hash) {
+        upd->value.leaf_hash = *leaf_hash;
+    } else {
+        memset(upd->value.leaf_hash.bytes, 0, sizeof(upd->value.leaf_hash.bytes));
+    }
+
+    (*len)++;
+    return SOL_OK;
+}
+
 sol_err_t
-sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
-                                         sol_accounts_db_t* src,
-                                         sol_slot_t default_slot) {
+sol_accounts_db_apply_delta_default_slot_ex(sol_accounts_db_t* dst,
+                                            sol_accounts_db_t* src,
+                                            sol_slot_t default_slot,
+                                            bool src_immutable) {
     if (!dst || !src) return SOL_ERR_INVAL;
     if (!src->parent) return SOL_ERR_INVAL;
 
     static uint32_t warned_bad_slot = 0;
+    static uint32_t warned_appendvec_index_batch = 0;
 
     /* Overlays should never store slot==0 entries in production. If they do,
      * root advancement must not try to write into slot 0's AppendVec (often
      * sealed from snapshot/genesis). Use the bank slot passed by the caller. */
     const bool use_default_slot = (default_slot != 0);
+    const owner_track_mode_t owner_track_mode = accounts_db_owner_track_mode(dst);
+
+    sol_accounts_db_local_snapshot_view_t src_view = {0};
+    bool have_src_view = false;
+    sol_accounts_db_stats_t src_stats = {0};
+
+    if (src_immutable) {
+        if (sol_accounts_db_snapshot_local_view_immutable(src, &src_view) == SOL_OK) {
+            have_src_view = true;
+            sol_accounts_db_stats(src, &src_stats);
+        }
+    }
 
     /* Fast path: bulk-apply overlay deltas into a persistent root (RocksDB).
      * This is a hot path during root advancement/catchup, so avoid per-account
@@ -7649,26 +8309,23 @@ sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
         const size_t batch_cap = 262144;
         sol_accounts_db_bulk_writer_t* bulk = sol_accounts_db_bulk_writer_new(dst, batch_cap);
         if (bulk) {
-            sol_err_t idx_err = sol_accounts_db_bulk_writer_set_write_owner_index(bulk, true);
-            if (idx_err != SOL_OK) {
-                sol_accounts_db_bulk_writer_destroy(bulk);
-                bulk = NULL;
+            if (owner_track_mode != OWNER_TRACK_MODE_NONE) {
+                sol_err_t idx_err = sol_accounts_db_bulk_writer_set_write_owner_index(bulk, true);
+                if (idx_err != SOL_OK) {
+                    sol_accounts_db_bulk_writer_destroy(bulk);
+                    bulk = NULL;
+                } else if (owner_track_mode == OWNER_TRACK_MODE_CORE) {
+                    sol_accounts_db_bulk_writer_set_write_owner_index_core_only(bulk, true);
+                }
             }
         }
 
         if (bulk) {
-
-            sol_accounts_db_stats_t src_stats = {0};
-
-            /* Overlay writers only take a shared lock plus stripe locks; take
-             * an exclusive lock while walking bucket chains. */
-            pthread_rwlock_wrlock(&src->lock);
-            src_stats = src->stats;
-
             sol_err_t first_err = SOL_OK;
-            for (size_t i = 0; i < src->bucket_count && first_err == SOL_OK; i++) {
-                sol_account_entry_t* entry = src->buckets[i];
-                while (entry && first_err == SOL_OK) {
+
+            if (have_src_view) {
+                for (size_t i = 0; i < src_view.len && first_err == SOL_OK; i++) {
+                    const sol_accounts_db_local_entry_t* entry = &src_view.entries[i];
                     sol_slot_t eff_slot = entry->slot;
                     if (__builtin_expect(use_default_slot && eff_slot == 0, 0)) {
                         uint32_t n = __atomic_fetch_add(&warned_bad_slot, 1u, __ATOMIC_RELAXED);
@@ -7693,18 +8350,55 @@ sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
                             first_err = SOL_OK;
                         }
                     }
-                    entry = entry->next;
                 }
+            } else {
+                /* Overlay writers only take a shared lock plus stripe locks; take
+                 * an exclusive lock while walking bucket chains. */
+                pthread_rwlock_wrlock(&src->lock);
+                src_stats = src->stats;
+                for (size_t i = 0; i < src->bucket_count && first_err == SOL_OK; i++) {
+                    sol_account_entry_t* entry = src->buckets[i];
+                    while (entry && first_err == SOL_OK) {
+                        sol_slot_t eff_slot = entry->slot;
+                        if (__builtin_expect(use_default_slot && eff_slot == 0, 0)) {
+                            uint32_t n = __atomic_fetch_add(&warned_bad_slot, 1u, __ATOMIC_RELAXED);
+                            if (n < 8u) {
+                                sol_log_warn("apply_delta: overlay entry slot=0; substituting default_slot=%lu",
+                                             (unsigned long)default_slot);
+                            }
+                            eff_slot = default_slot;
+                        }
+                        if (entry->account) {
+                            first_err = sol_accounts_db_bulk_writer_put_versioned(bulk,
+                                                                                  &entry->pubkey,
+                                                                                  entry->account,
+                                                                                  eff_slot,
+                                                                                  entry->write_version);
+                        } else {
+                            first_err = sol_accounts_db_bulk_writer_delete_versioned(bulk,
+                                                                                     &entry->pubkey,
+                                                                                     eff_slot,
+                                                                                     entry->write_version);
+                            if (first_err == SOL_ERR_NOTFOUND) {
+                                first_err = SOL_OK;
+                            }
+                        }
+                        entry = entry->next;
+                    }
+                }
+                pthread_rwlock_unlock(&src->lock);
             }
-
-            pthread_rwlock_unlock(&src->lock);
 
             if (first_err == SOL_OK) {
                 first_err = sol_accounts_db_bulk_writer_flush(bulk);
             }
+
             sol_accounts_db_bulk_writer_destroy(bulk);
 
             if (first_err != SOL_OK) {
+                if (have_src_view) {
+                    sol_accounts_db_local_snapshot_view_free(&src_view);
+                }
                 return first_err;
             }
 
@@ -7718,6 +8412,9 @@ sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
             dst->account_count = (size_t)src_stats.accounts_count;
             pthread_rwlock_unlock(&dst->lock);
 
+            if (have_src_view) {
+                sol_accounts_db_local_snapshot_view_free(&src_view);
+            }
             return SOL_OK;
         }
     }
@@ -7738,27 +8435,28 @@ sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
         const size_t batch_cap = 262144;
         sol_accounts_db_bulk_writer_t* bulk = sol_accounts_db_bulk_writer_new(dst, batch_cap);
         if (bulk) {
-            sol_err_t idx_err = sol_accounts_db_bulk_writer_set_write_owner_index(bulk, true);
-            if (idx_err != SOL_OK) {
-                sol_accounts_db_bulk_writer_destroy(bulk);
-                bulk = NULL;
+            if (owner_track_mode != OWNER_TRACK_MODE_NONE) {
+                sol_err_t idx_err = sol_accounts_db_bulk_writer_set_write_owner_index(bulk, true);
+                if (idx_err != SOL_OK) {
+                    sol_accounts_db_bulk_writer_destroy(bulk);
+                    bulk = NULL;
+                } else if (owner_track_mode == OWNER_TRACK_MODE_CORE) {
+                    sol_accounts_db_bulk_writer_set_write_owner_index_core_only(bulk, true);
+                }
             }
         }
 
         if (bulk) {
-            sol_accounts_db_stats_t src_stats = {0};
-
-            /* Overlay writers only take a shared lock plus stripe locks; take
-             * an exclusive lock while walking bucket chains. */
-            pthread_rwlock_wrlock(&src->lock);
-            src_stats = src->stats;
-
             sol_err_t first_err = SOL_OK;
             const sol_pubkey_t zero_owner = {0};
+            sol_appendvec_index_update_t* index_updates = NULL;
+            size_t index_updates_len = 0;
+            size_t index_updates_cap = 0;
+            const bool track_index = (dst->appendvec_index != NULL);
 
-            for (size_t i = 0; i < src->bucket_count && first_err == SOL_OK; i++) {
-                sol_account_entry_t* entry = src->buckets[i];
-                while (entry && first_err == SOL_OK) {
+            if (have_src_view) {
+                for (size_t i = 0; i < src_view.len && first_err == SOL_OK; i++) {
+                    const sol_accounts_db_local_entry_t* entry = &src_view.entries[i];
                     sol_slot_t eff_slot = entry->slot;
                     if (__builtin_expect(use_default_slot && eff_slot == 0, 0)) {
                         uint32_t n = __atomic_fetch_add(&warned_bad_slot, 1u, __ATOMIC_RELAXED);
@@ -7774,7 +8472,6 @@ sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
                     /* Commit semantics: treat 0-lamport accounts as deleted in
                      * the rooted DB (tombstone in the index). */
                     bool deleted = (!account) || (account->meta.lamports == 0);
-
                     if (deleted) {
                         first_err = sol_accounts_db_bulk_writer_put_snapshot_account(
                             bulk,
@@ -7791,19 +8488,20 @@ sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
                             0,      /* file_key */
                             0       /* record_offset */
                         );
-                        if (first_err == SOL_OK && dst->appendvec_index) {
-                            (void)sol_appendvec_index_update(dst->appendvec_index,
-                                                             pubkey,
-                                                             eff_slot,
-                                                             entry->write_version,
-                                                             NULL,
-                                                             0,
-                                                             0,
-                                                             0,
-                                                             0,
-                                                             NULL);
+                        if (first_err == SOL_OK && track_index) {
+                            first_err = appendvec_index_updates_push(&index_updates,
+                                                                     &index_updates_len,
+                                                                     &index_updates_cap,
+                                                                     pubkey,
+                                                                     eff_slot,
+                                                                     entry->write_version,
+                                                                     NULL,
+                                                                     0,
+                                                                     0,
+                                                                     0,
+                                                                     0,
+                                                                     NULL);
                         }
-                        entry = entry->next;
                         continue;
                     }
 
@@ -7838,31 +8536,149 @@ sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
                         file_key,
                         record_offset
                     );
-                    if (first_err == SOL_OK && dst->appendvec_index) {
-                        (void)sol_appendvec_index_update(dst->appendvec_index,
-                                                         pubkey,
-                                                         eff_slot,
-                                                         entry->write_version,
-                                                         &account->meta.owner,
-                                                         (uint64_t)account->meta.lamports,
-                                                         (uint64_t)account->meta.data_len,
-                                                         file_key,
-                                                         record_offset,
-                                                         &leaf);
+                    if (first_err == SOL_OK && track_index) {
+                        first_err = appendvec_index_updates_push(&index_updates,
+                                                                 &index_updates_len,
+                                                                 &index_updates_cap,
+                                                                 pubkey,
+                                                                 eff_slot,
+                                                                 entry->write_version,
+                                                                 &account->meta.owner,
+                                                                 (uint64_t)account->meta.lamports,
+                                                                 (uint64_t)account->meta.data_len,
+                                                                 file_key,
+                                                                 record_offset,
+                                                                 &leaf);
                     }
-
-                    entry = entry->next;
                 }
-            }
+            } else {
+                /* Overlay writers only take a shared lock plus stripe locks; take
+                 * an exclusive lock while walking bucket chains. */
+                pthread_rwlock_wrlock(&src->lock);
+                src_stats = src->stats;
+                for (size_t i = 0; i < src->bucket_count && first_err == SOL_OK; i++) {
+                    sol_account_entry_t* entry = src->buckets[i];
+                    while (entry && first_err == SOL_OK) {
+                        sol_slot_t eff_slot = entry->slot;
+                        if (__builtin_expect(use_default_slot && eff_slot == 0, 0)) {
+                            uint32_t n = __atomic_fetch_add(&warned_bad_slot, 1u, __ATOMIC_RELAXED);
+                            if (n < 8u) {
+                                sol_log_warn("apply_delta: overlay entry slot=0; substituting default_slot=%lu",
+                                             (unsigned long)default_slot);
+                            }
+                            eff_slot = default_slot;
+                        }
+                        const sol_pubkey_t* pubkey = &entry->pubkey;
+                        const sol_account_t* account = entry->account;
 
-            pthread_rwlock_unlock(&src->lock);
+                        bool deleted = (!account) || (account->meta.lamports == 0);
+                        if (deleted) {
+                            first_err = sol_accounts_db_bulk_writer_put_snapshot_account(
+                                bulk,
+                                pubkey,
+                                &zero_owner,
+                                0,
+                                NULL,
+                                0,
+                                false,
+                                0,
+                                eff_slot,
+                                entry->write_version,
+                                NULL,
+                                0,
+                                0
+                            );
+                            if (first_err == SOL_OK && track_index) {
+                                first_err = appendvec_index_updates_push(&index_updates,
+                                                                         &index_updates_len,
+                                                                         &index_updates_cap,
+                                                                         pubkey,
+                                                                         eff_slot,
+                                                                         entry->write_version,
+                                                                         NULL,
+                                                                         0,
+                                                                         0,
+                                                                         0,
+                                                                         0,
+                                                                         NULL);
+                            }
+                            entry = entry->next;
+                            continue;
+                        }
+
+                        uint64_t file_key = ((uint64_t)eff_slot << 32) | 0u;
+                        uint64_t record_offset = 0;
+                        sol_err_t aerr = appendvec_append_record_solana3(dst,
+                                                                         &file_key,
+                                                                         pubkey,
+                                                                         account,
+                                                                         entry->write_version,
+                                                                         &record_offset);
+                        if (aerr != SOL_OK) {
+                            first_err = aerr;
+                            break;
+                        }
+
+                        sol_hash_t leaf = {0};
+                        sol_account_hash(pubkey, account, &leaf);
+                        first_err = sol_accounts_db_bulk_writer_put_snapshot_account(
+                            bulk,
+                            pubkey,
+                            &account->meta.owner,
+                            (uint64_t)account->meta.lamports,
+                            account->data,
+                            (uint64_t)account->meta.data_len,
+                            account->meta.executable,
+                            (uint64_t)account->meta.rent_epoch,
+                            eff_slot,
+                            entry->write_version,
+                            &leaf,
+                            file_key,
+                            record_offset
+                        );
+                        if (first_err == SOL_OK && track_index) {
+                            first_err = appendvec_index_updates_push(&index_updates,
+                                                                     &index_updates_len,
+                                                                     &index_updates_cap,
+                                                                     pubkey,
+                                                                     eff_slot,
+                                                                     entry->write_version,
+                                                                     &account->meta.owner,
+                                                                     (uint64_t)account->meta.lamports,
+                                                                     (uint64_t)account->meta.data_len,
+                                                                     file_key,
+                                                                     record_offset,
+                                                                     &leaf);
+                        }
+                        entry = entry->next;
+                    }
+                }
+                pthread_rwlock_unlock(&src->lock);
+            }
 
             if (first_err == SOL_OK) {
                 first_err = sol_accounts_db_bulk_writer_flush(bulk);
             }
+
+            if (first_err == SOL_OK && track_index && index_updates_len > 0) {
+                sol_err_t ierr = sol_appendvec_index_update_batch(dst->appendvec_index,
+                                                                  index_updates,
+                                                                  index_updates_len);
+                if (ierr != SOL_OK) {
+                    uint32_t n = __atomic_fetch_add(&warned_appendvec_index_batch, 1u, __ATOMIC_RELAXED);
+                    if (n < 8u) {
+                        sol_log_warn("apply_delta: appendvec index batch update failed: %s",
+                                     sol_err_str(ierr));
+                    }
+                }
+            }
             sol_accounts_db_bulk_writer_destroy(bulk);
+            sol_free(index_updates);
 
             if (first_err != SOL_OK) {
+                if (have_src_view) {
+                    sol_accounts_db_local_snapshot_view_free(&src_view);
+                }
                 return first_err;
             }
 
@@ -7876,15 +8692,55 @@ sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
             dst->account_count = (size_t)src_stats.accounts_count;
             pthread_rwlock_unlock(&dst->lock);
 
+            if (have_src_view) {
+                sol_accounts_db_local_snapshot_view_free(&src_view);
+            }
             return SOL_OK;
         }
     }
 
     /* Fallback: apply entries via per-key stores/deletes (portable, slower). */
+    if (have_src_view) {
+        for (size_t i = 0; i < src_view.len; i++) {
+            const sol_accounts_db_local_entry_t* entry = &src_view.entries[i];
+            sol_slot_t eff_slot = entry->slot;
+            if (__builtin_expect(use_default_slot && eff_slot == 0, 0)) {
+                uint32_t n = __atomic_fetch_add(&warned_bad_slot, 1u, __ATOMIC_RELAXED);
+                if (n < 8u) {
+                    sol_log_warn("apply_delta: overlay entry slot=0; substituting default_slot=%lu",
+                                 (unsigned long)default_slot);
+                }
+                eff_slot = default_slot;
+            }
+
+            sol_err_t err;
+            if (entry->account) {
+                err = sol_accounts_db_store_versioned(dst,
+                                                     &entry->pubkey,
+                                                     entry->account,
+                                                     eff_slot,
+                                                     entry->write_version);
+            } else {
+                err = sol_accounts_db_delete_versioned(dst,
+                                                      &entry->pubkey,
+                                                      eff_slot,
+                                                      entry->write_version);
+                if (err == SOL_ERR_NOTFOUND) {
+                    err = SOL_OK;
+                }
+            }
+            if (err != SOL_OK) {
+                sol_accounts_db_local_snapshot_view_free(&src_view);
+                return err;
+            }
+        }
+        sol_accounts_db_local_snapshot_view_free(&src_view);
+        return SOL_OK;
+    }
+
     /* Overlay writers only take a shared lock plus stripe locks; take an
      * exclusive lock while walking bucket chains. */
     pthread_rwlock_wrlock(&src->lock);
-
     for (size_t i = 0; i < src->bucket_count; i++) {
         sol_account_entry_t* entry = src->buckets[i];
         while (entry) {
@@ -7920,14 +8776,20 @@ sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
             entry = entry->next;
         }
     }
-
     pthread_rwlock_unlock(&src->lock);
     return SOL_OK;
 }
 
 sol_err_t
+sol_accounts_db_apply_delta_default_slot(sol_accounts_db_t* dst,
+                                         sol_accounts_db_t* src,
+                                         sol_slot_t default_slot) {
+    return sol_accounts_db_apply_delta_default_slot_ex(dst, src, default_slot, false);
+}
+
+sol_err_t
 sol_accounts_db_apply_delta(sol_accounts_db_t* dst, sol_accounts_db_t* src) {
-    return sol_accounts_db_apply_delta_default_slot(dst, src, 0);
+    return sol_accounts_db_apply_delta_default_slot_ex(dst, src, 0, false);
 }
 
 void

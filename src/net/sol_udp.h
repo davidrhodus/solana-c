@@ -37,8 +37,8 @@ typedef struct {
     .bind_ip     = NULL,         \
     .bind_port   = 0,            \
     .family      = AF_INET,      \
-    .recv_buf    = 8 * 1024 * 1024, \
-    .send_buf    = 8 * 1024 * 1024, \
+    .recv_buf    = 64 * 1024 * 1024, \
+    .send_buf    = 64 * 1024 * 1024, \
     .nonblocking = true,         \
     .reuse_addr  = true,         \
     .reuse_port  = false,        \

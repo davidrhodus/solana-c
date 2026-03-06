@@ -98,6 +98,7 @@ struct sol_repair {
     sol_keypair_t       identity;
     sol_pubkey_t        self_pubkey;
     uint32_t            nonce_counter;
+    uint64_t            peer_select_counter;
 
     /* Gossip for peer discovery */
     sol_gossip_t*       gossip;
@@ -694,6 +695,7 @@ select_repair_peer_ex(sol_repair_t* repair,
                       sol_sockaddr_t* peer,
                       sol_pubkey_t* peer_pubkey) {
     uint64_t now_ms = sol_gossip_now_ms();
+    uint64_t sel_seq = __atomic_fetch_add(&repair->peer_select_counter, 1u, __ATOMIC_RELAXED);
 
     /* Prefer the slot leader when possible (best-effort). This reduces repair
      * timeouts by targeting a peer that is guaranteed to have produced the
@@ -731,7 +733,7 @@ select_repair_peer_ex(sol_repair_t* repair,
         }
     }
 
-    enum { SOL_REPAIR_CONTACTS_MAX = 512 };
+    enum { SOL_REPAIR_CONTACTS_MAX = 2048 };
 
     /* Get peers from gossip */
     const sol_contact_info_t* contacts[SOL_REPAIR_CONTACTS_MAX];
@@ -792,7 +794,8 @@ select_repair_peer_ex(sol_repair_t* repair,
         }
 
         uint64_t seed = now_ms;
-        seed ^= (uint64_t)repair->pending_count << 17;
+        seed ^= mix_u64((uint64_t)slot + 0x9e3779b97f4a7c15ULL);
+        seed ^= mix_u64(sel_seq + ((uint64_t)repair->pending_count << 17));
         seed ^= seed >> 33;
         seed *= 0xff51afd7ed558ccdULL;
         seed ^= seed >> 33;
@@ -839,19 +842,17 @@ select_repair_peer_ex(sol_repair_t* repair,
     }
 
     uint64_t seed = now_ms;
-    seed ^= (uint64_t)repair->pending_count << 17;
+    seed ^= mix_u64((uint64_t)slot + 0x9e3779b97f4a7c15ULL);
+    seed ^= mix_u64(sel_seq + ((uint64_t)repair->pending_count << 17));
     seed ^= seed >> 33;
     seed *= 0xff51afd7ed558ccdULL;
     seed ^= seed >> 33;
 
     if (warm_count) {
-        /* Prefer warm peers most of the time, but keep sampling cold peers to
-         * avoid getting stuck on a single slow/unhelpful peer.
-         *
-         * When we're retrying (avoid list non-empty), deliberately broaden the
-         * sample to cold peers more aggressively to find a responsive peer that
-         * still has historical shreds. */
-        uint64_t warm_mod = avoid_pubkeys_len ? 2u : 10u; /* ~50% warm on retry, ~90% warm initially */
+        /* Prefer warm peers most of the time, including during hedged retries.
+         * Avoid-lists naturally exclude already-tried peers, so still allow
+         * some cold sampling while keeping bias toward responsive peers. */
+        uint64_t warm_mod = avoid_pubkeys_len ? 3u : 10u; /* ~67% warm on retry, ~90% warm initially */
         bool choose_warm = (candidate_count == warm_count);
         if (!choose_warm) {
             choose_warm = (seed % warm_mod) != 0;
@@ -1056,6 +1057,24 @@ send_repair_request_unlocked_pending(sol_repair_t* repair, const sol_repair_pend
                                         pending->nonce,
                                         &pending->peer_pubkey,
                                         &pending->peer);
+}
+
+static inline bool
+repair_periodic_hedge_enabled(uint32_t fanout) {
+    /* Moderate fanout still benefits from periodic bursts under catchup.
+     * Restrict one-per-retry behavior to very low fanout to avoid starving
+     * replay-critical tail shreds. */
+    return fanout >= 8u;
+}
+
+static inline uint64_t
+repair_periodic_hedge_interval_ms(uint32_t fanout) {
+    /* Larger fanout should resend more frequently because each burst can fan
+     * out across many peers without increasing tracked pending entries. */
+    if (fanout >= 48u) return 2u;
+    if (fanout >= 32u) return 3u;
+    if (fanout >= 16u) return 4u;
+    return 8u;
 }
 
 /*
@@ -2349,9 +2368,6 @@ sol_repair_request_shred_fanout(sol_repair_t* repair, sol_slot_t slot,
     enum {
         /* Keep first hedge fast, but avoid flooding duplicate responses. */
         SOL_REPAIR_HEDGE_DELAY_MS = 3,
-        /* For high-fanout "last gap" repair, allow repeated hedge bursts,
-         * but keep enough spacing to prevent socket-queue saturation. */
-        SOL_REPAIR_HEDGE_BURST_MIN_INTERVAL_MS = 15,
     };
 
     uint64_t now_ms = sol_gossip_now_ms();
@@ -2416,13 +2432,14 @@ sol_repair_request_shred_fanout(sol_repair_t* repair, sol_slot_t slot,
             (pending->last_hedge_sent_time != 0u && now_ms >= pending->last_hedge_sent_time)
                 ? (now_ms - pending->last_hedge_sent_time)
                 : UINT64_MAX;
-        bool high_fanout_burst = (fanout >= 24u);
+        bool periodic_hedge = repair_periodic_hedge_enabled(fanout);
+        uint64_t burst_interval_ms = repair_periodic_hedge_interval_ms(fanout);
 
-        /* Normal mode: once per retry.
+        /* Low fanout mode: hedge once per retry.
          *
-         * High-fanout mode (critical tail catchup): permit periodic hedge bursts
-         * within a retry window, bounded by a short minimum interval. */
-        if (!high_fanout_burst && pending->hedge_retry_mark == pending->retries) {
+         * Periodic mode: allow bounded hedge bursts within a retry window to
+         * reduce tail latency on replay-critical missing shreds. */
+        if (!periodic_hedge && pending->hedge_retry_mark == pending->retries) {
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
@@ -2430,7 +2447,7 @@ sol_repair_request_shred_fanout(sol_repair_t* repair, sol_slot_t slot,
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
-        if (high_fanout_burst && since_hedge_ms < SOL_REPAIR_HEDGE_BURST_MIN_INTERVAL_MS) {
+        if (periodic_hedge && since_hedge_ms < burst_interval_ms) {
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
@@ -2501,7 +2518,6 @@ sol_repair_request_highest_fanout(sol_repair_t* repair, sol_slot_t slot,
     enum {
         /* Keep first hedge fast, but avoid flooding duplicate responses. */
         SOL_REPAIR_HEDGE_DELAY_MS = 3,
-        SOL_REPAIR_HEDGE_BURST_MIN_INTERVAL_MS = 15,
     };
 
     uint64_t now_ms = sol_gossip_now_ms();
@@ -2577,9 +2593,10 @@ sol_repair_request_highest_fanout(sol_repair_t* repair, sol_slot_t slot,
             (pending->last_hedge_sent_time != 0u && now_ms >= pending->last_hedge_sent_time)
                 ? (now_ms - pending->last_hedge_sent_time)
                 : UINT64_MAX;
-        bool high_fanout_burst = (fanout >= 24u);
+        bool periodic_hedge = repair_periodic_hedge_enabled(fanout);
+        uint64_t burst_interval_ms = repair_periodic_hedge_interval_ms(fanout);
 
-        if (!high_fanout_burst && pending->hedge_retry_mark == pending->retries) {
+        if (!periodic_hedge && pending->hedge_retry_mark == pending->retries) {
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
@@ -2587,7 +2604,7 @@ sol_repair_request_highest_fanout(sol_repair_t* repair, sol_slot_t slot,
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
-        if (high_fanout_burst && since_hedge_ms < SOL_REPAIR_HEDGE_BURST_MIN_INTERVAL_MS) {
+        if (periodic_hedge && since_hedge_ms < burst_interval_ms) {
             pthread_mutex_unlock(&repair->pending_lock);
             return SOL_OK;
         }
@@ -2888,6 +2905,24 @@ sol_repair_prune_pending_outside_window(sol_repair_t* repair,
             pruned++;
             continue;
         }
+    }
+    pthread_mutex_unlock(&repair->pending_lock);
+    return pruned;
+}
+
+size_t
+sol_repair_prune_pending_slot(sol_repair_t* repair,
+                              sol_slot_t slot) {
+    if (!repair || slot == 0) return 0;
+
+    size_t pruned = 0;
+    pthread_mutex_lock(&repair->pending_lock);
+    for (size_t i = 0; i < repair->config.max_pending_requests; i++) {
+        sol_repair_pending_t* p = &repair->pending[i];
+        if (!p->active) continue;
+        if (p->slot != slot) continue;
+        pending_deactivate_locked(repair, p);
+        pruned++;
     }
     pthread_mutex_unlock(&repair->pending_lock);
     return pruned;

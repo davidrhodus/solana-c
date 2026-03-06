@@ -12,6 +12,8 @@
 #include <time.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
+#include <ctype.h>
 
 /*
  * Slot tracking entry
@@ -29,6 +31,9 @@ typedef struct {
      * duplicate shred reception. */
     uint64_t            last_inserted_ns;
     uint64_t            last_repair_request_ns;
+    /* Round-robin cursor used when missing sets are too large to request in a
+     * single loop. This avoids repeatedly hammering low indices only. */
+    uint32_t            repair_missing_cursor;
     uint64_t            first_complete_ns;
     bool                replay_retry_requested;
     sol_slot_t          waiting_parent_slot;
@@ -42,11 +47,10 @@ typedef struct {
     uint32_t            last_replay_complete_variants;
     /* Best-effort restart probe:
      * After a restart, the persisted blockstore may already contain shreds/meta
-     * for some slots even before we receive any new shreds in this run. Probing
-     * RocksDB for every tracked slot on every replay loop iteration is extremely
-     * expensive, so we probe at most once per slot (and only for slots that have
-     * not received any shreds in this run). */
-    bool                restart_probed;
+     * for some slots even before we receive any new shreds in this run. Keep
+     * probing bounded by cadence, but do not probe only once: slots can become
+     * replayable later via repair responses without local shred ingestion. */
+    uint64_t            last_restart_probe_ns;
     uint64_t            last_prewarm_ns;
     int32_t             hash_next; /* next index in slot hash bucket (-1 if none) */
 } slot_tracker_t;
@@ -77,6 +81,7 @@ typedef struct {
  * complete forks/variants are available (duplicates, catchup backfill, etc.). */
 #define SOL_TVU_MAX_REPLAY_THREADS 64
 #define SOL_TVU_MAX_REPAIR_THREADS 64
+#define SOL_TVU_VERIFY_BATCH_MAX 256
 #define SOL_TVU_REPLAY_STAGE_SAMPLES 4096
 
 typedef struct {
@@ -387,21 +392,37 @@ tvu_auto_threads_for_role(uint32_t cpu_count, tvu_thread_role_t role) {
     if (role == TVU_THREAD_ROLE_REPLAY) {
         /* Replay slot selection has shared locks and parent checks; keep
          * defaults tighter than verify/repair to reduce scheduler contention
-         * on large-core machines. */
+         * on large-core machines. For replay-heavy mainnet catchup, lower
+         * fanout reduces long-tail convoy stalls between replay workers. */
         if (threads >= 128u) {
-            threads /= 16u; /* 128c -> 8 threads */
+            threads /= 32u; /* 128c -> 4 threads */
         } else if (threads >= 96u) {
-            threads /= 12u; /* 96c -> 8 threads */
+            threads /= 24u; /* 96c -> 4 threads */
         } else if (threads >= 64u) {
-            threads /= 8u;  /* 64c -> 8 threads */
+            threads /= 16u; /* 64c -> 4 threads */
         } else if (threads >= 48u) {
-            threads /= 6u;  /* 48c -> 8 threads */
+            threads /= 12u; /* 48c -> 4 threads */
         } else if (threads >= 24u) {
-            threads /= 4u;
+            threads /= 6u;  /* 24c -> 4 threads */
         } else if (threads >= 12u) {
-            threads /= 3u;
+            threads /= 4u;
         } else if (threads >= 4u) {
             threads /= 2u;
+        }
+    } else if (role == TVU_THREAD_ROLE_REPAIR) {
+        /* Catchup at the replay frontier is often repair-bound. On large-core
+         * hosts, keep a larger repair pool than verify so missing-shred gaps
+         * close quickly instead of stalling replay on the next slot. */
+        if (threads >= 128u) {
+            threads /= 4u;  /* 128c -> 32 threads */
+        } else if (threads >= 96u) {
+            threads /= 4u;  /* 96c -> 24 threads */
+        } else if (threads >= 64u) {
+            threads /= 3u;  /* 64c -> 21 threads */
+        } else if (threads >= 48u) {
+            threads /= 2u;  /* 48c -> 24 threads */
+        } else if (threads >= 24u) {
+            threads /= 2u;  /* 24c -> 12 threads */
         }
     } else {
         /* Avoid oversubscription: replay also runs a large tx worker pool.
@@ -621,6 +642,500 @@ tvu_max_shred_ahead_slots(void) {
     return (sol_slot_t)cached;
 }
 
+static sol_slot_t
+tvu_max_shred_ahead_high_lag(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* When replay lag exceeds this threshold, tighten far-ahead shred intake
+     * to keep queue/blockstore pressure near the replay-critical window.
+     * Set to 0 to disable this tier. */
+    const char* env = getenv("SOL_TVU_MAX_SHRED_AHEAD_HIGH_LAG");
+    long v = 2048; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_max_shred_ahead_high_slots(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* Effective max-ahead slots used when high-lag tier is active.
+     * Set to 0 to disable high-tier tightening. */
+    const char* env = getenv("SOL_TVU_MAX_SHRED_AHEAD_HIGH_SLOTS");
+    long v = 1024; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_max_shred_ahead_severe_lag(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* When replay lag is very high, tighten far-ahead intake further.
+     * Set to 0 to disable this tier. */
+    const char* env = getenv("SOL_TVU_MAX_SHRED_AHEAD_SEVERE_LAG");
+    long v = 8192; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_max_shred_ahead_severe_slots(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* Effective max-ahead slots used when severe-lag tier is active.
+     * Set to 0 to disable severe-tier tightening. */
+    const char* env = getenv("SOL_TVU_MAX_SHRED_AHEAD_SEVERE_SLOTS");
+    long v = 512; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_effective_max_shred_ahead(sol_tvu_t* tvu, sol_slot_t replay_cursor) {
+    sol_slot_t base = tvu_max_shred_ahead_slots();
+    if (base == 0 || !tvu || !tvu->blockstore || replay_cursor == 0) {
+        return base;
+    }
+
+    sol_slot_t highest = sol_blockstore_highest_slot(tvu->blockstore);
+    sol_slot_t lag = (highest > replay_cursor) ? (highest - replay_cursor) : 0;
+    if (lag == 0) {
+        return base;
+    }
+
+    sol_slot_t effective = base;
+    sol_slot_t high_lag = tvu_max_shred_ahead_high_lag();
+    sol_slot_t severe_lag = tvu_max_shred_ahead_severe_lag();
+    if (severe_lag != 0 && high_lag != 0 && severe_lag < high_lag) {
+        severe_lag = high_lag;
+    }
+
+    if (severe_lag != 0 && lag >= severe_lag) {
+        sol_slot_t severe_slots = tvu_max_shred_ahead_severe_slots();
+        if (severe_slots != 0 && severe_slots < effective) {
+            effective = severe_slots;
+        }
+    } else if (high_lag != 0 && lag >= high_lag) {
+        sol_slot_t high_slots = tvu_max_shred_ahead_high_slots();
+        if (high_slots != 0 && high_slots < effective) {
+            effective = high_slots;
+        }
+    }
+
+    return effective;
+}
+
+static sol_slot_t
+tvu_max_replay_ahead_slots(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* Bound how far ahead of highest-replayed the replay scheduler may pick
+     * COMPLETE slots. This prevents far-ahead replay storms from starving the
+     * frontier slot during catchup. Set to 0 to disable this guard. */
+    const char* env = getenv("SOL_TVU_MAX_REPLAY_AHEAD_SLOTS");
+    long v = 1024; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_max_replay_ahead_high_lag(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* When replay lag is high, shrink replay-ahead window to keep CPU focused
+     * on near-frontier progress. Set to 0 to disable this tier. */
+    const char* env = getenv("SOL_TVU_MAX_REPLAY_AHEAD_HIGH_LAG");
+    long v = 512; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_max_replay_ahead_high_slots(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    const char* env = getenv("SOL_TVU_MAX_REPLAY_AHEAD_HIGH_SLOTS");
+    long v = 64; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_max_replay_ahead_severe_lag(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* Severe backlog: keep replay tightly centered around the frontier.
+     * Set to 0 to disable this tier. */
+    const char* env = getenv("SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_LAG");
+    long v = 1024; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+
+    long high = (long)tvu_max_replay_ahead_high_lag();
+    if (v != 0 && high != 0 && v < high) {
+        v = high;
+    }
+
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_max_replay_ahead_severe_slots(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    const char* env = getenv("SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_SLOTS");
+    long v = 24; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 65536) {
+        v = 65536;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static sol_slot_t
+tvu_effective_max_replay_ahead(sol_tvu_t* tvu, sol_slot_t replay_cursor) {
+    sol_slot_t base = tvu_max_replay_ahead_slots();
+    if (base == 0 || !tvu || !tvu->blockstore || replay_cursor == 0) {
+        return base;
+    }
+
+    sol_slot_t highest = sol_blockstore_highest_slot(tvu->blockstore);
+    sol_slot_t lag = (highest > replay_cursor) ? (highest - replay_cursor) : 0;
+    if (lag == 0) {
+        return base;
+    }
+
+    sol_slot_t effective = base;
+    sol_slot_t high_lag = tvu_max_replay_ahead_high_lag();
+    sol_slot_t severe_lag = tvu_max_replay_ahead_severe_lag();
+    if (severe_lag != 0 && high_lag != 0 && severe_lag < high_lag) {
+        severe_lag = high_lag;
+    }
+
+    if (severe_lag != 0 && lag >= severe_lag) {
+        sol_slot_t severe_slots = tvu_max_replay_ahead_severe_slots();
+        if (severe_slots != 0 && severe_slots < effective) {
+            effective = severe_slots;
+        }
+    } else if (high_lag != 0 && lag >= high_lag) {
+        sol_slot_t high_slots = tvu_max_replay_ahead_high_slots();
+        if (high_slots != 0 && high_slots < effective) {
+            effective = high_slots;
+        }
+    }
+
+    return effective;
+}
+
+static inline bool
+tvu_slot_in_replay_window(sol_slot_t slot, sol_slot_t replay_cursor, sol_slot_t max_ahead) {
+    if (slot == 0) {
+        return false;
+    }
+    if (replay_cursor == 0 || max_ahead == 0) {
+        return true;
+    }
+    if (slot <= replay_cursor) {
+        return true;
+    }
+    return (slot - replay_cursor) <= max_ahead;
+}
+
+static sol_slot_t
+tvu_primary_dead_replay_ahead_slots(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (sol_slot_t)cached;
+    }
+
+    /* When the replay-primary slot (highest_replayed+1) is marked DEAD, keep
+     * replay candidate selection tightly centered near the frontier so replay
+     * threads don't burn CPU on far-ahead slots while duplicate repair is
+     * trying to recover the primary. Set to 0 to disable this tightening. */
+    const char* env = getenv("SOL_TVU_PRIMARY_DEAD_REPLAY_AHEAD_SLOTS");
+    long v = 8; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+
+    if (v < 0) {
+        v = 0;
+    }
+    if (v > 4096) {
+        v = 4096;
+    }
+    cached = v;
+    return (sol_slot_t)cached;
+}
+
+static uint32_t
+tvu_dead_primary_duplicate_fanout(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (uint32_t)cached;
+    }
+
+    const char* env = getenv("SOL_TVU_DEAD_PRIMARY_DUPLICATE_FANOUT");
+    long v = 48; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+    if (v < 1) v = 1;
+    if (v > 256) v = 256;
+    cached = v;
+    return (uint32_t)cached;
+}
+
+static uint32_t
+tvu_dead_primary_highest_fanout(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (uint32_t)cached;
+    }
+
+    const char* env = getenv("SOL_TVU_DEAD_PRIMARY_HIGHEST_FANOUT");
+    long v = 32; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+    if (v < 1) v = 1;
+    if (v > 256) v = 256;
+    cached = v;
+    return (uint32_t)cached;
+}
+
+static uint32_t
+tvu_dead_primary_orphan_fanout(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (uint32_t)cached;
+    }
+
+    const char* env = getenv("SOL_TVU_DEAD_PRIMARY_ORPHAN_FANOUT");
+    long v = 4; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+    if (v < 1) v = 1;
+    if (v > 64) v = 64;
+    cached = v;
+    return (uint32_t)cached;
+}
+
+static uint32_t
+tvu_dead_primary_ancestor_fanout(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (uint32_t)cached;
+    }
+
+    const char* env = getenv("SOL_TVU_DEAD_PRIMARY_ANCESTOR_FANOUT");
+    long v = 4; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+    if (v < 1) v = 1;
+    if (v > 64) v = 64;
+    cached = v;
+    return (uint32_t)cached;
+}
+
+static uint64_t
+tvu_primary_incomplete_retry_ns(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (uint64_t)cached * 1000000ULL;
+    }
+
+    /* Primary-slot safety valve: when the replay-critical slot was marked
+     * INCOMPLETE earlier, periodically allow a retry even if no new shreds
+     * arrived. This prevents permanent stalls when parent/fork state changed
+     * after the previous attempt. Set to 0 to disable. */
+    const char* env = getenv("SOL_TVU_PRIMARY_INCOMPLETE_RETRY_MS");
+    long v = 750; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+    if (v < 0) v = 0;
+    if (v > 60000) v = 60000;
+    cached = v;
+    return (uint64_t)cached * 1000000ULL;
+}
+
 static size_t
 tvu_replay_parent_probe_limit(void) {
     static long cached = -1;
@@ -799,8 +1314,9 @@ tvu_slot_tracker_init(slot_tracker_t* tracker, sol_slot_t slot) {
     tracker->slot = slot;
     tracker->status = SOL_SLOT_STATUS_RECEIVING;
     tracker->first_received_ns = 0;
+    tracker->repair_missing_cursor = 0;
     tracker->last_replay_result = SOL_REPLAY_INCOMPLETE;
-    tracker->restart_probed = false;
+    tracker->last_restart_probe_ns = 0;
     tracker->hash_next = -1;
 }
 
@@ -1133,10 +1649,42 @@ static void*
 shred_verify_thread_func(void* arg) {
     sol_tvu_t* tvu = (sol_tvu_t*)arg;
 
+    static size_t verify_batch_cached = 0u;
+    size_t verify_batch = __atomic_load_n(&verify_batch_cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(verify_batch == 0u, 0)) {
+        verify_batch = 32u;
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        if (ncpu >= 128) {
+            verify_batch = 192u;
+        } else if (ncpu >= 64) {
+            verify_batch = 128u;
+        } else if (ncpu >= 32) {
+            verify_batch = 64u;
+        }
+
+        const char* env = getenv("SOL_TVU_VERIFY_BATCH");
+        if (env && env[0] != '\0') {
+            errno = 0;
+            char* end = NULL;
+            unsigned long parsed = strtoul(env, &end, 10);
+            if (errno == 0 && end && end != env) {
+                while (*end && isspace((unsigned char)*end)) end++;
+                if (*end == '\0') {
+                    verify_batch = (size_t)parsed;
+                }
+            }
+        }
+
+        if (verify_batch < 8u) verify_batch = 8u;
+        if (verify_batch > SOL_TVU_VERIFY_BATCH_MAX) {
+            verify_batch = SOL_TVU_VERIFY_BATCH_MAX;
+        }
+        __atomic_store_n(&verify_batch_cached, verify_batch, __ATOMIC_RELEASE);
+    }
+
     while (tvu->running) {
-        enum { SOL_TVU_VERIFY_BATCH = 32 };
-        shred_queue_entry_t batch[SOL_TVU_VERIFY_BATCH];
-        size_t batch_n = shred_queue_pop_batch(tvu, batch, SOL_TVU_VERIFY_BATCH, 100);
+        shred_queue_entry_t batch[SOL_TVU_VERIFY_BATCH_MAX];
+        size_t batch_n = shred_queue_pop_batch(tvu, batch, verify_batch, 100);
         if (batch_n == 0) {
             continue;
         }
@@ -1328,6 +1876,7 @@ replay_thread_func(void* arg) {
     sol_slot_t report_last_slot = 0;
     uint32_t report_last_txs = 0;
     uint32_t report_last_entries = 0;
+    uint64_t replay_window_diag_ns = 0;
 
     while (tvu->running) {
         /* Find slots ready for replay */
@@ -1337,6 +1886,8 @@ replay_thread_func(void* arg) {
         bool fast_mode = tvu_fast_mode();
         enum {
             SOL_TVU_RESTART_PROBE_PER_LOOP = 16,
+            SOL_TVU_RESTART_PROBE_INTERVAL_NS = 250000000ULL,        /* 250ms */
+            SOL_TVU_PRIMARY_RESTART_PROBE_INTERVAL_NS = 50000000ULL, /* 50ms */
             /* Keep parent-ready checks bounded under backlog. We track the
              * lowest-N complete slots, which preserves strict min-slot replay
              * ordering while avoiding expensive parent probes across all
@@ -1347,6 +1898,38 @@ replay_thread_func(void* arg) {
         size_t probe_count = 0;
         sol_slot_t complete_slots[SOL_TVU_REPLAY_CANDIDATE_SLOTS];
         size_t complete_count = 0;
+        sol_slot_t replay_window_slots[SOL_TVU_REPLAY_CANDIDATE_SLOTS];
+        size_t replay_window_count = 0;
+        sol_slot_t replay_cursor = 0;
+        sol_slot_t replay_max_ahead = 0;
+        sol_slot_t replay_primary_slot = 0;
+        uint64_t loop_now_ns = now_ns();
+
+        if (tvu->replay) {
+            replay_cursor = sol_replay_highest_replayed_slot(tvu->replay);
+            if (replay_cursor == 0) {
+                /* During early startup, highest_replayed can be zero even though
+                 * a non-zero snapshot/root exists. Use root as the replay cursor
+                 * fallback so replay-window filtering is active immediately. */
+                replay_cursor = sol_replay_root_slot(tvu->replay);
+            }
+            replay_max_ahead = tvu_effective_max_replay_ahead(tvu, replay_cursor);
+            if (replay_cursor != 0) {
+                sol_slot_t primary_slot = replay_cursor + 1u;
+                if (primary_slot != 0 &&
+                    sol_replay_is_dead(tvu->replay, primary_slot)) {
+                    sol_slot_t dead_primary_ahead = tvu_primary_dead_replay_ahead_slots();
+                    if (dead_primary_ahead != 0 &&
+                        (replay_max_ahead == 0 || dead_primary_ahead < replay_max_ahead)) {
+                        replay_max_ahead = dead_primary_ahead;
+                    }
+                }
+            }
+            replay_primary_slot = replay_cursor + 1u;
+            if (replay_primary_slot == 0) {
+                replay_primary_slot = replay_cursor;
+            }
+        }
 
         pthread_mutex_lock(&tvu->slots_lock);
         /* Promote any slots waiting on a now-replayed parent. */
@@ -1362,27 +1945,165 @@ replay_thread_func(void* arg) {
             }
         }
 
+        /* Safety valve: tracker churn under heavy ingress can evict the replay
+         * frontier slot even when blockstore already has it complete. Ensure the
+         * frontier slot remains represented so replay can make forward progress. */
+        if (tvu->replay && tvu->blockstore && replay_primary_slot != 0) {
+            slot_tracker_t* primary_tracker = find_slot(tvu, replay_primary_slot);
+            if (!primary_tracker) {
+                bool primary_slot_complete =
+                    sol_blockstore_is_slot_complete(tvu->blockstore, replay_primary_slot);
+                bool primary_has_data = false;
+                if (!primary_slot_complete && fast_mode) {
+                    sol_slot_meta_t meta;
+                    if (sol_blockstore_get_slot_meta(tvu->blockstore, replay_primary_slot, &meta) == SOL_OK &&
+                        meta.received_data > 0) {
+                        primary_has_data = true;
+                    }
+                }
+
+                if (primary_slot_complete || (fast_mode && primary_has_data)) {
+                    primary_tracker = find_or_create_slot(tvu, replay_primary_slot);
+                    if (primary_tracker) {
+                        if (primary_tracker->first_received_ns == 0) {
+                            primary_tracker->first_received_ns = loop_now_ns;
+                        }
+                        primary_tracker->last_received_ns = loop_now_ns;
+                        primary_tracker->last_inserted_ns = loop_now_ns;
+                        tvu_mark_slot_complete_locked(tvu, primary_tracker, false);
+                    }
+                }
+            }
+        }
+
         for (size_t i = 0; i < tvu->num_slots; i++) {
-            if (tvu->slots[i].status != SOL_SLOT_STATUS_COMPLETE) {
+            slot_tracker_t* tracker = &tvu->slots[i];
+
+            if (tvu->replay &&
+                tvu->blockstore &&
+                replay_primary_slot != 0 &&
+                tracker->slot == replay_primary_slot &&
+                tracker->status == SOL_SLOT_STATUS_RECEIVING) {
+                bool primary_slot_complete =
+                    sol_blockstore_is_slot_complete(tvu->blockstore, tracker->slot);
+                bool primary_full_contiguous = false;
+                bool primary_meta_full_noncontiguous = false;
+                if (!primary_slot_complete) {
+                    sol_slot_meta_t meta;
+                    if (sol_blockstore_get_slot_meta(tvu->blockstore, tracker->slot, &meta) == SOL_OK &&
+                        meta.is_full) {
+                        uint32_t missing_idx = 0;
+                        size_t missing_count = sol_blockstore_get_missing_shreds(
+                            tvu->blockstore, tracker->slot, &missing_idx, 1u);
+                        primary_full_contiguous = (missing_count == 0);
+                        primary_meta_full_noncontiguous = (missing_count > 0);
+                    }
+                }
+
+                uint64_t retry_ns = tvu_primary_incomplete_retry_ns();
+                uint64_t since_last_replay_ns = 0;
+                if (tracker->last_replay_ns != 0 && loop_now_ns >= tracker->last_replay_ns) {
+                    since_last_replay_ns = loop_now_ns - tracker->last_replay_ns;
+                }
+
+                uint64_t last_progress_ns = tracker->last_inserted_ns
+                    ? tracker->last_inserted_ns
+                    : (tracker->last_received_ns
+                        ? tracker->last_received_ns
+                        : tracker->first_received_ns);
+                uint64_t stall_ns = 0;
+                if (last_progress_ns != 0 && loop_now_ns >= last_progress_ns) {
+                    stall_ns = loop_now_ns - last_progress_ns;
+                }
+
+                bool retry_due_incomplete =
+                    tracker->last_replay_result == SOL_REPLAY_INCOMPLETE &&
+                    tracker->last_replay_ns != 0 &&
+                    (retry_ns == 0 || since_last_replay_ns >= retry_ns) &&
+                    (tracker->last_inserted_ns == 0 ||
+                     tracker->last_inserted_ns <= tracker->last_replay_ns);
+
+                /* Safety valve: if the primary slot is complete in blockstore but
+                 * replay scheduling state lost track of it (e.g. tracker churn),
+                 * periodically force it back into COMPLETE so replay can retry. */
+                uint64_t stall_retry_ns = retry_ns ? retry_ns : 750000000ULL;
+                bool retry_due_stall =
+                    (stall_ns >= stall_retry_ns) &&
+                    (tracker->last_replay_ns == 0 ||
+                     retry_ns == 0 ||
+                     since_last_replay_ns >= retry_ns);
+
+                bool retry_due_initial = (tracker->last_replay_ns == 0);
+
+                bool primary_consider_replay = primary_slot_complete || primary_full_contiguous;
+                if (!primary_consider_replay &&
+                    primary_meta_full_noncontiguous &&
+                    stall_ns >= 1500000000ULL &&
+                    (tracker->last_replay_ns == 0 ||
+                     retry_ns == 0 ||
+                     since_last_replay_ns >= retry_ns)) {
+                    /* Some duplicate-variant states report "full" metadata while
+                     * still exposing sparse missing sets. Probe replay under deep
+                     * stall to avoid waiting indefinitely on repair convergence. */
+                    primary_consider_replay = true;
+                }
+
+                if (primary_consider_replay &&
+                    (retry_due_initial || retry_due_incomplete || retry_due_stall)) {
+                    tvu_mark_slot_complete_locked(tvu, tracker, false);
+                }
+            }
+
+            if (tracker->status != SOL_SLOT_STATUS_COMPLETE) {
                 continue;
             }
+            sol_slot_t slot = tracker->slot;
             tvu_collect_smallest_slot_candidates(complete_slots,
                                                  &complete_count,
                                                  SOL_TVU_REPLAY_CANDIDATE_SLOTS,
-                                                 tvu->slots[i].slot);
+                                                 slot);
+            if (tvu_slot_in_replay_window(slot, replay_cursor, replay_max_ahead)) {
+                tvu_collect_smallest_slot_candidates(replay_window_slots,
+                                                     &replay_window_count,
+                                                     SOL_TVU_REPLAY_CANDIDATE_SLOTS,
+                                                     slot);
+            }
         }
         if (complete_count == 0) {
             /* Best-effort restart probe: identify a small number of RECEIVING
              * slots with no shreds observed in this run and check persisted
              * blockstore state outside the slot lock. */
             if (tvu->blockstore) {
+                if (replay_primary_slot != 0 && probe_count < SOL_TVU_RESTART_PROBE_PER_LOOP) {
+                    slot_tracker_t* t = find_slot(tvu, replay_primary_slot);
+                    if (t &&
+                        t->status == SOL_SLOT_STATUS_RECEIVING &&
+                        t->slot != 0 &&
+                        t->shreds_received == 0u) {
+                        bool primary_probe_due =
+                            (t->last_restart_probe_ns == 0) ||
+                            (loop_now_ns >= t->last_restart_probe_ns &&
+                             (loop_now_ns - t->last_restart_probe_ns) >=
+                                 SOL_TVU_PRIMARY_RESTART_PROBE_INTERVAL_NS);
+                        if (primary_probe_due) {
+                            t->last_restart_probe_ns = loop_now_ns;
+                            probe_slots[probe_count++] = t->slot;
+                        }
+                    }
+                }
                 for (size_t i = 0; i < tvu->num_slots && probe_count < SOL_TVU_RESTART_PROBE_PER_LOOP; i++) {
                     slot_tracker_t* t = &tvu->slots[i];
                     if (t->status != SOL_SLOT_STATUS_RECEIVING) continue;
                     if (t->slot == 0) continue;
                     if (t->shreds_received != 0u) continue;
-                    if (t->restart_probed) continue;
-                    t->restart_probed = true;
+                    if (replay_primary_slot != 0 && t->slot == replay_primary_slot) continue;
+                    if (t->last_restart_probe_ns != 0 &&
+                        loop_now_ns >= t->last_restart_probe_ns &&
+                        (loop_now_ns - t->last_restart_probe_ns) <
+                            SOL_TVU_RESTART_PROBE_INTERVAL_NS) {
+                        continue;
+                    }
+                    t->last_restart_probe_ns = loop_now_ns;
                     probe_slots[probe_count++] = t->slot;
                 }
             }
@@ -1390,10 +2111,29 @@ replay_thread_func(void* arg) {
         pthread_mutex_unlock(&tvu->slots_lock);
 
         if (complete_count > 0) {
+            const sol_slot_t* replay_candidates = complete_slots;
+            size_t replay_candidate_count = complete_count;
+            if (replay_cursor != 0 && replay_max_ahead != 0) {
+                replay_candidates = replay_window_slots;
+                replay_candidate_count = replay_window_count;
+                if (replay_candidate_count == 0) {
+                    uint64_t now = now_ns();
+                    if (replay_window_diag_ns == 0 ||
+                        (now - replay_window_diag_ns) >= 1000000000ULL) {
+                        sol_log_debug("TVU replay window filtered all complete slots: "
+                                      "cursor=%lu max_ahead=%lu complete=%zu",
+                                      (unsigned long)replay_cursor,
+                                      (unsigned long)replay_max_ahead,
+                                      complete_count);
+                        replay_window_diag_ns = now;
+                    }
+                }
+            }
+
             sol_slot_t best_any = 0;
             sol_slot_t best_parent_ready = 0;
-            for (size_t i = 0; i < complete_count; i++) {
-                sol_slot_t s = complete_slots[i];
+            for (size_t i = 0; i < replay_candidate_count; i++) {
+                sol_slot_t s = replay_candidates[i];
                 if (s == 0) continue;
                 if (best_any == 0 || s < best_any) {
                     best_any = s;
@@ -1411,7 +2151,7 @@ replay_thread_func(void* arg) {
                 }
 
                 size_t parent_probe_budget =
-                    tvu_replay_parent_probe_budget(replay_lag, complete_count);
+                    tvu_replay_parent_probe_budget(replay_lag, replay_candidate_count);
                 if (parent_probe_budget > 0) {
                     bool probed[SOL_TVU_REPLAY_CANDIDATE_SLOTS];
                     memset(probed, 0, sizeof(probed));
@@ -1419,8 +2159,8 @@ replay_thread_func(void* arg) {
                     for (size_t probe_i = 0; probe_i < parent_probe_budget; probe_i++) {
                         sol_slot_t probe_slot = 0;
                         size_t probe_idx = 0;
-                        if (!tvu_pick_smallest_unprobed_slot(complete_slots,
-                                                             complete_count,
+                        if (!tvu_pick_smallest_unprobed_slot(replay_candidates,
+                                                             replay_candidate_count,
                                                              probed,
                                                              &probe_slot,
                                                              &probe_idx)) {
@@ -1774,6 +2514,7 @@ repair_thread_func(void* arg) {
     }
     uint64_t last_primary_diag_ns = 0;
     uint64_t last_thread_diag_ns = 0;
+    uint64_t last_primary_pending_reset_ns = 0;
 
     while (tvu->running) {
         struct timespec ts = {0, 250000};  /* 250us */
@@ -1790,12 +2531,22 @@ repair_thread_func(void* arg) {
         if (headroom == 0) {
             continue;
         }
+        size_t pending_target = max_pending / 4u;
+        if (pending_target < 2048u) {
+            pending_target = 2048u;
+        }
+        bool pending_saturated = pending >= pending_target;
         uint32_t thread_count = (uint32_t)tvu->repair_thread_count;
         if (thread_count == 0) {
             thread_count = 1;
         }
 
         bool strict_primary = false;
+        bool strict_due_pending = false;
+        uint64_t primary_stall_ms_hint = 0;
+        size_t primary_missing_hint = 0;
+        bool primary_missing_hint_valid = false;
+        bool primary_meta_full_hint = false;
 
 	        /* Proactively backfill a window of slots ahead of the highest replayed
 	         * slot. This is critical for bootstrap/catchup, where turbine may not
@@ -1803,15 +2554,27 @@ repair_thread_func(void* arg) {
 	        sol_slot_t replay_cursor = 0;
 	        sol_slot_t catchup_start = 0;
 	        sol_slot_t catchup_end = 0;
-	        enum {
-	            /* Only repair within a bounded window ahead of replay. Repairing
-	             * far-ahead slots creates huge pending sets and increases tail
-	             * latency for the critical next slot. */
-                    SOL_TVU_CATCHUP_WINDOW_SLOTS = 2048,
+                enum {
+                    /* Only repair within a bounded window ahead of replay. Repairing
+                     * far-ahead slots creates huge pending sets and increases tail
+                     * latency for the critical next slot. */
+                    SOL_TVU_CATCHUP_WINDOW_SLOTS = 128,
                     /* When the primary (next) slot is incomplete, shrink the repair
                      * window further to keep requests tightly focused. */
-                    SOL_TVU_PRIMARY_REPAIR_WINDOW_SLOTS = 768,
-	        };
+                    SOL_TVU_PRIMARY_REPAIR_WINDOW_SLOTS = 96,
+                    /* Enter strict-primary mode sooner so far-ahead requests don't
+                     * starve the blocked replay-critical slot. */
+                    SOL_TVU_PRIMARY_STRICT_PENDING_MIN = 2048,
+                    SOL_TVU_PRIMARY_STRICT_STALL_MS = 1000,
+                    SOL_TVU_PRIMARY_STRICT_KEEP_SLOTS = 16,
+                    SOL_TVU_PRIMARY_STRICT_KEEP_STALLED_SLOTS = 8,
+                    /* Missing-heavy primary slots need tighter focus than
+                     * stall/pending checks alone; otherwise far-ahead repair
+                     * churn can dominate request bandwidth. */
+                    SOL_TVU_PRIMARY_STRICT_MISSING_MIN = 1024,
+                    SOL_TVU_PRIMARY_STRICT_KEEP_HEAVY_SLOTS = 16,
+                    SOL_TVU_PRIMARY_STRICT_KEEP_SEVERE_SLOTS = 8,
+                };
 
 	        if (tvu->replay) {
 	            replay_cursor = sol_replay_highest_replayed_slot(tvu->replay);
@@ -1827,12 +2590,59 @@ repair_thread_func(void* arg) {
 		             * cursor advances. */
 		            focus_primary = !sol_blockstore_is_slot_complete(tvu->blockstore, primary_slot);
                     if (focus_primary) {
+                        /* If the replay-critical slot hasn't progressed recently,
+                         * tighten repair scope even before pending grows huge. */
+                        pthread_mutex_lock(&tvu->slots_lock);
+                        slot_tracker_t* primary_tracker = find_slot(tvu, primary_slot);
+                        if (primary_tracker) {
+                            uint64_t last_progress_ns = primary_tracker->last_inserted_ns
+                                ? primary_tracker->last_inserted_ns
+                                : (primary_tracker->last_received_ns
+                                    ? primary_tracker->last_received_ns
+                                    : primary_tracker->first_received_ns);
+                            if (last_progress_ns != 0 &&
+                                now >= last_progress_ns) {
+                                primary_stall_ms_hint =
+                                    (now - last_progress_ns) / 1000000ULL;
+                            }
+                        }
+                        pthread_mutex_unlock(&tvu->slots_lock);
+
+                        /* Missing-heavy primaries should enter strict mode
+                         * immediately, even if they are still receiving some
+                         * progress and therefore do not look "stalled". */
+                        if (tvu->blockstore) {
+                            uint32_t missing_probe[SOL_TVU_PRIMARY_STRICT_MISSING_MIN];
+                            primary_missing_hint = sol_blockstore_get_missing_shreds(
+                                tvu->blockstore,
+                                primary_slot,
+                                missing_probe,
+                                SOL_TVU_PRIMARY_STRICT_MISSING_MIN);
+                            primary_missing_hint_valid = true;
+
+                            sol_slot_meta_t primary_meta;
+                            if (sol_blockstore_get_slot_meta(tvu->blockstore, primary_slot, &primary_meta) == SOL_OK) {
+                                primary_meta_full_hint = primary_meta.is_full;
+                            }
+                        }
+
                         /* When pending backlog grows too large, aggressive
                          * lookahead can starve the blocked next slot. */
-                        size_t strict_threshold = (max_pending * 2u) / 3u;
-                        if (strict_threshold < 8192u) strict_threshold = 8192u;
-                        if (pending >= strict_threshold) {
+                        size_t strict_threshold = max_pending / 3u;
+                        if (strict_threshold < (size_t)SOL_TVU_PRIMARY_STRICT_PENDING_MIN) {
+                            strict_threshold = (size_t)SOL_TVU_PRIMARY_STRICT_PENDING_MIN;
+                        }
+                        if (pending >= strict_threshold ||
+                            primary_stall_ms_hint >= (uint64_t)SOL_TVU_PRIMARY_STRICT_STALL_MS ||
+                            (primary_missing_hint_valid &&
+                             primary_missing_hint >= (size_t)SOL_TVU_PRIMARY_STRICT_MISSING_MIN) ||
+                            (primary_meta_full_hint &&
+                             primary_missing_hint_valid &&
+                             primary_missing_hint >= 32u)) {
                             strict_primary = true;
+                            if (pending >= strict_threshold) {
+                                strict_due_pending = true;
+                            }
                         }
                     }
 		            if (focus_primary && catchup_end != 0) {
@@ -1843,9 +2653,39 @@ repair_thread_func(void* arg) {
 		            }
 		        }
 
+        bool pending_pressure_medium =
+            (max_pending > 0u) && (pending >= ((max_pending * 5u) / 10u));
+        bool pending_pressure_high =
+            (max_pending > 0u) && (pending >= ((max_pending * 7u) / 10u));
+        if (pending_saturated && !pending_pressure_medium) {
+            pending_pressure_medium = true;
+        }
+
+        if (catchup_start != 0 && catchup_end >= catchup_start && pending_pressure_medium) {
+            sol_slot_t pressure_keep = focus_primary ? 48u : 64u;
+            sol_slot_t pressure_end = catchup_start + pressure_keep;
+            if (pressure_end >= catchup_start && pressure_end < catchup_end) {
+                catchup_end = pressure_end;
+            }
+        }
+
         if (strict_primary && focus_primary && primary_slot != 0 && thread_idx == 0) {
             /* Keep repair queue centered on the replay-critical window. */
-            sol_slot_t keep_max = primary_slot + (sol_slot_t)128;
+            sol_slot_t keep_span =
+                (primary_stall_ms_hint >= (uint64_t)SOL_TVU_PRIMARY_STRICT_STALL_MS)
+                    ? (sol_slot_t)SOL_TVU_PRIMARY_STRICT_KEEP_STALLED_SLOTS
+                    : (sol_slot_t)SOL_TVU_PRIMARY_STRICT_KEEP_SLOTS;
+            if (strict_due_pending && keep_span > 8u) {
+                keep_span = 8u;
+            }
+            if (primary_missing_hint_valid &&
+                primary_missing_hint >= (size_t)(SOL_TVU_PRIMARY_STRICT_MISSING_MIN * 2u)) {
+                keep_span = (sol_slot_t)SOL_TVU_PRIMARY_STRICT_KEEP_SEVERE_SLOTS;
+            } else if (primary_missing_hint_valid &&
+                       primary_missing_hint >= (size_t)SOL_TVU_PRIMARY_STRICT_MISSING_MIN) {
+                keep_span = (sol_slot_t)SOL_TVU_PRIMARY_STRICT_KEEP_HEAVY_SLOTS;
+            }
+            sol_slot_t keep_max = primary_slot + keep_span;
             if (keep_max < primary_slot) keep_max = 0;
             size_t pruned = sol_repair_prune_pending_outside_window(tvu->repair, primary_slot, keep_max);
             if (pruned > 0 &&
@@ -1864,6 +2704,37 @@ repair_thread_func(void* arg) {
             }
         }
 
+        if (!strict_primary &&
+            thread_idx == 0 &&
+            catchup_start != 0 &&
+            catchup_end >= catchup_start &&
+            pending_pressure_high) {
+            /* Under sustained high pending pressure, aggressively evict
+             * far-ahead requests to preserve headroom for the replay frontier. */
+            sol_slot_t keep_span = focus_primary ? 48u : 64u;
+            sol_slot_t keep_max = catchup_start + keep_span;
+            if (keep_max < catchup_start) {
+                keep_max = 0;
+            }
+            size_t pruned = sol_repair_prune_pending_outside_window(tvu->repair, catchup_start, keep_max);
+            if (pruned > 0 &&
+                (last_thread_diag_ns == 0 || (now - last_thread_diag_ns) >= 1000000000ULL)) {
+                sol_log_debug("TVU pressure prune: keep=[%lu..%lu] pruned=%zu pending=%zu/%zu",
+                              (unsigned long)catchup_start,
+                              (unsigned long)keep_max,
+                              pruned,
+                              pending,
+                              max_pending);
+                last_thread_diag_ns = now;
+            }
+            pending = sol_repair_pending_count(tvu->repair);
+            headroom = (max_pending > pending) ? (max_pending - pending) : 0;
+            if (headroom == 0) {
+                continue;
+            }
+            pending_saturated = pending >= pending_target;
+        }
+
         typedef struct {
             sol_repair_type_t type;
             sol_slot_t        slot;
@@ -1871,30 +2742,50 @@ repair_thread_func(void* arg) {
             uint32_t          fanout; /* Best-effort hedged repair requests (SHRED/HIGHEST). */
         } repair_action_t;
 
-	        enum {
+        enum {
                     SOL_TVU_MAX_REPAIR_ACTIONS = 16384,
                     SOL_TVU_MAX_MISSING_SHREDS = 8192,
-                    SOL_TVU_CATCHUP_MIN_INTERVAL_MS = 2,
-                    SOL_TVU_INITIAL_SHRED_BURST_PRIMARY = 1024,
-                    SOL_TVU_INITIAL_SHRED_BURST_OTHER = 128,
-	            /* When the primary slot is incomplete, we still want to prefetch a
-	             * small lookahead window so replay doesn't immediately stall on the
-	             * next slot.  HighestShred is cheap and deduped by the repair service. */
-                    SOL_TVU_PRIMARY_PREFETCH_SLOTS = 64,
-	        };
+                    SOL_TVU_CATCHUP_MIN_INTERVAL_MS = 1,
+                    SOL_TVU_INITIAL_SHRED_BURST_PRIMARY = 256,
+                    SOL_TVU_INITIAL_SHRED_BURST_OTHER = 32,
+                    /* When the primary slot is incomplete, we still want to prefetch a
+                     * small lookahead window so replay doesn't immediately stall on the
+                     * next slot.  HighestShred is cheap and deduped by the repair service. */
+                    SOL_TVU_PRIMARY_PREFETCH_SLOTS = 12,
+                    SOL_TVU_PRIMARY_PREFETCH_FANOUT = 6,
+                };
 
-        repair_action_t actions[SOL_TVU_MAX_REPAIR_ACTIONS];
+	        repair_action_t actions[SOL_TVU_MAX_REPAIR_ACTIONS];
         size_t action_count = 0;
         size_t action_budget = headroom;
-        uint32_t primary_prefetch_slots = strict_primary ? 16u : (uint32_t)SOL_TVU_PRIMARY_PREFETCH_SLOTS;
+        bool primary_pending_reset = false;
+        sol_slot_t primary_pending_reset_slot = 0;
+        size_t primary_pending_reset_missing = 0;
+        bool primary_missing_heavy = focus_primary && primary_slot != 0 &&
+                                     primary_missing_hint_valid &&
+                                     primary_missing_hint >= 96u;
+        bool primary_missing_severe = focus_primary && primary_slot != 0 &&
+                                      primary_missing_hint_valid &&
+                                      primary_missing_hint >= 192u;
+
+        uint32_t primary_prefetch_slots = (uint32_t)SOL_TVU_PRIMARY_PREFETCH_SLOTS;
+        if (max_pending > 0u && pending >= ((max_pending * 3u) / 4u)) {
+            primary_prefetch_slots = 0u;
+        }
+        if (primary_missing_severe) {
+            if (primary_prefetch_slots > 4u) primary_prefetch_slots = 4u;
+        } else if (primary_missing_heavy && primary_prefetch_slots > 8u) {
+            primary_prefetch_slots = 8u;
+        }
         if (thread_count > 1) {
-            if (strict_primary && focus_primary && primary_slot != 0) {
+            if (strict_primary &&
+                focus_primary && primary_slot != 0) {
                 action_budget = (thread_idx == 0) ? headroom : 0;
             } else if (focus_primary && primary_slot != 0) {
                 /* Prioritize repairing the next replay slot, but keep a small
                  * portion of bandwidth for prefetching ahead so replay doesn't
                  * stall between slots. */
-                size_t primary_budget = (headroom * 3u) / 4u;
+                size_t primary_budget = (headroom * 80u) / 100u;
                 if (primary_budget == 0u) primary_budget = 1u;
                 if (primary_budget > headroom) primary_budget = headroom;
 
@@ -1921,6 +2812,32 @@ repair_thread_func(void* arg) {
         }
         if (action_budget > SOL_TVU_MAX_REPAIR_ACTIONS) {
             action_budget = SOL_TVU_MAX_REPAIR_ACTIONS;
+        }
+        if (pending_saturated && thread_idx != 0) {
+            action_budget = 0;
+        }
+        if (pending_pressure_medium && thread_idx != 0) {
+            action_budget = 0;
+        }
+        {
+            /* Bound per-loop request generation to avoid saturating pending
+             * with far-ahead requests under high ingress. */
+            size_t loop_cap = 256u;
+            if (focus_primary && primary_slot != 0) {
+                loop_cap = (strict_primary || primary_missing_heavy) ? 1024u : 768u;
+            }
+            if (pending_pressure_medium) {
+                loop_cap = focus_primary ? 256u : 96u;
+            }
+            if (action_budget > loop_cap) {
+                action_budget = loop_cap;
+            }
+        }
+        if (pending_saturated) {
+            size_t sat_cap = focus_primary ? 128u : 32u;
+            if (action_budget > sat_cap) {
+                action_budget = sat_cap;
+            }
         }
         if (action_budget == 0) {
             continue;
@@ -1987,7 +2904,20 @@ repair_thread_func(void* arg) {
                 min_interval_ms = SOL_TVU_CATCHUP_MIN_INTERVAL_MS;
             }
 
-            if (!(focus_primary && is_primary_slot) && since_req_ms < min_interval_ms) {
+            uint64_t primary_interval_ms = 0;
+            if (focus_primary && is_primary_slot && primary_missing_hint_valid) {
+                if (primary_missing_hint >= 96u) {
+                    primary_interval_ms = strict_primary ? 2u : 1u;
+                } else if (primary_missing_hint >= 32u) {
+                    primary_interval_ms = 1u;
+                }
+            }
+
+            if (focus_primary && is_primary_slot) {
+                if (since_req_ms < primary_interval_ms) {
+                    continue;
+                }
+            } else if (since_req_ms < min_interval_ms) {
                 continue;
             }
 
@@ -2015,6 +2945,7 @@ repair_thread_func(void* arg) {
                  * to solicit additional shreds so blockstore can surface new
                  * variants and replay can retry. */
                 tracker->last_repair_request_ns = now;
+                bool dead_primary = focus_primary && is_primary_slot;
 
                 sol_slot_meta_t meta;
                 uint32_t first_idx = 0;
@@ -2026,13 +2957,21 @@ repair_thread_func(void* arg) {
                     last_idx = meta.last_shred_index;
                 }
 
+                uint32_t duplicate_fanout = dead_primary
+                    ? tvu_dead_primary_duplicate_fanout()
+                    : 6u;
+                uint32_t highest_fanout = dead_primary
+                    ? tvu_dead_primary_highest_fanout()
+                    : 6u;
+                uint64_t highest_start = have_meta ? ((uint64_t)last_idx + 1u) : 0u;
+
                 /* Request a couple of deterministic indices to encourage peers
                  * to return any conflicting shreds we might have missed. */
                 actions[action_count++] = (repair_action_t){
                     .type = SOL_REPAIR_SHRED,
                     .slot = tracker->slot,
                     .shred_index = first_idx,
-                    .fanout = 1,
+                    .fanout = duplicate_fanout,
                 };
 
                 if (action_count < action_budget &&
@@ -2042,7 +2981,19 @@ repair_thread_func(void* arg) {
                         .type = SOL_REPAIR_SHRED,
                         .slot = tracker->slot,
                         .shred_index = last_idx,
-                        .fanout = 1,
+                        .fanout = duplicate_fanout,
+                    };
+                }
+
+                if (action_count < action_budget &&
+                    have_meta &&
+                    last_idx > first_idx + 1u) {
+                    uint32_t mid_idx = first_idx + ((last_idx - first_idx) / 2u);
+                    actions[action_count++] = (repair_action_t){
+                        .type = SOL_REPAIR_SHRED,
+                        .slot = tracker->slot,
+                        .shred_index = mid_idx,
+                        .fanout = duplicate_fanout,
                     };
                 }
 
@@ -2050,8 +3001,25 @@ repair_thread_func(void* arg) {
                     actions[action_count++] = (repair_action_t){
                         .type = SOL_REPAIR_HIGHEST_SHRED,
                         .slot = tracker->slot,
+                        .shred_index = highest_start,
+                        .fanout = highest_fanout,
+                    };
+                }
+
+                if (dead_primary && action_count < action_budget) {
+                    actions[action_count++] = (repair_action_t){
+                        .type = SOL_REPAIR_ORPHAN,
+                        .slot = tracker->slot,
                         .shred_index = 0,
-                        .fanout = 1,
+                        .fanout = tvu_dead_primary_orphan_fanout(),
+                    };
+                }
+                if (dead_primary && action_count < action_budget) {
+                    actions[action_count++] = (repair_action_t){
+                        .type = SOL_REPAIR_ANCESTOR_HASHES,
+                        .slot = tracker->slot,
+                        .shred_index = 0,
+                        .fanout = tvu_dead_primary_ancestor_fanout(),
                     };
                 }
 
@@ -2147,6 +3115,7 @@ repair_thread_func(void* arg) {
                                    is_primary_slot &&
                                    is_catchup_slot &&
                                    stall_ms >= 40ULL;
+            bool stalled_primary_deep = stalled_primary && (stall_ms >= 1500ULL);
 
             /* Keep missing detection variant-aware by trusting
              * `sol_blockstore_get_missing_shreds()`. Global index existence
@@ -2198,6 +3167,15 @@ repair_thread_func(void* arg) {
                     tracker->last_replay_result == SOL_REPLAY_INCOMPLETE &&
                     tvu->blockstore &&
                     sol_blockstore_is_slot_complete(tvu->blockstore, tracker->slot)) {
+                    request_duplicates = true;
+                }
+                if (!request_duplicates &&
+                    stalled_primary_deep &&
+                    have_meta &&
+                    meta.is_full) {
+                    /* If the replay-critical slot is "full" but replay is still
+                     * stalled for a long interval, proactively solicit duplicate
+                     * variants to break potential fork/parent ambiguity stalls. */
                     request_duplicates = true;
                 }
 
@@ -2256,7 +3234,7 @@ repair_thread_func(void* arg) {
                         .type = SOL_REPAIR_SHRED,
                         .slot = tracker->slot,
                         .shred_index = first_idx,
-                        .fanout = stalled_primary ? 6u : 1u,
+                        .fanout = stalled_primary_deep ? 12u : 1u,
                     };
                     if (action_count < action_budget &&
                         have_meta &&
@@ -2265,8 +3243,42 @@ repair_thread_func(void* arg) {
                             .type = SOL_REPAIR_SHRED,
                             .slot = tracker->slot,
                             .shred_index = last_idx,
-                            .fanout = stalled_primary ? 6u : 1u,
+                            .fanout = stalled_primary_deep ? 12u : 1u,
                         };
+                    }
+                    if (action_count < action_budget &&
+                        have_meta &&
+                        last_idx > first_idx + 1u) {
+                        uint32_t mid_idx = first_idx + ((last_idx - first_idx) / 2u);
+                        actions[action_count++] = (repair_action_t){
+                            .type = SOL_REPAIR_SHRED,
+                            .slot = tracker->slot,
+                            .shred_index = mid_idx,
+                            .fanout = stalled_primary_deep ? 12u : 1u,
+                        };
+                    }
+                    if (stalled_primary_deep &&
+                        have_meta &&
+                        last_idx > first_idx &&
+                        action_count < action_budget) {
+                        /* Deep-stall sweep: sample multiple indices across the
+                         * slot to solicit alternate duplicate variants. */
+                        uint32_t sweep_points = 8u;
+                        uint32_t span = last_idx - first_idx;
+                        uint32_t step = span / (sweep_points + 1u);
+                        if (step == 0u) step = 1u;
+                        uint32_t idx = first_idx + step;
+                        for (uint32_t s = 0; s < sweep_points &&
+                                            idx < last_idx &&
+                                            action_count < action_budget;
+                             s++, idx += step) {
+                            actions[action_count++] = (repair_action_t){
+                                .type = SOL_REPAIR_SHRED,
+                                .slot = tracker->slot,
+                                .shred_index = idx,
+                                .fanout = 16u,
+                            };
+                        }
                     }
                     if (action_count < action_budget) {
 		                        actions[action_count++] = (repair_action_t){
@@ -2276,6 +3288,22 @@ repair_thread_func(void* arg) {
 		                            .fanout = highest_fanout,
 		                        };
 		                    }
+                    if (stalled_primary_deep && action_count < action_budget) {
+                        actions[action_count++] = (repair_action_t){
+                            .type = SOL_REPAIR_ORPHAN,
+                            .slot = tracker->slot,
+                            .shred_index = 0,
+                            .fanout = tvu_dead_primary_orphan_fanout(),
+                        };
+                    }
+                    if (stalled_primary_deep && action_count < action_budget) {
+                        actions[action_count++] = (repair_action_t){
+                            .type = SOL_REPAIR_ANCESTOR_HASHES,
+                            .slot = tracker->slot,
+                            .shred_index = 0,
+                            .fanout = tvu_dead_primary_ancestor_fanout(),
+                        };
+                    }
 		                } else {
 		                    actions[action_count++] = (repair_action_t){
 		                        .type = SOL_REPAIR_HIGHEST_SHRED,
@@ -2290,7 +3318,7 @@ repair_thread_func(void* arg) {
                  * we repair/replay one slot, then only start asking for the
                  * next slot afterward. Prefetching ahead keeps a small backlog
                  * of upcoming slot metadata/shreds warm. */
-                if (focus_primary && is_primary_slot && thread_idx == 0) {
+                if (focus_primary && is_primary_slot && thread_idx == 0 && primary_prefetch_slots > 0u) {
                     for (uint32_t di = 1;
                          di <= primary_prefetch_slots && action_count < action_budget;
                          di++) {
@@ -2302,7 +3330,7 @@ repair_thread_func(void* arg) {
                             .type = SOL_REPAIR_HIGHEST_SHRED,
                             .slot = next_slot,
                             .shred_index = 0,
-                            .fanout = 6,
+                            .fanout = SOL_TVU_PRIMARY_PREFETCH_FANOUT,
                         };
                     }
                 }
@@ -2310,14 +3338,22 @@ repair_thread_func(void* arg) {
                 bool request_highest = false;
                 bool allow_highest = true;
                 uint64_t highest_idx = 0;
+                bool have_meta = false;
+                bool meta_is_full = false;
+                uint32_t meta_first_idx = 0;
+                uint32_t meta_last_idx = 0;
                 if (is_catchup_slot && tvu->blockstore) {
                     sol_slot_meta_t meta;
                     if (sol_blockstore_get_slot_meta(tvu->blockstore, tracker->slot, &meta) == SOL_OK) {
-	                        if (!meta.is_full || is_primary_slot) {
-	                            request_highest = true;
-	                            highest_idx = (uint64_t)meta.last_shred_index + 1;
-	                            if (focus_primary && is_primary_slot && thread_idx != 0) {
-	                                allow_highest = false;
+	                        have_meta = true;
+	                        meta_is_full = meta.is_full;
+	                        meta_first_idx = meta.first_shred_index;
+	                        meta_last_idx = meta.last_shred_index;
+		                        if (!meta.is_full || is_primary_slot) {
+		                            request_highest = true;
+		                            highest_idx = (uint64_t)meta.last_shred_index + 1;
+		                            if (focus_primary && is_primary_slot && thread_idx != 0) {
+		                                allow_highest = false;
 	                            }
 	                        }
 	                    }
@@ -2326,36 +3362,34 @@ repair_thread_func(void* arg) {
                 uint32_t shred_fanout = 1;
                 uint32_t highest_fanout = 1;
                 if (focus_primary && is_primary_slot) {
-				                    /* Tail latency dominates catchup. When we're missing only
-				                     * a handful of shreds on the primary slot, send hedged
-				                     * requests to multiple peers to avoid multi-second stalls
-				                     * waiting for a single slow/unhelpful repair peer. */
-				                    /* Default to modest fanout even when many shreds are
-				                     * missing; it doesn't increase pending slots (only
-				                     * duplicates the wire request) and helps eliminate tail
-				                     * stalls due to a single bad repair peer. */
-                    shred_fanout = 12;
-                    highest_fanout = 6;
+                    /* Use high fanout only for small tail gaps. Large sparse gaps are
+                     * throughput-bound and oversized fanout amplifies duplicate/timeout
+                     * churn without improving unique shred acquisition. */
+                    shred_fanout = 8;
+                    highest_fanout = 4;
                     if (missing_count <= 16) {
-                        shred_fanout = 32;
-                        highest_fanout = 16;
+                        shred_fanout = 24;
+                        highest_fanout = 12;
                     } else if (missing_count <= 64) {
-                        shred_fanout = 28;
-                        highest_fanout = 14;
-                    } else if (missing_count <= 256) {
-                        shred_fanout = 20;
+                        shred_fanout = 16;
                         highest_fanout = 10;
+                    } else if (missing_count <= 256) {
+                        shred_fanout = 12;
+                        highest_fanout = 8;
                     }
                     if (stalled_primary) {
                         if (missing_count <= 8) {
-                            shred_fanout = 48;
-                            highest_fanout = 24;
+                            shred_fanout = 28;
+                            highest_fanout = 14;
                         } else if (missing_count <= 32) {
-                            shred_fanout = 40;
-                            highest_fanout = 20;
+                            shred_fanout = 24;
+                            highest_fanout = 12;
+                        } else if (missing_count <= 128) {
+                            shred_fanout = 16;
+                            highest_fanout = 10;
                         } else {
-                            shred_fanout = 32;
-                            highest_fanout = 16;
+                            shred_fanout = 12;
+                            highest_fanout = 8;
                         }
                     }
                 }
@@ -2363,13 +3397,142 @@ repair_thread_func(void* arg) {
                     request_highest = true;
                 }
 
-                for (size_t m = 0; m < missing_count && action_count < action_budget; m++) {
+                bool heavy_sparse_primary = focus_primary &&
+                                            is_primary_slot &&
+                                            missing_count >= 256u;
+
+                if (focus_primary &&
+                    is_primary_slot &&
+                    thread_idx == 0 &&
+                    stalled_primary_deep &&
+                    have_meta &&
+                    meta_is_full &&
+                    missing_count >= 1024u) {
+                    /* Deep sparse stalls can pin many stale in-flight requests to
+                     * unresponsive peers. Periodically reset this slot's pending
+                     * set so fresh peer selection can make forward progress. */
+                    const uint64_t reset_interval_ns = 5000000000ULL; /* 5s */
+                    if (last_primary_pending_reset_ns == 0 ||
+                        (now >= last_primary_pending_reset_ns &&
+                         (now - last_primary_pending_reset_ns) >= reset_interval_ns)) {
+                        primary_pending_reset = true;
+                        primary_pending_reset_slot = tracker->slot;
+                        primary_pending_reset_missing = missing_count;
+                        last_primary_pending_reset_ns = now;
+                    }
+                }
+
+                size_t missing_budget = action_budget - action_count;
+                if (missing_budget > 0u && missing_count > 0u) {
+                    size_t missing_burst = missing_count;
+                    if (heavy_sparse_primary) {
+                        if (missing_count >= 1024u) {
+                            missing_burst = 256u;
+                        } else if (missing_count >= 512u) {
+                            missing_burst = 320u;
+                        } else {
+                            missing_burst = 384u;
+                        }
+                    } else if (focus_primary && is_primary_slot && missing_count >= 128u) {
+                        missing_burst = 256u;
+                    } else if (missing_count > 96u) {
+                        missing_burst = 128u;
+                    }
+
+                    if (missing_burst > missing_budget) {
+                        missing_burst = missing_budget;
+                    }
+                    if (missing_burst > missing_count) {
+                        missing_burst = missing_count;
+                    }
+
+                    size_t start = 0;
+                    if (missing_count > missing_burst) {
+                        start = (size_t)(tracker->repair_missing_cursor % (uint32_t)missing_count);
+                    }
+
+                    for (size_t m = 0; m < missing_burst && action_count < action_budget; m++) {
+                        size_t idx = start + m;
+                        if (idx >= missing_count) {
+                            idx -= missing_count;
+                        }
+                        actions[action_count++] = (repair_action_t){
+                            .type = SOL_REPAIR_SHRED,
+                            .slot = tracker->slot,
+                            .shred_index = missing[idx],
+                            .fanout = shred_fanout,
+                        };
+                    }
+
+                    if (missing_count > missing_burst) {
+                        /* Prime increment to rotate probes across the sparse set. */
+                        tracker->repair_missing_cursor += (uint32_t)missing_burst + 17u;
+                    } else {
+                        tracker->repair_missing_cursor = 0u;
+                    }
+                }
+
+                if (stalled_primary_deep &&
+                    have_meta &&
+                    meta_is_full &&
+                    missing_count >= 64 &&
+                    missing_count <= 384 &&
+                    action_count < action_budget) {
+                    /* Deep-stall duplicate probe: if the primary slot is marked
+                     * full but remains highly sparse for a long interval, solicit
+                     * alternate variants by sampling deterministic indices across
+                     * the slot, not only currently-missing indices. */
+                    uint32_t probe_fanout = (missing_count >= 256) ? 8u : 6u;
+
                     actions[action_count++] = (repair_action_t){
                         .type = SOL_REPAIR_SHRED,
                         .slot = tracker->slot,
-                        .shred_index = missing[m],
-                        .fanout = shred_fanout,
+                        .shred_index = meta_first_idx,
+                        .fanout = probe_fanout,
                     };
+
+                    if (action_count < action_budget && meta_last_idx != meta_first_idx) {
+                        actions[action_count++] = (repair_action_t){
+                            .type = SOL_REPAIR_SHRED,
+                            .slot = tracker->slot,
+                            .shred_index = meta_last_idx,
+                            .fanout = probe_fanout,
+                        };
+                    }
+
+                    if (action_count < action_budget && meta_last_idx > meta_first_idx + 1u) {
+                        uint32_t mid_idx = meta_first_idx + ((meta_last_idx - meta_first_idx) / 2u);
+                        actions[action_count++] = (repair_action_t){
+                            .type = SOL_REPAIR_SHRED,
+                            .slot = tracker->slot,
+                            .shred_index = mid_idx,
+                            .fanout = probe_fanout,
+                        };
+                    }
+
+                    if (meta_last_idx > meta_first_idx + 2u) {
+                        uint32_t sweep_points = 4u;
+                        uint32_t span = meta_last_idx - meta_first_idx;
+                        uint32_t step = span / (sweep_points + 1u);
+                        if (step == 0u) step = 1u;
+                        uint32_t idx = meta_first_idx + step;
+                        for (uint32_t s = 0; s < sweep_points &&
+                                            idx < meta_last_idx &&
+                                            action_count < action_budget;
+                             s++, idx += step) {
+                            actions[action_count++] = (repair_action_t){
+                                .type = SOL_REPAIR_SHRED,
+                                .slot = tracker->slot,
+                                .shred_index = idx,
+                                .fanout = probe_fanout,
+                            };
+                        }
+                    }
+
+                    if (highest_fanout < (probe_fanout / 2u)) {
+                        highest_fanout = probe_fanout / 2u;
+                    }
+                    request_highest = true;
                 }
 
                 if (stalled_primary && action_count < action_budget) {
@@ -2475,10 +3638,10 @@ repair_thread_func(void* arg) {
 	                         * window ahead so replay can keep running once this slot
 	                         * completes (especially when a consecutive run of slots
 	                         * are missing tail indices). */
-		                        if (focus_primary && is_primary_slot && thread_idx == 0) {
-		                            for (uint32_t di = 1;
-		                                 di <= primary_prefetch_slots && action_count < action_budget;
-		                                 di++) {
+	                        if (focus_primary && is_primary_slot && thread_idx == 0 && primary_prefetch_slots > 0u) {
+	                            for (uint32_t di = 1;
+	                                 di <= primary_prefetch_slots && action_count < action_budget;
+	                                 di++) {
 		                                sol_slot_t next_slot = tracker->slot + (sol_slot_t)di;
 		                                if (next_slot == 0 || (catchup_end != 0 && next_slot > catchup_end)) {
 		                                    break;
@@ -2487,7 +3650,7 @@ repair_thread_func(void* arg) {
                                     .type = SOL_REPAIR_HIGHEST_SHRED,
                                     .slot = next_slot,
                                     .shred_index = 0,
-                                    .fanout = 6,
+                                    .fanout = SOL_TVU_PRIMARY_PREFETCH_FANOUT,
                                 };
 	                            }
 	                        }
@@ -2495,36 +3658,69 @@ repair_thread_func(void* arg) {
 	        }
         pthread_mutex_unlock(&tvu->slots_lock);
 
+        if (primary_pending_reset && primary_pending_reset_slot != 0) {
+            size_t dropped = sol_repair_prune_pending_slot(tvu->repair, primary_pending_reset_slot);
+            if (dropped > 0 &&
+                (last_thread_diag_ns == 0 || (now - last_thread_diag_ns) >= 1000000000ULL)) {
+                sol_log_debug("TVU repair primary reset: slot=%lu missing=%zu dropped=%zu",
+                              (unsigned long)primary_pending_reset_slot,
+                              primary_pending_reset_missing,
+                              dropped);
+                last_thread_diag_ns = now;
+            }
+        }
+
+        uint32_t fanout_cap = UINT32_MAX;
+        if (pending_saturated) {
+            fanout_cap = focus_primary ? 8u : 4u;
+        } else if (pending_pressure_high) {
+            fanout_cap = focus_primary ? 12u : 6u;
+        } else if (pending_pressure_medium) {
+            fanout_cap = focus_primary ? 16u : 8u;
+        }
+
+        uint32_t emergency_fanout = 8u;
+        if (fanout_cap != UINT32_MAX && emergency_fanout > fanout_cap) {
+            emergency_fanout = fanout_cap;
+        }
+
         if (action_count == 0 && catchup_start && action_budget) {
             actions[action_count++] = (repair_action_t){
                 .type = SOL_REPAIR_HIGHEST_SHRED,
                 .slot = catchup_start,
                 .shred_index = 0,
-                .fanout = 8,
+                .fanout = emergency_fanout,
             };
         }
 
         for (size_t i = 0; i < action_count; i++) {
             sol_err_t err = SOL_ERR_INVAL;
             const repair_action_t* a = &actions[i];
+            uint32_t fanout = a->fanout;
+            if (fanout_cap != UINT32_MAX && fanout > fanout_cap) {
+                fanout = fanout_cap;
+            }
+            if (fanout == 0u) {
+                fanout = 1u;
+            }
             switch (a->type) {
             case SOL_REPAIR_SHRED:
-                if (a->fanout > 1) {
+                if (fanout > 1u) {
                     err = sol_repair_request_shred_fanout(tvu->repair,
                                                          a->slot,
                                                          a->shred_index,
                                                          true,
-                                                         a->fanout);
+                                                         fanout);
                 } else {
                     err = sol_repair_request_shred(tvu->repair, a->slot, a->shred_index, true);
                 }
                 break;
             case SOL_REPAIR_HIGHEST_SHRED:
-                if (a->fanout > 1) {
+                if (fanout > 1u) {
                     err = sol_repair_request_highest_fanout(tvu->repair,
                                                             a->slot,
                                                             a->shred_index,
-                                                            a->fanout);
+                                                            fanout);
                 } else {
                     err = sol_repair_request_highest(tvu->repair, a->slot, a->shred_index);
                 }
@@ -2852,6 +4048,7 @@ sol_tvu_process_shred(sol_tvu_t* tvu, const uint8_t* shred, size_t len) {
     if (max_ahead != 0 && tvu->replay && len >= SOL_SHRED_COMMON_HEADER_SIZE) {
         sol_slot_t cursor = sol_replay_highest_replayed_slot(tvu->replay);
         if (cursor != 0) {
+            max_ahead = tvu_effective_max_shred_ahead(tvu, cursor);
             sol_slot_t slot = (sol_slot_t)sol_load_u64_le(shred + 65);
             if (slot > cursor && (slot - cursor) > max_ahead) {
                 return SOL_OK;
@@ -2878,6 +4075,9 @@ sol_tvu_process_shreds_batch(sol_tvu_t* tvu, const sol_udp_pkt_t* pkts, int coun
     sol_slot_t cursor = 0;
     if (max_ahead != 0 && tvu->replay) {
         cursor = sol_replay_highest_replayed_slot(tvu->replay);
+        if (cursor != 0) {
+            max_ahead = tvu_effective_max_shred_ahead(tvu, cursor);
+        }
     }
 
     size_t dropped_full = 0;

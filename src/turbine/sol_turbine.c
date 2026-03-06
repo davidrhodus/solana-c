@@ -14,6 +14,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <unistd.h>
 #ifdef __linux__
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -70,6 +71,39 @@ struct sol_turbine {
     /* Receive buffer */
     uint8_t                 recv_buf[2048];
 };
+
+static size_t
+turbine_recv_budget(void) {
+    static size_t cached = 0;
+    if (__builtin_expect(cached != 0u, 1)) {
+        return cached;
+    }
+
+    size_t budget = 131072u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        budget = 1048576u;
+    } else if (ncpu >= 64) {
+        budget = 262144u;
+    } else if (ncpu <= 16) {
+        budget = 65536u;
+    }
+
+    const char* env = getenv("SOL_TURBINE_RECV_BUDGET");
+    if (env && env[0] != '\0') {
+        errno = 0;
+        char* end = NULL;
+        unsigned long long parsed = strtoull(env, &end, 10);
+        if (errno == 0 && end && end != env && *end == '\0') {
+            budget = (size_t)parsed;
+        }
+    }
+
+    if (budget < 4096u) budget = 4096u;
+    if (budget > 8388608u) budget = 8388608u;
+    cached = budget;
+    return cached;
+}
 
 /*
  * Hash slot for slot table lookup
@@ -477,8 +511,15 @@ sol_turbine_start(sol_turbine_t* turbine, uint16_t tvu_port) {
     /* Mainnet shred feeds can exceed tens of thousands of packets/sec. Use a
      * large socket receive buffer to reduce kernel-level drops when user-space
      * is momentarily busy (signature verify, RocksDB, etc.). */
-    udp_cfg.recv_buf = 128u * 1024u * 1024u;
-    udp_cfg.send_buf = 128u * 1024u * 1024u;
+    size_t sock_buf = 128u * 1024u * 1024u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        sock_buf = 1024u * 1024u * 1024u;
+    } else if (ncpu >= 64) {
+        sock_buf = 512u * 1024u * 1024u;
+    }
+    udp_cfg.recv_buf = sock_buf;
+    udp_cfg.send_buf = sock_buf;
 
     turbine->tvu_sock = sol_udp_new(&udp_cfg);
     if (!turbine->tvu_sock) {
@@ -577,7 +618,7 @@ sol_turbine_run_once(sol_turbine_t* turbine, uint32_t timeout_ms) {
     }
 
     /* Drain TVU socket to avoid dropping shreds under load. */
-    enum { SOL_TURBINE_RECV_BUDGET = 32768 };
+    size_t recv_budget = turbine_recv_budget();
     size_t received = 0;
     sol_udp_pkt_t pkts[SOL_NET_BATCH_SIZE];
     const bool fast_ingress =
@@ -585,7 +626,7 @@ sol_turbine_run_once(sol_turbine_t* turbine, uint32_t timeout_ms) {
         (turbine->shred_batch_callback || turbine->shred_callback) &&
         !turbine->slot_callback;
 
-    while (received < SOL_TURBINE_RECV_BUDGET) {
+    while (received < recv_budget) {
         int n = sol_udp_recv_batch(turbine->tvu_sock, pkts, SOL_NET_BATCH_SIZE);
         if (n < 0) {
             return SOL_ERR_IO;

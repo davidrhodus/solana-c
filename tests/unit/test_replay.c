@@ -113,6 +113,31 @@ TEST(bank_forks_create_destroy) {
     TEST_ASSERT(forks != NULL);
     TEST_ASSERT_EQ(sol_bank_forks_count(forks), 1);
     TEST_ASSERT_EQ(sol_bank_forks_root_slot(forks), 0);
+    TEST_ASSERT(sol_bank_forks_capacity(forks) >= 256);
+
+    sol_bank_forks_destroy(forks);
+}
+
+TEST(bank_forks_custom_capacity_enforced) {
+    sol_bank_t* root = sol_bank_new(0, NULL, NULL, NULL);
+    TEST_ASSERT(root != NULL);
+
+    sol_bank_forks_config_t cfg = SOL_BANK_FORKS_CONFIG_DEFAULT;
+    cfg.max_banks = 4;
+
+    sol_bank_forks_t* forks = sol_bank_forks_new(root, &cfg);
+    TEST_ASSERT_NOT_NULL(forks);
+    TEST_ASSERT_EQ(sol_bank_forks_capacity(forks), 4);
+    TEST_ASSERT_EQ(sol_bank_forks_count(forks), 1);
+
+    TEST_ASSERT_NOT_NULL(sol_bank_forks_new_from_parent(forks, 0, 1));
+    TEST_ASSERT_NOT_NULL(sol_bank_forks_new_from_parent(forks, 1, 2));
+    TEST_ASSERT_NOT_NULL(sol_bank_forks_new_from_parent(forks, 2, 3));
+    TEST_ASSERT_EQ(sol_bank_forks_count(forks), 4);
+
+    /* Capacity reached: no additional child bank should be created. */
+    TEST_ASSERT(sol_bank_forks_new_from_parent(forks, 3, 4) == NULL);
+    TEST_ASSERT_EQ(sol_bank_forks_count(forks), 4);
 
     sol_bank_forks_destroy(forks);
 }
@@ -973,6 +998,7 @@ TEST(replay_null_handling) {
     sol_replay_destroy(NULL);
 
     TEST_ASSERT_EQ(sol_bank_forks_count(NULL), 0);
+    TEST_ASSERT_EQ(sol_bank_forks_capacity(NULL), 0);
     TEST_ASSERT_EQ(sol_bank_forks_root_slot(NULL), 0);
     TEST_ASSERT(sol_bank_forks_get(NULL, 0) == NULL);
 
@@ -989,6 +1015,7 @@ TEST(replay_null_handling) {
 static test_case_t replay_tests[] = {
     /* Bank forks tests */
     TEST_CASE(bank_forks_create_destroy),
+    TEST_CASE(bank_forks_custom_capacity_enforced),
     TEST_CASE(bank_forks_get_root),
     TEST_CASE(bank_forks_new_from_parent),
     TEST_CASE(bank_forks_get_bank),

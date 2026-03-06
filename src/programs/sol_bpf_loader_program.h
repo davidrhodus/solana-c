@@ -50,6 +50,29 @@ sol_err_t sol_bpf_loader_execute_program(
 );
 
 /*
+ * Best-effort preload of a deployed BPF program into the shared loader cache.
+ *
+ * This parses and caches the program ELF without executing it, reducing
+ * first-use replay stalls on hot programs.
+ */
+sol_err_t sol_bpf_loader_prewarm_program(
+    sol_bank_t* bank,
+    const sol_pubkey_t* program_id
+);
+
+/*
+ * Budgeted variant of program prewarm.
+ *
+ * `wait_budget_ns` bounds how long prewarm waits on an in-flight load.
+ * Pass `UINT64_MAX` for legacy/unbounded waiting behavior.
+ */
+sol_err_t sol_bpf_loader_prewarm_program_budget(
+    sol_bank_t* bank,
+    const sol_pubkey_t* program_id,
+    uint64_t wait_budget_ns
+);
+
+/*
  * CPI dispatch helper for BPF programs
  */
 sol_err_t sol_bpf_loader_cpi_dispatch(

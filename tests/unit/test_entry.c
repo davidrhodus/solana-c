@@ -6,6 +6,7 @@
 #include "sol_entry.h"
 #include "sol_alloc.h"
 #include "sol_sha256.h"
+#include <stdlib.h>
 #include <string.h>
 
 /*
@@ -720,6 +721,71 @@ TEST(entry_compute_hash_different_prev_hash) {
     sol_entry_cleanup(&entry);
 }
 
+TEST(entry_batch_verify_parallel_matches_serial) {
+    enum { ENTRY_COUNT = 320 };
+
+    sol_entry_batch_t* batch = sol_entry_batch_new(ENTRY_COUNT);
+    TEST_ASSERT(batch != NULL);
+
+    sol_hash_t start_hash = {0};
+    memset(start_hash.bytes, 0x42, sizeof(start_hash.bytes));
+
+    sol_hash_t prev = start_hash;
+    for (size_t i = 0; i < ENTRY_COUNT; i++) {
+        sol_entry_t* entry = &batch->entries[i];
+        sol_entry_init(entry);
+        entry->num_hashes = (uint64_t)((i % 3u) + 1u);
+        entry->num_transactions = 0;
+        sol_entry_compute_hash(entry, &prev, &entry->hash);
+        prev = entry->hash;
+    }
+    batch->num_entries = ENTRY_COUNT;
+
+    const char* key_threads = "SOL_ENTRY_VERIFY_PARALLEL_THREADS";
+    const char* key_min_entries = "SOL_ENTRY_VERIFY_PARALLEL_MIN_ENTRIES";
+    const char* prev_threads = getenv(key_threads);
+    const char* prev_min_entries = getenv(key_min_entries);
+    char prev_threads_buf[32] = {0};
+    char prev_min_entries_buf[32] = {0};
+    bool had_prev_threads = false;
+    bool had_prev_min_entries = false;
+
+    if (prev_threads && prev_threads[0] != '\0') {
+        strncpy(prev_threads_buf, prev_threads, sizeof(prev_threads_buf) - 1u);
+        had_prev_threads = true;
+    }
+    if (prev_min_entries && prev_min_entries[0] != '\0') {
+        strncpy(prev_min_entries_buf, prev_min_entries, sizeof(prev_min_entries_buf) - 1u);
+        had_prev_min_entries = true;
+    }
+
+    setenv(key_threads, "4", 1);
+    setenv(key_min_entries, "1", 1);
+
+    sol_entry_verify_result_t vr = sol_entry_batch_verify(batch, &start_hash);
+    TEST_ASSERT(vr.valid);
+    TEST_ASSERT_EQ(vr.num_verified, ENTRY_COUNT);
+
+    batch->entries[137].hash.bytes[0] ^= 0x80u;
+    vr = sol_entry_batch_verify(batch, &start_hash);
+    TEST_ASSERT(!vr.valid);
+    TEST_ASSERT_EQ(vr.failed_entry, 137u);
+    batch->entries[137].hash.bytes[0] ^= 0x80u;
+
+    if (had_prev_threads) {
+        setenv(key_threads, prev_threads_buf, 1);
+    } else {
+        unsetenv(key_threads);
+    }
+    if (had_prev_min_entries) {
+        setenv(key_min_entries, prev_min_entries_buf, 1);
+    } else {
+        unsetenv(key_min_entries);
+    }
+
+    sol_entry_batch_destroy(batch);
+}
+
 /*
  * Null handling tests
  */
@@ -777,6 +843,7 @@ static test_case_t entry_tests[] = {
     TEST_CASE(entry_compute_hash_deterministic),
     TEST_CASE(entry_compute_hash_different_num_hashes),
     TEST_CASE(entry_compute_hash_different_prev_hash),
+    TEST_CASE(entry_batch_verify_parallel_matches_serial),
     TEST_CASE(entry_null_handling),
     TEST_CASE(entry_parse_truncated),
 };

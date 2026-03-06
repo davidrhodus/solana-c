@@ -15,6 +15,16 @@
 #include "../programs/sol_secp256k1_program.h"
 #include "../programs/sol_secp256r1_program.h"
 
+static void
+log_program_fallback_once(volatile uint32_t* once_flag, const char* msg) {
+    if (!once_flag || !msg) {
+        return;
+    }
+    if (__atomic_exchange_n(once_flag, 1u, __ATOMIC_RELAXED) == 0u) {
+        sol_log_warn("%s", msg);
+    }
+}
+
 static uint64_t
 program_base_compute_units(const sol_pubkey_t* program_id) {
     /* Base compute-unit cost charged from the compute meter before a
@@ -134,21 +144,28 @@ sol_program_execute(sol_invoke_context_t* ctx) {
         sol_err_t err = sol_bpf_loader_execute_program(ctx, program_id);
         if (err == SOL_ERR_PROGRAM_INVALID_ACCOUNT ||
             err == SOL_ERR_ACCOUNT_NOT_FOUND) {
+            static volatile uint32_t stake_fallback_warned = 0u;
+            static volatile uint32_t token_fallback_warned = 0u;
+            static volatile uint32_t ata_fallback_warned = 0u;
+
             /* Migrated builtins (Stake, Config, ALT, Token) are BPF programs on
                mainnet and must execute via the VM.  However, unit tests commonly
                construct a minimal in-memory bank without these program accounts
                present.  Fall back to the native stake implementation in that
                specific case so CPI return-data tests can remain self-contained. */
             if (sol_pubkey_eq(program_id, &SOL_STAKE_PROGRAM_ID)) {
-                sol_log_warn("Stake program account not found; falling back to native stake program");
+                log_program_fallback_once(&stake_fallback_warned,
+                                          "Stake program account not found; falling back to native stake program");
                 return sol_stake_program_execute(ctx);
             }
             if (sol_pubkey_eq(program_id, &SOL_TOKEN_PROGRAM_ID)) {
-                sol_log_warn("Token program account not found; falling back to native token program");
+                log_program_fallback_once(&token_fallback_warned,
+                                          "Token program account not found; falling back to native token program");
                 return sol_token_program_execute(ctx);
             }
             if (sol_pubkey_eq(program_id, &SOL_ASSOCIATED_TOKEN_PROGRAM_ID)) {
-                sol_log_warn("Associated Token program account not found; falling back to native associated token program");
+                log_program_fallback_once(&ata_fallback_warned,
+                                          "Associated Token program account not found; falling back to native associated token program");
                 return sol_associated_token_program_execute(ctx);
             }
             return SOL_ERR_PROGRAM_NOT_FOUND;

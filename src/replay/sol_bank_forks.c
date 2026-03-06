@@ -5,7 +5,9 @@
 #include "sol_bank_forks.h"
 #include "../util/sol_alloc.h"
 #include "../util/sol_log.h"
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /*
  * Bank entry in the forks tree
@@ -53,7 +55,185 @@ struct sol_bank_forks {
     /* Serialize root advancement so we can drop forks->lock around expensive
      * AccountsDB delta materialization without racing another root prune. */
     pthread_mutex_t         root_update_lock;
+
+    /* Deferred destruction queue for pruned banks. */
+    pthread_mutex_t         prune_gc_lock;
+    pthread_cond_t          prune_gc_cond;
+    sol_bank_t**            prune_gc_banks;
+    size_t                  prune_gc_len;
+    size_t                  prune_gc_cap;
+    bool                    prune_gc_stop;
+    bool                    prune_gc_thread_started;
+    pthread_t               prune_gc_thread;
 };
+
+enum {
+    KEEP_MARK_UNKNOWN  = 0u,
+    KEEP_MARK_KEEP     = 1u,
+    KEEP_MARK_DROP     = 2u,
+    KEEP_MARK_VISITING = 3u,
+};
+
+static void
+bank_forks_destroy_bank_array(sol_bank_t** banks, size_t count) {
+    if (!banks || count == 0) return;
+    for (size_t i = 0; i < count; i++) {
+        sol_bank_destroy(banks[i]);
+    }
+}
+
+static void*
+bank_forks_prune_gc_worker(void* arg) {
+    sol_bank_forks_t* forks = (sol_bank_forks_t*)arg;
+    if (!forks) return NULL;
+
+    for (;;) {
+        sol_bank_t** batch = NULL;
+        size_t batch_len = 0;
+
+        pthread_mutex_lock(&forks->prune_gc_lock);
+        while (!forks->prune_gc_stop && forks->prune_gc_len == 0) {
+            pthread_cond_wait(&forks->prune_gc_cond, &forks->prune_gc_lock);
+        }
+        if (forks->prune_gc_len > 0) {
+            batch = forks->prune_gc_banks;
+            batch_len = forks->prune_gc_len;
+            forks->prune_gc_banks = NULL;
+            forks->prune_gc_len = 0;
+            forks->prune_gc_cap = 0;
+        } else if (forks->prune_gc_stop) {
+            pthread_mutex_unlock(&forks->prune_gc_lock);
+            break;
+        }
+        pthread_mutex_unlock(&forks->prune_gc_lock);
+
+        if (batch && batch_len > 0) {
+            bank_forks_destroy_bank_array(batch, batch_len);
+            sol_free(batch);
+        }
+    }
+
+    return NULL;
+}
+
+static void
+bank_forks_prune_gc_enqueue(sol_bank_forks_t* forks, sol_bank_t** banks, size_t count) {
+    if (!banks || count == 0) {
+        sol_free(banks);
+        return;
+    }
+
+    if (!forks || !forks->prune_gc_thread_started) {
+        bank_forks_destroy_bank_array(banks, count);
+        sol_free(banks);
+        return;
+    }
+
+    bool queued = false;
+    pthread_mutex_lock(&forks->prune_gc_lock);
+    if (!forks->prune_gc_stop) {
+        size_t need = forks->prune_gc_len + count;
+        if (need >= forks->prune_gc_len) {
+            if (need > forks->prune_gc_cap) {
+                size_t new_cap = forks->prune_gc_cap ? forks->prune_gc_cap : 256u;
+                while (new_cap < need) {
+                    if (new_cap > SIZE_MAX / 2u) {
+                        new_cap = need;
+                        break;
+                    }
+                    new_cap *= 2u;
+                }
+
+                sol_bank_t** next = sol_realloc(forks->prune_gc_banks, new_cap * sizeof(*next));
+                if (next) {
+                    forks->prune_gc_banks = next;
+                    forks->prune_gc_cap = new_cap;
+                }
+            }
+
+            if (need <= forks->prune_gc_cap) {
+                memcpy(forks->prune_gc_banks + forks->prune_gc_len,
+                       banks,
+                       count * sizeof(*banks));
+                forks->prune_gc_len = need;
+                queued = true;
+                pthread_cond_signal(&forks->prune_gc_cond);
+            }
+        }
+    }
+    pthread_mutex_unlock(&forks->prune_gc_lock);
+
+    if (queued) {
+        sol_free(banks);
+        return;
+    }
+
+    bank_forks_destroy_bank_array(banks, count);
+    sol_free(banks);
+}
+
+static inline uint64_t
+bank_forks_monotonic_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static long
+bank_forks_timing_threshold_ms(void) {
+    static int inited = 0;
+    static long threshold_ms = -1;
+
+    if (!inited) {
+        inited = 1;
+        const char* env = getenv("SOL_BANK_FORKS_TIMING_THRESHOLD_MS");
+        if (env && *env) {
+            char* end = NULL;
+            long parsed = strtol(env, &end, 10);
+            if (end != env && parsed >= 0) {
+                threshold_ms = parsed;
+            }
+        }
+    }
+
+    return threshold_ms;
+}
+
+static inline bool
+bank_forks_timing_enabled(void) {
+    return bank_forks_timing_threshold_ms() >= 0;
+}
+
+static void
+bank_forks_log_slow_path(const char* op,
+                         sol_slot_t slot,
+                         uint64_t total_ns,
+                         uint64_t root_lock_wait_ns,
+                         uint64_t forks_lock_wait_ns,
+                         uint64_t forks_lock_hold_ns,
+                         size_t bank_count) {
+    long threshold_ms = bank_forks_timing_threshold_ms();
+    if (threshold_ms < 0) return;
+
+    uint64_t threshold_ns = (uint64_t)threshold_ms * 1000000ull;
+    if (total_ns < threshold_ns &&
+        root_lock_wait_ns < threshold_ns &&
+        forks_lock_wait_ns < threshold_ns &&
+        forks_lock_hold_ns < threshold_ns) {
+        return;
+    }
+
+    sol_log_info(
+        "Bank forks timing: op=%s slot=%llu total=%.2fms root_wait=%.2fms "
+        "forks_wait=%.2fms forks_hold=%.2fms banks=%zu",
+        op,
+        (unsigned long long)slot,
+        (double)total_ns / 1000000.0,
+        (double)root_lock_wait_ns / 1000000.0,
+        (double)forks_lock_wait_ns / 1000000.0,
+        (double)forks_lock_hold_ns / 1000000.0,
+        bank_count);
+}
 
 /*
  * Hash function for slot
@@ -189,6 +369,21 @@ sol_bank_forks_new(sol_bank_t* root_bank,
         sol_free(forks);
         return NULL;
     }
+    if (pthread_mutex_init(&forks->prune_gc_lock, NULL) != 0) {
+        pthread_mutex_destroy(&forks->root_update_lock);
+        pthread_rwlock_destroy(&forks->lock);
+        sol_free(forks->buckets);
+        sol_free(forks);
+        return NULL;
+    }
+    if (pthread_cond_init(&forks->prune_gc_cond, NULL) != 0) {
+        pthread_mutex_destroy(&forks->prune_gc_lock);
+        pthread_mutex_destroy(&forks->root_update_lock);
+        pthread_rwlock_destroy(&forks->lock);
+        sol_free(forks->buckets);
+        sol_free(forks);
+        return NULL;
+    }
 
     /* Insert root bank */
     sol_slot_t root_slot = sol_bank_slot(root_bank);
@@ -210,6 +405,8 @@ sol_bank_forks_new(sol_bank_t* root_bank,
         if (forks->owns_accounts_db) {
             sol_bank_set_owns_accounts_db(root_bank, true);
         }
+        pthread_cond_destroy(&forks->prune_gc_cond);
+        pthread_mutex_destroy(&forks->prune_gc_lock);
         pthread_mutex_destroy(&forks->root_update_lock);
         pthread_rwlock_destroy(&forks->lock);
         sol_free(forks->buckets);
@@ -231,12 +428,36 @@ sol_bank_forks_new(sol_bank_t* root_bank,
 
     forks->stats.banks_created = 1;
 
+    if (pthread_create(&forks->prune_gc_thread, NULL, bank_forks_prune_gc_worker, forks) == 0) {
+        forks->prune_gc_thread_started = true;
+    } else {
+        forks->prune_gc_thread_started = false;
+        sol_log_warn("bank_forks: prune GC worker disabled; destroying pruned banks inline");
+    }
+
     return forks;
 }
 
 void
 sol_bank_forks_destroy(sol_bank_forks_t* forks) {
     if (!forks) return;
+
+    if (forks->prune_gc_thread_started) {
+        pthread_mutex_lock(&forks->prune_gc_lock);
+        forks->prune_gc_stop = true;
+        pthread_cond_signal(&forks->prune_gc_cond);
+        pthread_mutex_unlock(&forks->prune_gc_lock);
+        (void)pthread_join(forks->prune_gc_thread, NULL);
+        forks->prune_gc_thread_started = false;
+    }
+
+    if (forks->prune_gc_banks && forks->prune_gc_len > 0) {
+        bank_forks_destroy_bank_array(forks->prune_gc_banks, forks->prune_gc_len);
+    }
+    sol_free(forks->prune_gc_banks);
+    forks->prune_gc_banks = NULL;
+    forks->prune_gc_len = 0;
+    forks->prune_gc_cap = 0;
 
     /* Free all entries and banks */
     for (size_t i = 0; i < forks->bucket_count; i++) {
@@ -255,6 +476,8 @@ sol_bank_forks_destroy(sol_bank_forks_t* forks) {
     }
 
     sol_free(forks->buckets);
+    pthread_cond_destroy(&forks->prune_gc_cond);
+    pthread_mutex_destroy(&forks->prune_gc_lock);
     pthread_mutex_destroy(&forks->root_update_lock);
     pthread_rwlock_destroy(&forks->lock);
     sol_free(forks);
@@ -277,12 +500,27 @@ sol_bank_t*
 sol_bank_forks_get_hash(sol_bank_forks_t* forks, sol_slot_t slot, const sol_hash_t* bank_hash) {
     if (!forks || !bank_hash) return NULL;
 
+    bool timing = bank_forks_timing_enabled();
+    uint64_t t_wait0 = timing ? bank_forks_monotonic_ns() : 0;
     pthread_rwlock_rdlock(&forks->lock);
+    uint64_t lock_wait_ns = timing ? (bank_forks_monotonic_ns() - t_wait0) : 0;
 
     sol_bank_entry_t* entry = find_entry_hash(forks, slot, bank_hash);
     sol_bank_t* bank = (entry && !entry->is_dead) ? entry->bank : NULL;
 
     pthread_rwlock_unlock(&forks->lock);
+
+    if (timing) {
+        long threshold_ms = bank_forks_timing_threshold_ms();
+        uint64_t threshold_ns = (uint64_t)threshold_ms * 1000000ull;
+        if (lock_wait_ns >= threshold_ns) {
+            sol_log_info(
+                "Bank forks timing: op=get_hash slot=%llu wait=%.2fms found=%s",
+                (unsigned long long)slot,
+                (double)lock_wait_ns / 1000000.0,
+                bank ? "yes" : "no");
+        }
+    }
     return bank;
 }
 
@@ -502,60 +740,127 @@ is_descendant_of(sol_bank_forks_t* forks, sol_slot_t slot, sol_slot_t ancestor) 
     return false;
 }
 
-static bool
-is_descendant_of_hash(sol_bank_forks_t* forks,
-                      const sol_bank_entry_t* entry,
-                      sol_slot_t ancestor_slot,
-                      const sol_hash_t* ancestor_hash) {
-    if (!forks || !entry || !ancestor_hash) return false;
-    if (entry->slot < ancestor_slot) return false;
+static uint8_t
+mark_descendant_keep_slot(sol_bank_forks_t* forks, sol_bank_entry_t* entry, sol_slot_t root_slot) {
+    if (!forks || !entry) return KEEP_MARK_DROP;
 
-    const sol_bank_entry_t* cur = entry;
-    size_t safety = 0;
-
-    while (cur && cur->slot > ancestor_slot) {
-        if (cur->parent_slot == cur->slot) {
-            return false;
-        }
-
-        sol_bank_entry_t* parent = find_entry_hash(forks, cur->parent_slot, &cur->parent_hash);
-        if (!parent) {
-            return false;
-        }
-
-        cur = parent;
-        if (++safety > forks->bank_count) {
-            return false;
-        }
+    if (entry->slot == root_slot) {
+        entry->keep_mark = KEEP_MARK_KEEP;
+        return KEEP_MARK_KEEP;
+    }
+    if (entry->slot < root_slot) {
+        entry->keep_mark = KEEP_MARK_DROP;
+        return KEEP_MARK_DROP;
     }
 
-    if (!cur) return false;
-    if (cur->slot != ancestor_slot) return false;
-
-    sol_hash_t cur_hash = cur->bank_hash;
-    if (sol_hash_is_zero(&cur_hash) && cur->bank) {
-        sol_bank_compute_hash(cur->bank, &cur_hash);
+    if (entry->keep_mark == KEEP_MARK_KEEP || entry->keep_mark == KEEP_MARK_DROP) {
+        return entry->keep_mark;
+    }
+    if (entry->keep_mark == KEEP_MARK_VISITING) {
+        entry->keep_mark = KEEP_MARK_DROP;
+        return KEEP_MARK_DROP;
     }
 
-    return memcmp(cur_hash.bytes, ancestor_hash->bytes, SOL_HASH_SIZE) == 0;
+    entry->keep_mark = KEEP_MARK_VISITING;
+
+    sol_bank_entry_t* parent = NULL;
+    if (entry->parent_slot != entry->slot) {
+        parent = find_entry(forks, entry->parent_slot);
+    }
+
+    uint8_t parent_mark = parent
+        ? mark_descendant_keep_slot(forks, parent, root_slot)
+        : KEEP_MARK_DROP;
+
+    entry->keep_mark = (parent_mark == KEEP_MARK_KEEP) ? KEEP_MARK_KEEP : KEEP_MARK_DROP;
+    return entry->keep_mark;
+}
+
+static uint8_t
+mark_descendant_keep_hash(sol_bank_forks_t* forks,
+                          sol_bank_entry_t* entry,
+                          sol_slot_t root_slot,
+                          const sol_bank_entry_t* root_entry) {
+    if (!forks || !entry || !root_entry) return KEEP_MARK_DROP;
+    if (entry == root_entry) {
+        entry->keep_mark = KEEP_MARK_KEEP;
+        return KEEP_MARK_KEEP;
+    }
+    if (entry->slot < root_slot) {
+        entry->keep_mark = KEEP_MARK_DROP;
+        return KEEP_MARK_DROP;
+    }
+
+    if (entry->keep_mark == KEEP_MARK_KEEP || entry->keep_mark == KEEP_MARK_DROP) {
+        return entry->keep_mark;
+    }
+    if (entry->keep_mark == KEEP_MARK_VISITING) {
+        entry->keep_mark = KEEP_MARK_DROP;
+        return KEEP_MARK_DROP;
+    }
+
+    entry->keep_mark = KEEP_MARK_VISITING;
+
+    sol_bank_entry_t* parent = NULL;
+    if (entry->parent_slot != entry->slot) {
+        parent = find_entry_hash(forks, entry->parent_slot, &entry->parent_hash);
+    }
+
+    uint8_t parent_mark = parent
+        ? mark_descendant_keep_hash(forks, parent, root_slot, root_entry)
+        : KEEP_MARK_DROP;
+
+    entry->keep_mark = (parent_mark == KEEP_MARK_KEEP) ? KEEP_MARK_KEEP : KEEP_MARK_DROP;
+    return entry->keep_mark;
 }
 
 sol_err_t
 sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
     if (!forks) return SOL_ERR_INVAL;
 
+    bool timing = bank_forks_timing_enabled();
+    uint64_t timing_start_ns = timing ? bank_forks_monotonic_ns() : 0;
+    uint64_t root_lock_wait_ns = 0;
+    uint64_t forks_lock_wait_ns = 0;
+    uint64_t forks_lock_hold_ns = 0;
+    size_t timing_bank_count = 0;
+    uint64_t forks_lock_hold_start_ns = 0;
+    bool forks_lock_held = false;
+    uint64_t phase_collect_ns = 0;
+    uint64_t phase_apply_ns = 0;
+    uint64_t phase_mark_ns = 0;
+    uint64_t phase_prune_ns = 0;
+    uint64_t phase_finalize_ns = 0;
+
     sol_slot_t* seal_slots = NULL;
     size_t seal_count = 0;
+    sol_bank_t** pruned_banks = NULL;
+    size_t pruned_count = 0;
+    size_t pruned_cap = 0;
     sol_slot_t* chain_slots = NULL;
     sol_accounts_db_t** chain_dbs = NULL;
+    bool* chain_frozen = NULL;
     size_t chain_len = 0;
     size_t chain_cap = 0;
     sol_accounts_db_t* new_root_db = NULL;
     bool have_root_chain = false;
     sol_err_t ret = SOL_OK;
 
+    uint64_t t_wait0 = timing ? bank_forks_monotonic_ns() : 0;
     pthread_mutex_lock(&forks->root_update_lock);
+    if (timing) {
+        root_lock_wait_ns += bank_forks_monotonic_ns() - t_wait0;
+    }
+
+    t_wait0 = timing ? bank_forks_monotonic_ns() : 0;
     pthread_rwlock_wrlock(&forks->lock);
+    if (timing) {
+        uint64_t t_now = bank_forks_monotonic_ns();
+        forks_lock_wait_ns += t_now - t_wait0;
+        forks_lock_hold_start_ns = t_now;
+        forks_lock_held = true;
+    }
+    uint64_t phase_t0 = timing ? bank_forks_monotonic_ns() : 0;
 
     /* Verify slot exists */
     sol_bank_entry_t* new_root = find_entry(forks, slot);
@@ -602,11 +907,19 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
                     goto out_unlock_rwlock;
                 }
                 chain_dbs = new_dbs;
+
+                bool* new_frozen = sol_realloc(chain_frozen, new_cap * sizeof(*new_frozen));
+                if (!new_frozen) {
+                    ret = SOL_ERR_NOMEM;
+                    goto out_unlock_rwlock;
+                }
+                chain_frozen = new_frozen;
                 chain_cap = new_cap;
             }
 
             chain_slots[chain_len] = e->slot;
             chain_dbs[chain_len] = sol_bank_get_accounts_db(e->bank);
+            chain_frozen[chain_len] = sol_bank_is_frozen(e->bank);
             chain_len++;
 
             if (cur == forks->root_slot) {
@@ -641,16 +954,25 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
         }
     }
 
+    if (timing && forks_lock_held) {
+        if (timing) {
+            phase_collect_ns += bank_forks_monotonic_ns() - phase_t0;
+        }
+        forks_lock_hold_ns += bank_forks_monotonic_ns() - forks_lock_hold_start_ns;
+        forks_lock_held = false;
+    }
     pthread_rwlock_unlock(&forks->lock);
 
     if (have_root_chain) {
+        uint64_t apply_t0 = timing ? bank_forks_monotonic_ns() : 0;
         /* chain[0] = new root ... chain[chain_len-1] = old root.
          * Apply deltas from old-root-child to new-root while fork insertions
          * continue under the bank-forks rwlock. */
         for (size_t i = chain_len - 1; i-- > 0;) {
-            sol_err_t err = sol_accounts_db_apply_delta_default_slot(forks->accounts_db,
-                                                                      chain_dbs[i],
-                                                                      chain_slots[i]);
+            sol_err_t err = sol_accounts_db_apply_delta_default_slot_ex(forks->accounts_db,
+                                                                         chain_dbs[i],
+                                                                         chain_slots[i],
+                                                                         chain_frozen ? chain_frozen[i] : false);
             if (err != SOL_OK) {
                 ret = err;
                 goto out_unlock_root;
@@ -662,9 +984,20 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
             sol_accounts_db_set_parent(new_root_db, forks->accounts_db);
             sol_accounts_db_clear_local(new_root_db);
         }
+        if (timing) {
+            phase_apply_ns += bank_forks_monotonic_ns() - apply_t0;
+        }
     }
 
+    t_wait0 = timing ? bank_forks_monotonic_ns() : 0;
     pthread_rwlock_wrlock(&forks->lock);
+    if (timing) {
+        uint64_t t_now = bank_forks_monotonic_ns();
+        forks_lock_wait_ns += t_now - t_wait0;
+        forks_lock_hold_start_ns = t_now;
+        forks_lock_held = true;
+    }
+    phase_t0 = timing ? bank_forks_monotonic_ns() : 0;
 
     /* Re-check root target after dropping/reacquiring forks->lock. */
     new_root = find_entry(forks, slot);
@@ -677,6 +1010,25 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
         goto out_unlock_rwlock;
     }
 
+    for (size_t i = 0; i < forks->bucket_count; i++) {
+        for (sol_bank_entry_t* entry = forks->buckets[i]; entry; entry = entry->next) {
+            entry->keep_mark = KEEP_MARK_UNKNOWN;
+        }
+    }
+
+    for (size_t i = 0; i < forks->bucket_count; i++) {
+        for (sol_bank_entry_t* entry = forks->buckets[i]; entry; entry = entry->next) {
+            if (entry->keep_mark == KEEP_MARK_UNKNOWN) {
+                (void)mark_descendant_keep_slot(forks, entry, slot);
+            }
+        }
+    }
+    if (timing) {
+        uint64_t now_ns = bank_forks_monotonic_ns();
+        phase_mark_ns += now_ns - phase_t0;
+        phase_t0 = now_ns;
+    }
+
     /* Prune banks that are not descendants of new root */
     for (size_t i = 0; i < forks->bucket_count; i++) {
         sol_bank_entry_t** prev_ptr = &forks->buckets[i];
@@ -685,21 +1037,44 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
         while (entry) {
             sol_bank_entry_t* next = entry->next;
 
-            /* Keep if it's the new root or a descendant */
-            bool keep = (entry->slot == slot) || is_descendant_of(forks, entry->slot, slot);
+            bool keep = (entry->keep_mark == KEEP_MARK_KEEP);
 
             if (!keep) {
                 *prev_ptr = next;
-                sol_bank_destroy(entry->bank);
+                bool deferred_destroy = false;
+                if (entry->bank) {
+                    if (pruned_count == pruned_cap) {
+                        size_t new_cap = pruned_cap ? (pruned_cap * 2u) : 64u;
+                        sol_bank_t** next_pruned =
+                            sol_realloc(pruned_banks, new_cap * sizeof(*next_pruned));
+                        if (next_pruned) {
+                            pruned_banks = next_pruned;
+                            pruned_cap = new_cap;
+                        }
+                    }
+                    if (pruned_count < pruned_cap) {
+                        pruned_banks[pruned_count++] = entry->bank;
+                        deferred_destroy = true;
+                    }
+                }
+                if (!deferred_destroy && entry->bank) {
+                    sol_bank_destroy(entry->bank);
+                }
                 sol_free(entry);
                 forks->bank_count--;
                 forks->stats.banks_pruned++;
             } else {
+                entry->keep_mark = KEEP_MARK_UNKNOWN;
                 prev_ptr = &entry->next;
             }
 
             entry = next;
         }
+    }
+    if (timing) {
+        uint64_t now_ns = bank_forks_monotonic_ns();
+        phase_prune_ns += now_ns - phase_t0;
+        phase_t0 = now_ns;
     }
 
     forks->root_slot = slot;
@@ -707,11 +1082,23 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
     forks->highest_slot = recompute_highest_slot(forks);
     forks->stats.highest_slot = forks->highest_slot;
     forks->highest_unfrozen_slot = 0;
+    if (timing) {
+        phase_finalize_ns += bank_forks_monotonic_ns() - phase_t0;
+    }
 
 out_unlock_rwlock:
-    pthread_rwlock_unlock(&forks->lock);
+    if (forks_lock_held) {
+        timing_bank_count = forks->bank_count;
+        if (timing) {
+            forks_lock_hold_ns += bank_forks_monotonic_ns() - forks_lock_hold_start_ns;
+        }
+        forks_lock_held = false;
+        pthread_rwlock_unlock(&forks->lock);
+    }
 out_unlock_root:
     pthread_mutex_unlock(&forks->root_update_lock);
+
+    bank_forks_prune_gc_enqueue(forks, pruned_banks, pruned_count);
 
     if (ret == SOL_OK) {
         for (size_t i = 0; i < seal_count; i++) {
@@ -721,6 +1108,38 @@ out_unlock_root:
     sol_free(seal_slots);
     sol_free(chain_slots);
     sol_free(chain_dbs);
+    sol_free(chain_frozen);
+
+    if (timing) {
+        uint64_t total_ns = bank_forks_monotonic_ns() - timing_start_ns;
+        bank_forks_log_slow_path("set_root",
+                                 slot,
+                                 total_ns,
+                                 root_lock_wait_ns,
+                                 forks_lock_wait_ns,
+                                 forks_lock_hold_ns,
+                                 timing_bank_count);
+        long threshold_ms = bank_forks_timing_threshold_ms();
+        if (threshold_ms >= 0) {
+            uint64_t threshold_ns = (uint64_t)threshold_ms * 1000000ull;
+            if (total_ns >= threshold_ns ||
+                phase_collect_ns >= threshold_ns ||
+                phase_apply_ns >= threshold_ns ||
+                phase_mark_ns >= threshold_ns ||
+                phase_prune_ns >= threshold_ns) {
+                sol_log_info(
+                    "Bank forks timing detail: op=set_root slot=%llu collect=%.2fms "
+                    "apply=%.2fms mark=%.2fms prune=%.2fms finalize=%.2fms rooted=%zu",
+                    (unsigned long long)slot,
+                    (double)phase_collect_ns / 1000000.0,
+                    (double)phase_apply_ns / 1000000.0,
+                    (double)phase_mark_ns / 1000000.0,
+                    (double)phase_prune_ns / 1000000.0,
+                    (double)phase_finalize_ns / 1000000.0,
+                    (chain_len > 0) ? (chain_len - 1u) : 0u);
+            }
+        }
+    }
     return ret;
 }
 
@@ -730,18 +1149,43 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
                              const sol_hash_t* bank_hash) {
     if (!forks || !bank_hash) return SOL_ERR_INVAL;
 
+    bool timing = bank_forks_timing_enabled();
+    uint64_t timing_start_ns = timing ? bank_forks_monotonic_ns() : 0;
+    uint64_t root_lock_wait_ns = 0;
+    uint64_t forks_lock_wait_ns = 0;
+    uint64_t forks_lock_hold_ns = 0;
+    size_t timing_bank_count = 0;
+    uint64_t forks_lock_hold_start_ns = 0;
+    bool forks_lock_held = false;
+
     sol_slot_t* seal_slots = NULL;
     size_t seal_count = 0;
+    sol_bank_t** pruned_banks = NULL;
+    size_t pruned_count = 0;
+    size_t pruned_cap = 0;
     sol_slot_t* chain_slots = NULL;
     sol_accounts_db_t** chain_dbs = NULL;
+    bool* chain_frozen = NULL;
     size_t chain_len = 0;
     size_t chain_cap = 0;
     sol_accounts_db_t* new_root_db = NULL;
     bool have_root_chain = false;
     sol_err_t ret = SOL_OK;
 
+    uint64_t t_wait0 = timing ? bank_forks_monotonic_ns() : 0;
     pthread_mutex_lock(&forks->root_update_lock);
+    if (timing) {
+        root_lock_wait_ns += bank_forks_monotonic_ns() - t_wait0;
+    }
+
+    t_wait0 = timing ? bank_forks_monotonic_ns() : 0;
     pthread_rwlock_wrlock(&forks->lock);
+    if (timing) {
+        uint64_t t_now = bank_forks_monotonic_ns();
+        forks_lock_wait_ns += t_now - t_wait0;
+        forks_lock_hold_start_ns = t_now;
+        forks_lock_held = true;
+    }
 
     sol_bank_entry_t* new_root = find_entry_hash(forks, slot, bank_hash);
     if (!new_root || !new_root->bank || new_root->is_dead) {
@@ -792,11 +1236,19 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
                     goto out_unlock_rwlock_hash;
                 }
                 chain_dbs = new_dbs;
+
+                bool* new_frozen = sol_realloc(chain_frozen, new_cap * sizeof(*new_frozen));
+                if (!new_frozen) {
+                    ret = SOL_ERR_NOMEM;
+                    goto out_unlock_rwlock_hash;
+                }
+                chain_frozen = new_frozen;
                 chain_cap = new_cap;
             }
 
             chain_slots[chain_len] = cur->slot;
             chain_dbs[chain_len] = sol_bank_get_accounts_db(cur->bank);
+            chain_frozen[chain_len] = sol_bank_is_frozen(cur->bank);
             chain_len++;
 
             if (cur->slot == forks->root_slot) {
@@ -836,13 +1288,18 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
         }
     }
 
+    if (timing && forks_lock_held) {
+        forks_lock_hold_ns += bank_forks_monotonic_ns() - forks_lock_hold_start_ns;
+        forks_lock_held = false;
+    }
     pthread_rwlock_unlock(&forks->lock);
 
     if (have_root_chain) {
         for (size_t i = chain_len - 1; i-- > 0;) {
-            sol_err_t err = sol_accounts_db_apply_delta_default_slot(forks->accounts_db,
-                                                                      chain_dbs[i],
-                                                                      chain_slots[i]);
+            sol_err_t err = sol_accounts_db_apply_delta_default_slot_ex(forks->accounts_db,
+                                                                         chain_dbs[i],
+                                                                         chain_slots[i],
+                                                                         chain_frozen ? chain_frozen[i] : false);
             if (err != SOL_OK) {
                 ret = err;
                 goto out_unlock_root_hash;
@@ -855,7 +1312,14 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
         }
     }
 
+    t_wait0 = timing ? bank_forks_monotonic_ns() : 0;
     pthread_rwlock_wrlock(&forks->lock);
+    if (timing) {
+        uint64_t t_now = bank_forks_monotonic_ns();
+        forks_lock_wait_ns += t_now - t_wait0;
+        forks_lock_hold_start_ns = t_now;
+        forks_lock_held = true;
+    }
 
     new_root = find_entry_hash(forks, slot, bank_hash);
     if (!new_root || !new_root->bank || new_root->is_dead) {
@@ -867,30 +1331,18 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
         goto out_unlock_rwlock_hash;
     }
 
-    /* Snapshot all entries before pruning so descendant checks see a consistent view. */
-    size_t max_entries = forks->bank_count;
-    sol_bank_entry_t** entries = sol_alloc(max_entries * sizeof(*entries));
-    bool* keep = sol_calloc(max_entries, sizeof(*keep));
-    if (!entries || !keep) {
-        sol_free(entries);
-        sol_free(keep);
-        ret = SOL_ERR_NOMEM;
-        goto out_unlock_rwlock_hash;
-    }
-
-    size_t entry_count = 0;
     for (size_t i = 0; i < forks->bucket_count; i++) {
-        for (sol_bank_entry_t* e = forks->buckets[i]; e; e = e->next) {
-            if (entry_count < max_entries) {
-                entries[entry_count++] = e;
-            }
+        for (sol_bank_entry_t* entry = forks->buckets[i]; entry; entry = entry->next) {
+            entry->keep_mark = KEEP_MARK_UNKNOWN;
         }
     }
 
-    for (size_t i = 0; i < entry_count; i++) {
-        sol_bank_entry_t* e = entries[i];
-        keep[i] = (e == new_root) || is_descendant_of_hash(forks, e, slot, bank_hash);
-        e->keep_mark = keep[i] ? 1u : 0u;
+    for (size_t i = 0; i < forks->bucket_count; i++) {
+        for (sol_bank_entry_t* entry = forks->buckets[i]; entry; entry = entry->next) {
+            if (entry->keep_mark == KEEP_MARK_UNKNOWN) {
+                (void)mark_descendant_keep_hash(forks, entry, slot, new_root);
+            }
+        }
     }
 
     for (size_t i = 0; i < forks->bucket_count; i++) {
@@ -899,25 +1351,40 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
 
         while (entry) {
             sol_bank_entry_t* next = entry->next;
-            bool keep_entry = (entry->keep_mark != 0u);
+            bool keep_entry = (entry->keep_mark == KEEP_MARK_KEEP);
 
             if (!keep_entry) {
                 *prev_ptr = next;
-                sol_bank_destroy(entry->bank);
+                bool deferred_destroy = false;
+                if (entry->bank) {
+                    if (pruned_count == pruned_cap) {
+                        size_t new_cap = pruned_cap ? (pruned_cap * 2u) : 64u;
+                        sol_bank_t** next_pruned =
+                            sol_realloc(pruned_banks, new_cap * sizeof(*next_pruned));
+                        if (next_pruned) {
+                            pruned_banks = next_pruned;
+                            pruned_cap = new_cap;
+                        }
+                    }
+                    if (pruned_count < pruned_cap) {
+                        pruned_banks[pruned_count++] = entry->bank;
+                        deferred_destroy = true;
+                    }
+                }
+                if (!deferred_destroy && entry->bank) {
+                    sol_bank_destroy(entry->bank);
+                }
                 sol_free(entry);
                 forks->bank_count--;
                 forks->stats.banks_pruned++;
             } else {
-                entry->keep_mark = 0u;
+                entry->keep_mark = KEEP_MARK_UNKNOWN;
                 prev_ptr = &entry->next;
             }
 
             entry = next;
         }
     }
-
-    sol_free(entries);
-    sol_free(keep);
 
     forks->root_slot = slot;
     forks->stats.root_slot = slot;
@@ -926,9 +1393,18 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
     forks->highest_unfrozen_slot = 0;
 
 out_unlock_rwlock_hash:
-    pthread_rwlock_unlock(&forks->lock);
+    if (forks_lock_held) {
+        timing_bank_count = forks->bank_count;
+        if (timing) {
+            forks_lock_hold_ns += bank_forks_monotonic_ns() - forks_lock_hold_start_ns;
+        }
+        forks_lock_held = false;
+        pthread_rwlock_unlock(&forks->lock);
+    }
 out_unlock_root_hash:
     pthread_mutex_unlock(&forks->root_update_lock);
+
+    bank_forks_prune_gc_enqueue(forks, pruned_banks, pruned_count);
 
     if (ret == SOL_OK) {
         for (size_t i = 0; i < seal_count; i++) {
@@ -938,6 +1414,18 @@ out_unlock_root_hash:
     sol_free(seal_slots);
     sol_free(chain_slots);
     sol_free(chain_dbs);
+    sol_free(chain_frozen);
+
+    if (timing) {
+        uint64_t total_ns = bank_forks_monotonic_ns() - timing_start_ns;
+        bank_forks_log_slow_path("set_root_hash",
+                                 slot,
+                                 total_ns,
+                                 root_lock_wait_ns,
+                                 forks_lock_wait_ns,
+                                 forks_lock_hold_ns,
+                                 timing_bank_count);
+    }
     return ret;
 }
 
@@ -1220,4 +1708,15 @@ sol_bank_forks_count(const sol_bank_forks_t* forks) {
     pthread_rwlock_unlock((pthread_rwlock_t*)&forks->lock);
 
     return count;
+}
+
+size_t
+sol_bank_forks_capacity(const sol_bank_forks_t* forks) {
+    if (!forks) return 0;
+
+    pthread_rwlock_rdlock((pthread_rwlock_t*)&forks->lock);
+    size_t cap = (size_t)forks->config.max_banks;
+    pthread_rwlock_unlock((pthread_rwlock_t*)&forks->lock);
+
+    return cap;
 }
