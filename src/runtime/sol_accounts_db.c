@@ -73,6 +73,19 @@ appendvec_map_wait_slow_threshold_ns(void) {
     return threshold_ns;
 }
 
+static sol_err_t
+appendvec_get_fd_size(int fd, uint64_t* out_size) {
+    if (out_size) *out_size = 0;
+    if (fd < 0 || !out_size) return SOL_ERR_INVAL;
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) return SOL_ERR_IO;
+    if (st.st_size < 0) return SOL_ERR_IO;
+
+    *out_size = (uint64_t)st.st_size;
+    return SOL_OK;
+}
+
 /*
  * Hash table entry for account storage (legacy in-memory mode)
  */
@@ -1960,20 +1973,21 @@ appendvec_get_map_ro(sol_accounts_db_t* db,
         /* We're at the FD cache cap. Still try to mmap for fast account loads,
          * but don't keep the FD open. Store the mmap in the tracked entry so
          * subsequent loads avoid open/pread/close. */
-        off_t end = lseek(fd, 0, SEEK_END);
-        if (end < 0) {
+        uint64_t backing_size = 0;
+        sol_err_t serr = appendvec_get_fd_size(fd, &backing_size);
+        if (serr != SOL_OK) {
             close(fd);
-            return SOL_ERR_IO;
+            return serr;
         }
-        if (end == 0) {
+        if (backing_size == 0u) {
             close(fd);
             return SOL_ERR_UNSUPPORTED;
         }
-        if ((uint64_t)end > (uint64_t)SIZE_MAX) {
+        if (backing_size > (uint64_t)SIZE_MAX) {
             close(fd);
             return SOL_ERR_TOO_LARGE;
         }
-        uint64_t cur_size = (uint64_t)end;
+        uint64_t cur_size = backing_size;
 
         for (;;) {
             pthread_rwlock_wrlock(&db->appendvec_lock);
@@ -2021,6 +2035,17 @@ appendvec_get_map_ro(sol_accounts_db_t* db,
                 __atomic_store_n(&cur->size, cur_size, __ATOMIC_RELAXED);
             }
             cur_size = __atomic_load_n(&cur->size, __ATOMIC_RELAXED);
+            if (cur_size == 0u) cur_size = backing_size;
+            if (cur_size > backing_size) {
+                /* Size reservations can temporarily run ahead of EOF. Clamp map
+                 * length to on-disk bytes to avoid SIGBUS on later page faults. */
+                cur_size = backing_size;
+            }
+            if (cur_size == 0u) {
+                pthread_rwlock_unlock(&db->appendvec_lock);
+                close(fd);
+                return SOL_ERR_UNSUPPORTED;
+            }
 
             if (cur->map_inflight) {
                 pthread_rwlock_unlock(&db->appendvec_lock);
@@ -2126,15 +2151,35 @@ appendvec_get_map_ro(sol_accounts_db_t* db,
             continue;
         }
 
-        if (cur_size > (uint64_t)SIZE_MAX) {
-            pthread_rwlock_unlock(&db->appendvec_lock);
-            return SOL_ERR_TOO_LARGE;
-        }
-
         int map_fd = dup(cur->fd);
         if (map_fd < 0) {
             pthread_rwlock_unlock(&db->appendvec_lock);
             return SOL_ERR_IO;
+        }
+        uint64_t backing_size = 0;
+        sol_err_t serr = appendvec_get_fd_size(map_fd, &backing_size);
+        if (serr != SOL_OK) {
+            close(map_fd);
+            pthread_rwlock_unlock(&db->appendvec_lock);
+            return serr;
+        }
+        if (backing_size == 0u) {
+            close(map_fd);
+            pthread_rwlock_unlock(&db->appendvec_lock);
+            return SOL_ERR_UNSUPPORTED;
+        }
+        if (cur_size > backing_size) {
+            cur_size = backing_size;
+        }
+        if (cur_size == 0u) {
+            close(map_fd);
+            pthread_rwlock_unlock(&db->appendvec_lock);
+            return SOL_ERR_UNSUPPORTED;
+        }
+        if (cur_size > (uint64_t)SIZE_MAX) {
+            close(map_fd);
+            pthread_rwlock_unlock(&db->appendvec_lock);
+            return SOL_ERR_TOO_LARGE;
         }
         size_t map_len = (size_t)cur_size;
         cur->map_inflight = 1u;
@@ -2715,7 +2760,7 @@ appendvec_load_account_view_by_ref(sol_accounts_db_t* db,
 
     if (ref->record_offset > map_size ||
         map_size - ref->record_offset < (uint64_t)SOL_APPENDVEC_RECORD_HEADER_SIZE) {
-        return SOL_ERR_TRUNCATED;
+        return appendvec_load_account_by_ref(db, expected_pubkey, ref, out_account);
     }
 
     const uint8_t* hdr = base + ref->record_offset;
@@ -2736,7 +2781,7 @@ appendvec_load_account_view_by_ref(sol_accounts_db_t* db,
                                            &data_len_u64,
                                            NULL,
                                            &layout)) {
-        return SOL_ERR_SNAPSHOT_CORRUPT;
+        return appendvec_load_account_by_ref(db, expected_pubkey, ref, out_account);
     }
 
     if (lamports == 0) {
@@ -2755,7 +2800,7 @@ appendvec_load_account_view_by_ref(sol_accounts_db_t* db,
 
     if (data_offset > map_size ||
         (uint64_t)data_len > map_size - data_offset) {
-        return SOL_ERR_TRUNCATED;
+        return appendvec_load_account_by_ref(db, expected_pubkey, ref, out_account);
     }
 
     sol_account_t* account = sol_account_alloc();

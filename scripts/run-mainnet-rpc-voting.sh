@@ -95,16 +95,16 @@ export ROCKSDB_PATH LOG_FILE
 # Bound async-verify wait before local fallback. Tune lower (or 0) when
 # prioritizing strict latency over duplicate verify work.
 : "${SOL_REPLAY_VERIFY_WAIT_BUDGET_MS:=256}"
-# Keep replay tx-pool on the parallel path under shard contention; sequential
-# fallback on busy slots creates multi-second execute tails. Use a longer
-# bounded wait on large-core hosts before dropping to local sequential replay.
-: "${SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS:=1500}"
-# Apply the long-wait retry to smaller replay segments too; many mainnet
-# hotspots currently manifest in medium-sized DAG segments.
-: "${SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH:=16}"
-# On 96+ core hosts, waiting for an in-flight shard is usually cheaper than
-# falling back to sequential replay for medium/large segments.
-: "${SOL_TX_POOL_REPLAY_FORCE_WAIT_ON_BUSY:=1}"
+# Keep replay queue waits bounded to avoid multi-second convoy stalls. The
+# runtime defaults are core-count aware; we pin the canary profile to low-tail
+# values for large-core RPC+voting nodes.
+: "${SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS:=384}"
+# Let smaller replay batches fail over earlier instead of inheriting the long
+# wait budget, which otherwise amplifies shard hot-spot tails.
+: "${SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH:=64}"
+# Forced extra waits are opt-in; enabling them on busy shards can recreate
+# multi-second replay outliers under contention.
+: "${SOL_TX_POOL_REPLAY_FORCE_WAIT_ON_BUSY:=0}"
 # Replay/tx scheduler tuning for large-core combined nodes: avoid oversubscription
 # starvation while keeping enough execution throughput.
 : "${SOL_TX_WORKERS:=96}"
