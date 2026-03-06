@@ -994,8 +994,17 @@ replay_has_any_shreds(const sol_replay_t* replay, sol_slot_t slot) {
 }
 
 static bool
+replay_parent_available(sol_replay_t* replay, sol_slot_t slot, sol_slot_t parent_slot);
+
+static bool
 replay_find_slot_parent(sol_replay_t* replay, sol_slot_t slot, sol_slot_t* out_parent_slot) {
     if (!replay || !replay->blockstore || !out_parent_slot) return false;
+
+    /* Parent readiness is variant-sensitive under duplicate forks.  Track the
+     * first observed parent for diagnostics/fallback, but prefer returning a
+     * parent that is currently replay-available if any variant provides one. */
+    sol_slot_t first_parent_slot = 0;
+    bool have_first_parent = false;
 
     size_t num_variants = sol_blockstore_num_variants(replay->blockstore, slot);
     if (num_variants == 0) {
@@ -1009,8 +1018,14 @@ replay_find_slot_parent(sol_replay_t* replay, sol_slot_t slot, sol_slot_t* out_p
         if (sol_blockstore_get_slot_meta_variant(replay->blockstore, slot, variant_id, &meta) != SOL_OK) {
             continue;
         }
-        *out_parent_slot = meta.parent_slot;
-        return true;
+        if (!have_first_parent) {
+            first_parent_slot = meta.parent_slot;
+            have_first_parent = true;
+        }
+        if (replay_parent_available(replay, slot, meta.parent_slot)) {
+            *out_parent_slot = meta.parent_slot;
+            return true;
+        }
     }
 
     /* Fallback for ledgers that may have block data without variant metadata. */
@@ -1021,8 +1036,20 @@ replay_find_slot_parent(sol_replay_t* replay, sol_slot_t slot, sol_slot_t* out_p
             sol_block_destroy(block);
             continue;
         }
-        *out_parent_slot = block->parent_slot;
+        if (!have_first_parent) {
+            first_parent_slot = block->parent_slot;
+            have_first_parent = true;
+        }
+        if (replay_parent_available(replay, slot, block->parent_slot)) {
+            *out_parent_slot = block->parent_slot;
+            sol_block_destroy(block);
+            return true;
+        }
         sol_block_destroy(block);
+    }
+
+    if (have_first_parent) {
+        *out_parent_slot = first_parent_slot;
         return true;
     }
 
@@ -2547,6 +2574,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
 
     sol_block_t* first_block = NULL;
     uint32_t first_variant_id = 0;
+    bool first_parent_available = false;
     for (uint32_t variant_id = 0; variant_id < num_variants; variant_id++) {
         sol_block_t* block = sol_blockstore_get_block_variant(replay->blockstore, slot, variant_id);
         if (!block) continue;
@@ -2554,9 +2582,26 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             sol_block_destroy(block);
             continue;
         }
-        first_block = block;
-        first_variant_id = variant_id;
-        break;
+        bool parent_available = replay_parent_available(replay, slot, block->parent_slot);
+        if (!first_block) {
+            first_block = block;
+            first_variant_id = variant_id;
+            first_parent_available = parent_available;
+            if (first_parent_available) {
+                break;
+            }
+            continue;
+        }
+
+        if (!first_parent_available && parent_available) {
+            sol_block_destroy(first_block);
+            first_block = block;
+            first_variant_id = variant_id;
+            first_parent_available = true;
+            break;
+        }
+
+        sol_block_destroy(block);
     }
 
     if (!first_block) {
@@ -2585,7 +2630,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
      * produced banks) before we create a "replayed slot" tracking entry. Use a
      * weaker parent-availability predicate so live catchup doesn't stall waiting
      * for replay bookkeeping that may never be created for snapshot banks. */
-    bool parent_available = replay_parent_available(replay, slot, parent_slot);
+    bool parent_available = first_parent_available;
 
     if (!parent_available) {
         /* Parent not available yet - add to pending */

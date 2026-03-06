@@ -6941,9 +6941,20 @@ tx_pool_replay_busy_fallback_batch(void) {
     size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v != SIZE_MAX, 1)) return v;
 
-    /* Replay throughput mode: allow small fallback-to-local execution when all
-     * shards are busy to avoid multi-second queue convoy outliers. */
+    /* Replay throughput mode: if all shards are busy, medium ranges should
+     * prefer local execution over queueing behind an in-flight shard job.
+     * This cuts long-tail convoy stalls on high-core hosts. */
     size_t threshold = 64u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        threshold = 256u;
+    } else if (ncpu >= 96) {
+        threshold = 224u;
+    } else if (ncpu >= 64) {
+        threshold = 192u;
+    } else if (ncpu >= 32) {
+        threshold = 128u;
+    }
     const char* env = getenv("SOL_TX_POOL_REPLAY_BUSY_FALLBACK_BATCH");
     if (env && env[0] != '\0') {
         char* end = NULL;
@@ -7019,9 +7030,19 @@ tx_pool_replay_no_seq_fallback_batch(void) {
     size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v != SIZE_MAX, 1)) return v;
 
-    /* For medium/large replay batches, waiting briefly for a busy shard is
-     * usually much cheaper than falling back to fully sequential execution. */
-    size_t threshold = 64u;
+    /* For replay, only large ranges should use extended wait windows on busy
+     * shards. Medium ranges typically do better with quick local fallback. */
+    size_t threshold = 128u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        threshold = 384u;
+    } else if (ncpu >= 96) {
+        threshold = 320u;
+    } else if (ncpu >= 64) {
+        threshold = 256u;
+    } else if (ncpu >= 32) {
+        threshold = 192u;
+    }
     const char* env = getenv("SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH");
     if (env && env[0] != '\0') {
         char* end = NULL;
@@ -7042,21 +7063,18 @@ tx_pool_replay_queue_wait_long_budget_ns(void) {
     uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v != UINT64_MAX, 1)) return v;
 
-    /* Secondary queue-wait budget used for medium/large replay batches after
-     * the short budget expires.
-     *
-     * Keep this bounded well below multi-second territory so one busy shard
-     * cannot hold replay slots in long convoy waits. */
-    uint64_t budget_ms = 128u;
+    /* Secondary queue-wait budget used for large replay batches after the
+     * short wait expires. Keep this tight to avoid convoy amplification. */
+    uint64_t budget_ms = 64u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu >= 128) {
-        budget_ms = 384u;
+        budget_ms = 160u;
     } else if (ncpu >= 96) {
-        budget_ms = 320u;
+        budget_ms = 144u;
     } else if (ncpu >= 64) {
-        budget_ms = 256u;
+        budget_ms = 128u;
     } else if (ncpu >= 32) {
-        budget_ms = 192u;
+        budget_ms = 96u;
     }
     const char* env = getenv("SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS");
     if (env && env[0] != '\0') {
@@ -7067,7 +7085,7 @@ tx_pool_replay_queue_wait_long_budget_ns(void) {
         }
     }
 
-    if (budget_ms > 5000u) budget_ms = 5000u;
+    if (budget_ms > 2000u) budget_ms = 2000u;
     uint64_t budget_ns = budget_ms * 1000000ULL;
     __atomic_store_n(&cached, budget_ns, __ATOMIC_RELEASE);
     return budget_ns;
@@ -7079,18 +7097,19 @@ lthash_queue_wait_budget_ns(void) {
     uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v != UINT64_MAX, 1)) return v;
 
-    /* Lt-hash delta fallback-to-sequential is particularly expensive on replay
-     * hot slots. Bias toward waiting longer for an idle tx-pool shard. */
-    uint64_t budget_ms = 1000u;
+    /* Lt-hash delta fallback-to-sequential is expensive, but very long waits
+     * create replay tails when shards are saturated. Use a bounded middle
+     * ground and keep env override hooks for host-specific tuning. */
+    uint64_t budget_ms = 400u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu >= 128) {
-        budget_ms = 3000u;
+        budget_ms = 1200u;
     } else if (ncpu >= 96) {
-        budget_ms = 2500u;
+        budget_ms = 1000u;
     } else if (ncpu >= 64) {
-        budget_ms = 2000u;
+        budget_ms = 800u;
     } else if (ncpu >= 32) {
-        budget_ms = 1500u;
+        budget_ms = 600u;
     }
 
     const char* env = getenv("SOL_LT_HASH_QUEUE_WAIT_BUDGET_MS");
@@ -8221,12 +8240,17 @@ tx_pool_init_once(void) {
         }
     }
 
-    sol_log_info("TX pool: workers=%lu shards=%lu (dag=%d dag_min_batch=%lu min_batch=%lu)",
+    sol_log_info("TX pool: workers=%lu shards=%lu (dag=%d dag_min_batch=%lu min_batch=%lu replay_busy_fallback=%lu replay_no_seq_wait=%lu replay_wait_ms=%.1f replay_wait_long_ms=%.1f lthash_wait_ms=%.1f)",
                  (unsigned long)(total_spawned_workers ? total_spawned_workers : workers_total),
                  (unsigned long)g_tx_pool_count,
                  tx_dag_sched_enabled() ? 1 : 0,
                  (unsigned long)tx_dag_min_batch(),
-                 (unsigned long)tx_pool_min_batch());
+                 (unsigned long)tx_pool_min_batch(),
+                 (unsigned long)tx_pool_replay_busy_fallback_batch(),
+                 (unsigned long)tx_pool_replay_no_seq_fallback_batch(),
+                 (double)tx_pool_replay_queue_wait_budget_ns() / 1000000.0,
+                 (double)tx_pool_replay_queue_wait_long_budget_ns() / 1000000.0,
+                 (double)lthash_queue_wait_budget_ns() / 1000000.0);
     atexit(tx_pool_shutdown);
 }
 

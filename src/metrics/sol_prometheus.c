@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
 
 /*
  * Maximum metrics and labels
@@ -217,6 +218,39 @@ http_server_thread(void* arg) {
             break;
         }
 
+        struct pollfd pfd = {
+            .fd = server_fd,
+            .events = POLLIN,
+            .revents = 0
+        };
+        int poll_rc = poll(&pfd, 1, 250);
+        if (poll_rc == 0) {
+            continue; /* periodic wake to observe prom->running */
+        }
+        if (poll_rc < 0) {
+            int err = errno;
+            if (!prom->running) break;
+            if (err == EINTR) {
+                continue;
+            }
+
+            accept_error_burst++;
+            if (accept_error_burst == 1 || (accept_error_burst % 100u) == 0u) {
+                sol_log_warn("Prometheus: poll failed: %s (burst=%u)",
+                             strerror(err),
+                             (unsigned)accept_error_burst);
+            }
+            usleep(accept_backoff_us);
+            if (accept_backoff_us < 250000u) {
+                accept_backoff_us <<= 1;
+                if (accept_backoff_us > 250000u) accept_backoff_us = 250000u;
+            }
+            continue;
+        }
+        if (!(pfd.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) {
+            continue;
+        }
+
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
@@ -227,7 +261,20 @@ http_server_thread(void* arg) {
                 break;
             }
             if (err == EINTR || err == EAGAIN || err == EWOULDBLOCK || err == ECONNABORTED) {
-                if (err != EINTR) usleep(1000);
+                /* transient failures on a hot listen socket can otherwise spin */
+                accept_error_burst++;
+                if (accept_error_burst == 1 || (accept_error_burst % 100u) == 0u) {
+                    sol_log_warn("Prometheus: transient accept failed: %s (burst=%u)",
+                                 strerror(err),
+                                 (unsigned)accept_error_burst);
+                }
+                if (err != EINTR) {
+                    usleep(accept_backoff_us);
+                    if (accept_backoff_us < 250000u) {
+                        accept_backoff_us <<= 1;
+                        if (accept_backoff_us > 250000u) accept_backoff_us = 250000u;
+                    }
+                }
                 continue;
             }
             if (err == EBADF || err == ENOTSOCK || err == EINVAL) {

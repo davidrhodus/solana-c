@@ -1877,6 +1877,9 @@ replay_thread_func(void* arg) {
     uint32_t report_last_txs = 0;
     uint32_t report_last_entries = 0;
     uint64_t replay_window_diag_ns = 0;
+    uint64_t parent_missing_diag_ns = 0;
+    uint64_t replay_scheduler_diag_ns = 0;
+    uint64_t replay_primary_result_diag_ns = 0;
 
     while (tvu->running) {
         /* Find slots ready for replay */
@@ -1903,6 +1906,7 @@ replay_thread_func(void* arg) {
         sol_slot_t replay_cursor = 0;
         sol_slot_t replay_max_ahead = 0;
         sol_slot_t replay_primary_slot = 0;
+        size_t replay_candidate_count_diag = 0;
         uint64_t loop_now_ns = now_ns();
 
         if (tvu->replay) {
@@ -2142,6 +2146,7 @@ replay_thread_func(void* arg) {
                     }
                 }
             }
+            replay_candidate_count_diag = replay_candidate_count;
 
             sol_slot_t best_any = 0;
             sol_slot_t best_parent_ready = 0;
@@ -2213,6 +2218,24 @@ replay_thread_func(void* arg) {
                 }
                 pthread_mutex_unlock(&tvu->slots_lock);
             }
+        }
+
+        if ((complete_count > 0 || replay_candidate_count_diag > 0) &&
+            (replay_scheduler_diag_ns == 0 ||
+             (loop_now_ns - replay_scheduler_diag_ns) >= 1000000000ULL)) {
+            if (!found) {
+                sol_log_info("Replay scheduler stalled: complete=%zu candidates=%zu replay_slot=%lu primary=%lu",
+                             complete_count,
+                             replay_candidate_count_diag,
+                             (unsigned long)replay_slot,
+                             (unsigned long)replay_primary_slot);
+            } else if (replay_slot == replay_primary_slot && replay_primary_slot != 0) {
+                sol_log_info("Replay primary scheduled: slot=%lu complete=%zu candidates=%zu",
+                             (unsigned long)replay_slot,
+                             complete_count,
+                             replay_candidate_count_diag);
+            }
+            replay_scheduler_diag_ns = loop_now_ns;
         }
 
         if (!found) {
@@ -2341,9 +2364,35 @@ replay_thread_func(void* arg) {
                 __atomic_fetch_add(&tvu->stats.blocks_failed, 1, __ATOMIC_RELAXED);
                 sol_log_warn("Slot %lu replay failed: %d", (unsigned long)replay_slot, replay_result);
             } else if (replay_result == SOL_REPLAY_PARENT_MISSING) {
+                uint64_t now = now_ns();
+                if (replay_slot == replay_primary_slot &&
+                    (parent_missing_diag_ns == 0 ||
+                     (now - parent_missing_diag_ns) >= 1000000000ULL)) {
+                    bool parent_frozen =
+                        sol_replay_has_frozen_bank(tvu->replay, replay_info.parent_slot);
+                    sol_log_info("Replay primary blocked: slot=%lu parent=%lu parent_frozen=%s",
+                                 (unsigned long)replay_slot,
+                                 (unsigned long)replay_info.parent_slot,
+                                 parent_frozen ? "yes" : "no");
+                    parent_missing_diag_ns = now;
+                }
                 sol_log_debug("Slot %lu waiting for parent %lu",
                               (unsigned long)replay_slot,
                               (unsigned long)replay_info.parent_slot);
+            }
+
+            if (replay_slot == replay_primary_slot &&
+                replay_result != SOL_REPLAY_SUCCESS &&
+                replay_result != SOL_REPLAY_DUPLICATE) {
+                uint64_t now = now_ns();
+                if (replay_primary_result_diag_ns == 0 ||
+                    (now - replay_primary_result_diag_ns) >= 1000000000ULL) {
+                    sol_log_info("Replay primary result: slot=%lu result=%d parent=%lu",
+                                 (unsigned long)replay_slot,
+                                 (int)replay_result,
+                                 (unsigned long)replay_info.parent_slot);
+                    replay_primary_result_diag_ns = now;
+                }
             }
         }
 
