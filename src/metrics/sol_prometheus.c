@@ -75,6 +75,7 @@ struct sol_prometheus {
     /* HTTP server */
     int                 server_fd;
     pthread_t           server_thread;
+    bool                server_thread_started;
     bool                running;
 };
 
@@ -150,6 +151,7 @@ sol_prometheus_new(const sol_prometheus_config_t* config) {
 
     pthread_mutex_init(&prom->metrics_lock, NULL);
     prom->server_fd = -1;
+    prom->server_thread_started = false;
     prom->running = false;
 
     return prom;
@@ -203,6 +205,7 @@ sol_prometheus_destroy(sol_prometheus_t* prom) {
 static void*
 http_server_thread(void* arg) {
     sol_prometheus_t* prom = (sol_prometheus_t*)arg;
+    uint32_t accept_error_burst = 0;
 
     while (prom->running) {
         struct sockaddr_in client_addr;
@@ -210,11 +213,34 @@ http_server_thread(void* arg) {
 
         int client_fd = accept(prom->server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
-            if (prom->running && errno != EINTR) {
-                sol_log_warn("Prometheus: accept failed: %s", strerror(errno));
+            int err = errno;
+            if (!prom->running) {
+                break;
             }
+            if (err == EINTR || err == EAGAIN || err == EWOULDBLOCK || err == ECONNABORTED) {
+                continue;
+            }
+            if (err == EBADF || err == ENOTSOCK || err == EINVAL) {
+                sol_log_error("Prometheus: accept failed: %s (stopping metrics thread)", strerror(err));
+                prom->running = false;
+                if (prom->server_fd >= 0) {
+                    shutdown(prom->server_fd, SHUT_RDWR);
+                    close(prom->server_fd);
+                    prom->server_fd = -1;
+                }
+                break;
+            }
+
+            accept_error_burst++;
+            if (accept_error_burst == 1 || (accept_error_burst % 100u) == 0u) {
+                sol_log_warn("Prometheus: accept failed: %s (burst=%u)",
+                             strerror(err),
+                             (unsigned)accept_error_burst);
+            }
+            usleep(1000);
             continue;
         }
+        accept_error_burst = 0;
 
         /* Don't leak client sockets into snapshot helper processes (curl/zstd). */
         {
@@ -340,6 +366,7 @@ sol_prometheus_start(sol_prometheus_t* prom) {
     }
 
     prom->running = true;
+    prom->server_thread_started = false;
 
     /* Start server thread */
     if (pthread_create(&prom->server_thread, NULL, http_server_thread, prom) != 0) {
@@ -349,6 +376,7 @@ sol_prometheus_start(sol_prometheus_t* prom) {
         prom->server_fd = -1;
         return SOL_ERR_IO;
     }
+    prom->server_thread_started = true;
 
     sol_log_info("Prometheus metrics server started on port %u", prom->config.port);
     return SOL_OK;
@@ -360,7 +388,7 @@ sol_prometheus_start(sol_prometheus_t* prom) {
 sol_err_t
 sol_prometheus_stop(sol_prometheus_t* prom) {
     if (prom == NULL) return SOL_ERR_INVAL;
-    if (!prom->running) return SOL_OK;
+    if (!prom->running && !prom->server_thread_started) return SOL_OK;
 
     prom->running = false;
 
@@ -371,7 +399,10 @@ sol_prometheus_stop(sol_prometheus_t* prom) {
         prom->server_fd = -1;
     }
 
-    pthread_join(prom->server_thread, NULL);
+    if (prom->server_thread_started) {
+        pthread_join(prom->server_thread, NULL);
+        prom->server_thread_started = false;
+    }
 
     sol_log_info("Prometheus metrics server stopped");
     return SOL_OK;

@@ -7043,23 +7043,20 @@ tx_pool_replay_queue_wait_long_budget_ns(void) {
     if (__builtin_expect(v != UINT64_MAX, 1)) return v;
 
     /* Secondary queue-wait budget used for medium/large replay batches after
-     * the short budget expires. Keep this generous enough to absorb a single
-     * in-flight shard job and avoid multi-second sequential fallback tails.
+     * the short budget expires.
      *
-     * On large-core hosts a single in-flight shard job can easily exceed
-     * ~128ms for busy mainnet slots; a too-small budget causes frequent
-     * fallback to fully sequential execution, which creates 4-5s replay
-     * outliers. */
-    uint64_t budget_ms = 256u;
+     * Keep this bounded well below multi-second territory so one busy shard
+     * cannot hold replay slots in long convoy waits. */
+    uint64_t budget_ms = 128u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu >= 128) {
-        budget_ms = 1500u;
+        budget_ms = 384u;
     } else if (ncpu >= 96) {
-        budget_ms = 1200u;
+        budget_ms = 320u;
     } else if (ncpu >= 64) {
-        budget_ms = 900u;
+        budget_ms = 256u;
     } else if (ncpu >= 32) {
-        budget_ms = 512u;
+        budget_ms = 192u;
     }
     const char* env = getenv("SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS");
     if (env && env[0] != '\0') {
@@ -7117,10 +7114,9 @@ tx_pool_replay_force_wait_on_busy(void) {
     int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v >= 0, 1)) return v != 0;
 
-    /* On large-core replay hosts, falling back to sequential execution after a
-     * bounded queue wait is often worse than waiting for a shard to drain. */
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-    int enabled = (ncpu >= 96) ? 1 : 0;
+    /* Keep this opt-in by default. Forcing extra waits on already-busy shards
+     * can compound queue convoy stalls into multi-second replay tails. */
+    int enabled = 0;
 
     const char* env = getenv("SOL_TX_POOL_REPLAY_FORCE_WAIT_ON_BUSY");
     if (env && env[0] != '\0') {
@@ -7137,17 +7133,16 @@ tx_pool_replay_force_wait_cap_ns(void) {
     uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v != UINT64_MAX, 1)) return v;
 
-    /* Avoid unbounded convoy waits when every shard is busy. Keep this below
-     * the multi-second range so replay can fail over instead of stalling a
+    /* Cap extra forced waits so replay can fail over instead of stalling a
      * slot behind one long-running shard job. */
     uint64_t cap_ms = 0u; /* 0 preserves legacy unbounded wait behavior. */
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu >= 128) {
-        cap_ms = 2000u;
+        cap_ms = 800u;
     } else if (ncpu >= 96) {
-        cap_ms = 1500u;
+        cap_ms = 700u;
     } else if (ncpu >= 64) {
-        cap_ms = 1200u;
+        cap_ms = 600u;
     }
 
     const char* env = getenv("SOL_TX_POOL_REPLAY_FORCE_WAIT_CAP_MS");

@@ -1953,7 +1953,18 @@ replay_thread_func(void* arg) {
             if (!primary_tracker) {
                 bool primary_slot_complete =
                     sol_blockstore_is_slot_complete(tvu->blockstore, replay_primary_slot);
+                bool primary_full_contiguous = false;
                 bool primary_has_data = false;
+                if (!primary_slot_complete) {
+                    sol_slot_meta_t meta;
+                    if (sol_blockstore_get_slot_meta(tvu->blockstore, replay_primary_slot, &meta) == SOL_OK &&
+                        meta.is_full) {
+                        uint32_t missing_idx = 0;
+                        size_t missing_count = sol_blockstore_get_missing_shreds(
+                            tvu->blockstore, replay_primary_slot, &missing_idx, 1u);
+                        primary_full_contiguous = (missing_count == 0);
+                    }
+                }
                 if (!primary_slot_complete && fast_mode) {
                     sol_slot_meta_t meta;
                     if (sol_blockstore_get_slot_meta(tvu->blockstore, replay_primary_slot, &meta) == SOL_OK &&
@@ -1962,7 +1973,9 @@ replay_thread_func(void* arg) {
                     }
                 }
 
-                if (primary_slot_complete || (fast_mode && primary_has_data)) {
+                if (primary_slot_complete ||
+                    primary_full_contiguous ||
+                    (fast_mode && primary_has_data)) {
                     primary_tracker = find_or_create_slot(tvu, replay_primary_slot);
                     if (primary_tracker) {
                         if (primary_tracker->first_received_ns == 0) {

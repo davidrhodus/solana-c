@@ -512,11 +512,13 @@ replay_sync_prewarm_programs(void) {
     const char* env = getenv("SOL_REPLAY_SYNC_PREWARM_BPF_PROGRAMS");
     int enabled = 0;
     if (!env || env[0] == '\0') {
-        /* Default to enabled on high-core validators. This path is budgeted,
-         * and prewarming program ELFs before tx execution helps avoid periodic
-         * multi-second first-hit stalls in replay. */
-        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
-        enabled = (ncpu >= 96) ? 1 : 0;
+        /* Keep synchronous program prewarm opt-in by default.
+         *
+         * Even with a nominal per-slot budget, single account/program loads can
+         * block long enough to create multi-second replay outliers on hot slots.
+         * Asynchronous prewarm remains enabled and can warm the same programs
+         * off the replay critical path. */
+        enabled = 0;
     } else {
         enabled = (strcmp(env, "0") != 0) ? 1 : 0;
     }
