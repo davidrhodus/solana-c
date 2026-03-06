@@ -1889,11 +1889,28 @@ sol_replay_new(sol_bank_forks_t* bank_forks,
 
     /* Mark root slot as replayed */
     sol_slot_t root = sol_bank_forks_root_slot(bank_forks);
+    if (root != 0) {
+        /* Replay parent-availability checks require a frozen parent bank in
+         * bank-forks. Snapshot bootstrap can seed root/highest_replayed before
+         * the root entry is explicitly frozen, which can stall replay at
+         * root+1 with repeated PARENT_MISSING. */
+        sol_bank_t* root_bank = sol_bank_forks_get(bank_forks, root);
+        if (root_bank) {
+            if (!sol_bank_is_frozen(root_bank)) {
+                sol_bank_freeze(root_bank);
+            }
+            (void)sol_bank_forks_freeze(bank_forks, root);
+        }
+    }
     uint32_t root_variants = (uint32_t)sol_blockstore_num_variants(blockstore, root);
     uint32_t root_complete = count_complete_variants(blockstore, root, root_variants);
     mark_replayed(replay, root, false, root_variants, root_complete);
     replay->stats.highest_replayed_slot = root;
     replay->highest_replayed_slot_atomic = root;
+    if (root != 0 && !sol_bank_forks_has_frozen_slot(bank_forks, root)) {
+        sol_log_warn("Replay bootstrap: root slot %lu has no frozen bank; parent gating may stall catchup",
+                     (unsigned long)root);
+    }
 
     return replay;
 }

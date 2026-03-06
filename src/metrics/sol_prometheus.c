@@ -206,18 +206,28 @@ static void*
 http_server_thread(void* arg) {
     sol_prometheus_t* prom = (sol_prometheus_t*)arg;
     uint32_t accept_error_burst = 0;
+    uint32_t accept_backoff_us = 1000; /* 1ms */
 
     while (prom->running) {
+        int server_fd = prom->server_fd;
+        if (server_fd < 0) {
+            if (!prom->running) break;
+            sol_log_error("Prometheus: listen socket closed unexpectedly (stopping metrics thread)");
+            prom->running = false;
+            break;
+        }
+
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
-        int client_fd = accept(prom->server_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
             int err = errno;
             if (!prom->running) {
                 break;
             }
             if (err == EINTR || err == EAGAIN || err == EWOULDBLOCK || err == ECONNABORTED) {
+                if (err != EINTR) usleep(1000);
                 continue;
             }
             if (err == EBADF || err == ENOTSOCK || err == EINVAL) {
@@ -237,10 +247,15 @@ http_server_thread(void* arg) {
                              strerror(err),
                              (unsigned)accept_error_burst);
             }
-            usleep(1000);
+            usleep(accept_backoff_us);
+            if (accept_backoff_us < 250000u) {
+                accept_backoff_us <<= 1;
+                if (accept_backoff_us > 250000u) accept_backoff_us = 250000u;
+            }
             continue;
         }
         accept_error_burst = 0;
+        accept_backoff_us = 1000;
 
         /* Don't leak client sockets into snapshot helper processes (curl/zstd). */
         {
