@@ -2383,9 +2383,22 @@ sol_bank_new_from_parent(sol_bank_t* parent, sol_slot_t slot) {
     child->owns_accounts_db = true;
 
     /* Wire parent bank hash for voting/bank-hash computation. Parent is expected
-     * to be frozen when used as an ancestor for replay. */
+     * to be frozen when used as an ancestor for replay.
+     *
+     * Fast path: freeze() precomputes and publishes bank_hash for frozen banks,
+     * so child creation can copy it under parent lock without triggering an
+     * expensive hash compute in the bank_new path. */
     t0 = bank_monotonic_ns();
-    sol_bank_compute_hash(parent, &child->parent_hash);
+    bool parent_hash_ready = false;
+    pthread_mutex_lock(&parent->lock);
+    if (parent->hash_computed) {
+        child->parent_hash = parent->bank_hash;
+        parent_hash_ready = true;
+    }
+    pthread_mutex_unlock(&parent->lock);
+    if (!parent_hash_ready) {
+        sol_bank_compute_hash(parent, &child->parent_hash);
+    }
     phase_parent_hash_ns = bank_monotonic_ns() - t0;
     child->parent_slot = parent->slot;
 
@@ -11552,6 +11565,39 @@ collect_rent_eagerly(sol_bank_t* bank) {
     }
 }
 
+/* Bank hash computation helper.
+ * Caller must hold bank->lock. */
+static inline void
+bank_compute_hash_locked(sol_bank_t* bank) {
+    if (!bank || bank->hash_computed) return;
+
+    /* Ensure accounts_lt_hash is available for hashing (and for child banks
+     * to inherit as their base). */
+    bank_compute_accounts_lt_hash_locked(bank);
+
+    uint8_t signature_count_le[8];
+    sol_store_u64_le(signature_count_le, bank->signature_count);
+
+    /* hash1 = sha256(parent_hash || signature_count || last_blockhash) */
+    sol_hash_t hash1 = {0};
+    sol_sha256_ctx_t ctx;
+    sol_sha256_init(&ctx);
+    sol_sha256_update(&ctx, bank->parent_hash.bytes, SOL_HASH_SIZE);
+    sol_sha256_update(&ctx, signature_count_le, sizeof(signature_count_le));
+    sol_sha256_update(&ctx, bank->blockhash.bytes, SOL_HASH_SIZE);
+    sol_sha256_final_bytes(&ctx, hash1.bytes);
+
+    /* bank_hash = sha256(hash1 || accounts_lt_hash_bytes) */
+    sol_sha256_init(&ctx);
+    sol_sha256_update(&ctx, hash1.bytes, SOL_HASH_SIZE);
+    sol_sha256_update(&ctx,
+                      (const uint8_t*)bank->accounts_lt_hash.v,
+                      SOL_LT_HASH_SIZE_BYTES);
+    sol_sha256_final_bytes(&ctx, bank->bank_hash.bytes);
+
+    bank->hash_computed = true;
+}
+
 void
 sol_bank_freeze(sol_bank_t* bank) {
     if (!bank) return;
@@ -11586,6 +11632,11 @@ sol_bank_freeze(sol_bank_t* bank) {
         run_incinerator(bank);
     }
 
+    /* Precompute frozen bank hash while we already own bank->lock. Child-bank
+     * construction relies on parent bank hash and tail latency improves when
+     * this work is done at freeze-time instead of first child creation. */
+    bank_compute_hash_locked(bank);
+
     /* Publish frozen=true with release semantics so readers can check the flag
      * without contending on bank->lock (used by RPC hot paths). */
     __atomic_store_n(&bank->frozen, true, __ATOMIC_RELEASE);
@@ -11610,32 +11661,7 @@ sol_bank_compute_hash(sol_bank_t* bank, sol_hash_t* out_hash) {
          *   bank_hash = sha256(hash1 || accounts_lt_hash_bytes)
          *
          * Note: snapshots may seed bank->bank_hash via sol_bank_set_bank_hash(). */
-
-        /* Ensure accounts_lt_hash is available for hashing (and for child banks
-         * to inherit as their base). */
-        bank_compute_accounts_lt_hash_locked(bank);
-
-        uint8_t signature_count_le[8];
-        sol_store_u64_le(signature_count_le, bank->signature_count);
-
-        /* hash1 = sha256(parent_hash || signature_count || last_blockhash) */
-        sol_hash_t hash1 = {0};
-        sol_sha256_ctx_t ctx;
-        sol_sha256_init(&ctx);
-        sol_sha256_update(&ctx, bank->parent_hash.bytes, SOL_HASH_SIZE);
-        sol_sha256_update(&ctx, signature_count_le, sizeof(signature_count_le));
-        sol_sha256_update(&ctx, bank->blockhash.bytes, SOL_HASH_SIZE);
-        sol_sha256_final_bytes(&ctx, hash1.bytes);
-
-        /* bank_hash = sha256(hash1 || accounts_lt_hash_bytes) */
-        sol_sha256_init(&ctx);
-        sol_sha256_update(&ctx, hash1.bytes, SOL_HASH_SIZE);
-        sol_sha256_update(&ctx,
-                          (const uint8_t*)bank->accounts_lt_hash.v,
-                          SOL_LT_HASH_SIZE_BYTES);
-        sol_sha256_final_bytes(&ctx, bank->bank_hash.bytes);
-
-        bank->hash_computed = true;
+        bank_compute_hash_locked(bank);
     }
 
     *out_hash = bank->bank_hash;
