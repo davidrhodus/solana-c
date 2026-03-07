@@ -1142,6 +1142,33 @@ tvu_primary_incomplete_retry_ns(void) {
 }
 
 static uint64_t
+tvu_primary_incomplete_same_variant_backoff_ns(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (uint64_t)cached * 1000000ULL;
+    }
+
+    /* When primary replay repeatedly returns INCOMPLETE without any new
+     * complete variants or new inserted shreds, apply a longer retry backoff
+     * to avoid pinning replay on the same stale block variant. Set to 0 to
+     * disable and keep retry cadence controlled only by
+     * SOL_TVU_PRIMARY_INCOMPLETE_RETRY_MS. */
+    const char* env = getenv("SOL_TVU_PRIMARY_INCOMPLETE_SAME_VARIANT_BACKOFF_MS");
+    long v = 5000; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+    if (v < 0) v = 0;
+    if (v > 60000) v = 60000;
+    cached = v;
+    return (uint64_t)cached * 1000000ULL;
+}
+
+static uint64_t
 tvu_primary_replaying_timeout_ns(void) {
     static long cached = -1;
     if (cached >= 0) {
@@ -1919,6 +1946,7 @@ replay_thread_func(void* arg) {
     uint64_t replay_scheduler_diag_ns = 0;
     uint64_t replay_primary_result_diag_ns = 0;
     uint64_t replay_primary_stale_diag_ns = 0;
+    uint64_t replay_primary_backoff_diag_ns = 0;
     uint64_t replay_stale_result_diag_ns = 0;
 
     while (tvu->running) {
@@ -2117,6 +2145,33 @@ replay_thread_func(void* arg) {
 
                 bool retry_due_initial = (tracker->last_replay_ns == 0);
 
+                bool stale_variant_backoff = false;
+                if (tracker->last_replay_result == SOL_REPLAY_INCOMPLETE &&
+                    tracker->last_replay_ns != 0 &&
+                    (tracker->last_inserted_ns == 0 ||
+                     tracker->last_inserted_ns <= tracker->last_replay_ns)) {
+                    uint32_t complete_variants =
+                        tvu_count_complete_variants(tvu->blockstore, tracker->slot);
+                    if (complete_variants <= tracker->last_replay_complete_variants) {
+                        uint64_t backoff_ns = tvu_primary_incomplete_same_variant_backoff_ns();
+                        stale_variant_backoff = (backoff_ns != 0 &&
+                                                 since_last_replay_ns < backoff_ns);
+                        if (stale_variant_backoff &&
+                            (replay_primary_backoff_diag_ns == 0 ||
+                             (loop_now_ns - replay_primary_backoff_diag_ns) >= 1000000000ULL)) {
+                            uint64_t remaining_ms =
+                                (backoff_ns - since_last_replay_ns) / 1000000ULL;
+                            sol_log_debug("Replay primary backoff: slot=%lu result=%d variants=%u prev_variants=%u wait_ms=%lu",
+                                          (unsigned long)tracker->slot,
+                                          (int)tracker->last_replay_result,
+                                          (unsigned)complete_variants,
+                                          (unsigned)tracker->last_replay_complete_variants,
+                                          (unsigned long)remaining_ms);
+                            replay_primary_backoff_diag_ns = loop_now_ns;
+                        }
+                    }
+                }
+
                 bool primary_consider_replay = primary_slot_complete || primary_full_contiguous;
                 if (!primary_consider_replay &&
                     primary_meta_full_noncontiguous &&
@@ -2128,6 +2183,11 @@ replay_thread_func(void* arg) {
                      * still exposing sparse missing sets. Probe replay under deep
                      * stall to avoid waiting indefinitely on repair convergence. */
                     primary_consider_replay = true;
+                }
+
+                if (stale_variant_backoff) {
+                    retry_due_incomplete = false;
+                    retry_due_stall = false;
                 }
 
                 if (primary_consider_replay &&

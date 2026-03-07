@@ -2286,27 +2286,40 @@ replay_entries(sol_replay_t* replay,
 
         pthread_mutex_lock(&verify_worker->mu);
         if (wait_budget_ns > 0) {
-            struct timespec deadline = {0};
-            if (verify_worker->done_clock_monotonic) {
-                clock_gettime(CLOCK_MONOTONIC, &deadline);
-            } else {
-                clock_gettime(CLOCK_REALTIME, &deadline);
-            }
-            deadline.tv_sec += (time_t)(wait_budget_ns / 1000000000ull);
-            deadline.tv_nsec += (long)(wait_budget_ns % 1000000000ull);
-            if (deadline.tv_nsec >= 1000000000l) {
-                deadline.tv_sec++;
-                deadline.tv_nsec -= 1000000000l;
-            }
+            /* Bound waits with short timed slices so clock/condvar edge cases
+             * cannot stretch a nominal budget into multi-second stalls. */
+            uint64_t wait_start_ns = get_time_ns();
+            uint64_t waited_ns = 0;
+            const uint64_t wait_slice_ns = 8ull * 1000ull * 1000ull; /* 8ms */
 
-            while (!verify_worker->job_done && !verify_worker->stop) {
-                int wrc = pthread_cond_timedwait(&verify_worker->done, &verify_worker->mu, &deadline);
-                if (wrc == ETIMEDOUT) {
+            while (!verify_worker->job_done && !verify_worker->stop &&
+                   waited_ns < wait_budget_ns) {
+                uint64_t remaining_ns = wait_budget_ns - waited_ns;
+                uint64_t slice_ns =
+                    (remaining_ns < wait_slice_ns) ? remaining_ns : wait_slice_ns;
+
+                struct timespec deadline = {0};
+                if (verify_worker->done_clock_monotonic) {
+                    clock_gettime(CLOCK_MONOTONIC, &deadline);
+                } else {
+                    clock_gettime(CLOCK_REALTIME, &deadline);
+                }
+                deadline.tv_sec += (time_t)(slice_ns / 1000000000ull);
+                deadline.tv_nsec += (long)(slice_ns % 1000000000ull);
+                if (deadline.tv_nsec >= 1000000000l) {
+                    deadline.tv_sec++;
+                    deadline.tv_nsec -= 1000000000l;
+                }
+
+                int wrc = pthread_cond_timedwait(&verify_worker->done,
+                                                 &verify_worker->mu,
+                                                 &deadline);
+                if (wrc != 0 && wrc != ETIMEDOUT && wrc != EINTR) {
                     break;
                 }
-                if (wrc != 0 && wrc != EINTR) {
-                    break;
-                }
+
+                uint64_t now_ns = get_time_ns();
+                waited_ns = (now_ns >= wait_start_ns) ? (now_ns - wait_start_ns) : wait_budget_ns;
             }
         }
         if (verify_worker->job_done) {

@@ -1300,14 +1300,10 @@ sol_bank_vote_timestamp_cache_update(sol_bank_t* bank,
     }
 
     pthread_rwlock_wrlock(&g_vote_ts_cache_lock);
-    if (g_vote_ts_cache_root_id != root_id || !g_vote_ts_cache) {
-        if (g_vote_ts_cache) {
-            sol_pubkey_map_destroy(g_vote_ts_cache);
-            g_vote_ts_cache = NULL;
-        }
+    if (!g_vote_ts_cache) {
         g_vote_ts_cache = sol_pubkey_map_new(sizeof(vote_timestamp_cache_val_t), 4096u);
-        g_vote_ts_cache_root_id = root_id;
     }
+    g_vote_ts_cache_root_id = root_id;
 
     if (g_vote_ts_cache) {
         vote_timestamp_cache_val_t* cur =
@@ -1363,11 +1359,14 @@ stake_weighted_median_timestamp(sol_bank_t* bank,
     __uint128_t total_stake = 0;
 
     vote_ts_cache_init();
-    uint64_t root_id = vote_ts_cache_root_id_for_db(bank->accounts_db);
 
     sol_pubkey_map_t* ts_map = NULL;
     pthread_rwlock_rdlock(&g_vote_ts_cache_lock);
-    if (g_vote_ts_cache && g_vote_ts_cache_root_id == root_id) {
+    /* Overlay/forked AccountsDB instances can report different root-ids while
+     * still sharing the same effective vote timestamp set. Use the cache as a
+     * best-effort hint even when root-id changed, and lazily refresh entries
+     * from AccountsDB on misses. */
+    if (g_vote_ts_cache) {
         ts_map = g_vote_ts_cache;
     }
 

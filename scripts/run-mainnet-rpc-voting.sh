@@ -74,7 +74,10 @@ export ROCKSDB_PATH LOG_FILE
 : "${SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_LAG:=896}"
 : "${SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_SLOTS:=16}"
 : "${SOL_TVU_PRIMARY_DEAD_REPLAY_AHEAD_SLOTS:=4}"
-: "${SOL_TVU_PRIMARY_INCOMPLETE_RETRY_MS:=500}"
+: "${SOL_TVU_PRIMARY_INCOMPLETE_RETRY_MS:=750}"
+# If primary replay keeps returning INCOMPLETE with the same complete variant,
+# back off retries to avoid pinning replay on a stale duplicate variant.
+: "${SOL_TVU_PRIMARY_INCOMPLETE_SAME_VARIANT_BACKOFF_MS:=5000}"
 # Reduce duplicate-repair amplification while retaining dead-primary recovery.
 : "${SOL_TVU_DEAD_PRIMARY_DUPLICATE_FANOUT:=32}"
 : "${SOL_TVU_DEAD_PRIMARY_HIGHEST_FANOUT:=24}"
@@ -95,14 +98,14 @@ export ROCKSDB_PATH LOG_FILE
 : "${SOL_REPLAY_VERIFY_WORKERS:=24}"
 # Bound async-verify wait before local fallback. Tune lower (or 0) when
 # prioritizing strict latency over duplicate verify work.
-: "${SOL_REPLAY_VERIFY_WAIT_BUDGET_MS:=64}"
+: "${SOL_REPLAY_VERIFY_WAIT_BUDGET_MS:=192}"
 # Keep replay queue waits bounded to avoid multi-second convoy stalls. The
 # runtime defaults are core-count aware; we pin the canary profile to low-tail
 # values for large-core RPC+voting nodes.
-: "${SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS:=384}"
+: "${SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS:=160}"
 # Let smaller replay batches fail over earlier instead of inheriting the long
 # wait budget, which otherwise amplifies shard hot-spot tails.
-: "${SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH:=64}"
+: "${SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH:=384}"
 # Forced extra waits are opt-in; enabling them on busy shards can recreate
 # multi-second replay outliers under contention.
 : "${SOL_TX_POOL_REPLAY_FORCE_WAIT_ON_BUSY:=0}"
@@ -163,6 +166,7 @@ export SOL_TVU_MAX_SHRED_AHEAD_SEVERE_LAG SOL_TVU_MAX_SHRED_AHEAD_SEVERE_SLOTS
 export SOL_TVU_MAX_REPLAY_AHEAD_SLOTS SOL_TVU_MAX_REPLAY_AHEAD_HIGH_LAG SOL_TVU_MAX_REPLAY_AHEAD_HIGH_SLOTS
 export SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_LAG SOL_TVU_MAX_REPLAY_AHEAD_SEVERE_SLOTS
 export SOL_TVU_PRIMARY_DEAD_REPLAY_AHEAD_SLOTS SOL_TVU_PRIMARY_INCOMPLETE_RETRY_MS
+export SOL_TVU_PRIMARY_INCOMPLETE_SAME_VARIANT_BACKOFF_MS
 export SOL_TVU_DEAD_PRIMARY_DUPLICATE_FANOUT SOL_TVU_DEAD_PRIMARY_HIGHEST_FANOUT
 export SOL_TVU_DEAD_PRIMARY_ORPHAN_FANOUT SOL_TVU_DEAD_PRIMARY_ANCESTOR_FANOUT
 export SOL_REPAIR_REQUEST_TIMEOUT_MS SOL_REPAIR_MAX_PENDING SOL_REPAIR_MAX_RETRIES
