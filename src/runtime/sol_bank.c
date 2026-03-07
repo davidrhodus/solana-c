@@ -1088,6 +1088,30 @@ bank_get_vote_stakes_cached(sol_bank_t* bank, uint64_t epoch, uint64_t* out_tota
         }
     }
 
+    /* Overlay/forked AccountsDB instances can carry a different root-id while
+     * still sharing the same effective epoch stake map. If we miss on the
+     * strict (root, epoch) key, fall back to any cached entry for this epoch
+     * to avoid rebuilding vote stakes in replay hot paths. */
+    vote_stakes_cache_entry_t* epoch_fallback = NULL;
+    for (size_t i = 0; i < VOTE_STAKES_CACHE_ENTRIES; i++) {
+        vote_stakes_cache_entry_t* e = &g_vote_stakes_cache[i];
+        if (!e->valid || !e->vote_stakes || e->epoch != epoch) {
+            continue;
+        }
+        if (!epoch_fallback || e->gen > epoch_fallback->gen) {
+            epoch_fallback = e;
+        }
+    }
+    if (epoch_fallback) {
+        epoch_fallback->gen = ++g_vote_stakes_cache_gen;
+        if (out_total_stake) {
+            *out_total_stake = epoch_fallback->total_stake;
+        }
+        sol_pubkey_map_t* map = epoch_fallback->vote_stakes;
+        pthread_mutex_unlock(&g_vote_stakes_cache_lock);
+        return map;
+    }
+
     /* Find eviction slot (first invalid, else least-recently-used). */
     size_t evict = 0;
     uint64_t oldest = UINT64_MAX;
@@ -1124,6 +1148,23 @@ bank_get_vote_stakes_cached(sol_bank_t* bank, uint64_t epoch, uint64_t* out_tota
             sol_pubkey_map_destroy(new_map);
             return map;
         }
+    }
+
+    /* Re-check epoch-only fallback in case another thread seeded it while we
+     * were building. */
+    for (size_t i = 0; i < VOTE_STAKES_CACHE_ENTRIES; i++) {
+        vote_stakes_cache_entry_t* e = &g_vote_stakes_cache[i];
+        if (!e->valid || !e->vote_stakes || e->epoch != epoch) {
+            continue;
+        }
+        e->gen = ++g_vote_stakes_cache_gen;
+        if (out_total_stake) {
+            *out_total_stake = e->total_stake;
+        }
+        sol_pubkey_map_t* map = e->vote_stakes;
+        pthread_mutex_unlock(&g_vote_stakes_cache_lock);
+        sol_pubkey_map_destroy(new_map);
+        return map;
     }
 
     vote_stakes_cache_entry_t* slot = &g_vote_stakes_cache[evict];
