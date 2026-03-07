@@ -2359,12 +2359,23 @@ sol_bank_t*
 sol_bank_new_from_parent(sol_bank_t* parent, sol_slot_t slot) {
     if (!parent) return NULL;
 
+    uint64_t t_total0 = bank_monotonic_ns();
+    uint64_t phase_fork_ns = 0;
+    uint64_t phase_new_ns = 0;
+    uint64_t phase_parent_hash_ns = 0;
+    uint64_t phase_copy_ns = 0;
+    uint64_t phase_sysvar_ns = 0;
+
     /* Create child bank with a forked AccountsDB view */
+    uint64_t t0 = bank_monotonic_ns();
     sol_accounts_db_t* forked_db = sol_accounts_db_fork(parent->accounts_db);
+    phase_fork_ns = bank_monotonic_ns() - t0;
     if (!forked_db) return NULL;
 
+    t0 = bank_monotonic_ns();
     sol_bank_t* child = sol_bank_new(slot, &parent->blockhash,
                                      forked_db, &parent->config);
+    phase_new_ns = bank_monotonic_ns() - t0;
     if (!child) {
         sol_accounts_db_destroy(forked_db);
         return NULL;
@@ -2373,7 +2384,9 @@ sol_bank_new_from_parent(sol_bank_t* parent, sol_slot_t slot) {
 
     /* Wire parent bank hash for voting/bank-hash computation. Parent is expected
      * to be frozen when used as an ancestor for replay. */
+    t0 = bank_monotonic_ns();
     sol_bank_compute_hash(parent, &child->parent_hash);
+    phase_parent_hash_ns = bank_monotonic_ns() - t0;
     child->parent_slot = parent->slot;
 
     /* Ticks can be "caught up" when intermediate slots are skipped. In that
@@ -2433,6 +2446,7 @@ sol_bank_new_from_parent(sol_bank_t* parent, sol_slot_t slot) {
     }
 
     /* Copy recent blockhashes from parent */
+    t0 = bank_monotonic_ns();
     pthread_mutex_lock(&parent->lock);
 
     size_t copy_count = parent->recent_blockhash_count;
@@ -2460,13 +2474,29 @@ sol_bank_new_from_parent(sol_bank_t* parent, sol_slot_t slot) {
     pthread_mutex_unlock(&parent->lock);
 
     bank_recent_blockhash_map_rebuild(child);
+    phase_copy_ns = bank_monotonic_ns() - t0;
 
     /* Sysvars like Clock/SlotHashes must advance for each derived bank.
      * Do this after wiring parent hash so SlotHashes can include parent bank
      * hash immediately (needed for vote verification). */
+    t0 = bank_monotonic_ns();
     if (refresh_sysvar_accounts(child, true) != SOL_OK) {
         sol_bank_destroy(child);
         return NULL;
+    }
+    phase_sysvar_ns = bank_monotonic_ns() - t0;
+
+    uint64_t total_ns = bank_monotonic_ns() - t_total0;
+    if (total_ns >= 1000000000ull) {
+        sol_log_info("bank_new_slow: slot=%lu parent=%lu total=%.2fms fork=%.2fms new=%.2fms parent_hash=%.2fms copy=%.2fms sysvar=%.2fms",
+                     (unsigned long)slot,
+                     (unsigned long)parent->slot,
+                     (double)total_ns / 1000000.0,
+                     (double)phase_fork_ns / 1000000.0,
+                     (double)phase_new_ns / 1000000.0,
+                     (double)phase_parent_hash_ns / 1000000.0,
+                     (double)phase_copy_ns / 1000000.0,
+                     (double)phase_sysvar_ns / 1000000.0);
     }
 
     return child;
