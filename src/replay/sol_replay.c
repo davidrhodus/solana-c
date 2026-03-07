@@ -2027,6 +2027,10 @@ sol_replay_new(sol_bank_forks_t* bank_forks,
             if (!sol_bank_is_frozen(root_bank)) {
                 sol_bank_freeze(root_bank);
             }
+            /* Precompute hash once at bootstrap so the first child bank build
+             * doesn't pay a full parent-hash cost in the replay hot path. */
+            sol_hash_t root_hash = {0};
+            sol_bank_compute_hash(root_bank, &root_hash);
             (void)sol_bank_forks_freeze(bank_forks, root);
         }
     }
@@ -2939,6 +2943,13 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             }
 
             if (!parent_bank) continue;
+            if (!sol_bank_is_frozen(parent_bank)) {
+                /* Avoid replaying children from an in-flight parent bank.
+                 * Waiting for the parent to finalize is both safer and avoids
+                 * multi-second stalls inside sol_bank_new_from_parent(). */
+                any_incomplete = true;
+                continue;
+            }
 
             replay_set_stage(replayed, REPLAY_STAGE_BUILD_BANK);
             uint64_t t_new0 = timing_collect ? get_time_ns() : 0;

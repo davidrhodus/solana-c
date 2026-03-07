@@ -86,7 +86,7 @@ export ROCKSDB_PATH LOG_FILE
 : "${SOL_REPAIR_MAX_RETRIES:=6}"
 # Keep replay-thread fanout conservative on combined RPC+voting nodes to avoid
 # cross-slot replay convoy stalls under backlog.
-: "${SOL_TVU_REPLAY_THREADS:=8}"
+: "${SOL_TVU_REPLAY_THREADS:=4}"
 # Prefer async replay verify with bounded wait. This reduces sync verify
 # outliers while preserving deterministic fallback via wait budget.
 : "${SOL_REPLAY_VERIFY_ASYNC:=1}"
@@ -95,7 +95,7 @@ export ROCKSDB_PATH LOG_FILE
 : "${SOL_REPLAY_VERIFY_WORKERS:=24}"
 # Bound async-verify wait before local fallback. Tune lower (or 0) when
 # prioritizing strict latency over duplicate verify work.
-: "${SOL_REPLAY_VERIFY_WAIT_BUDGET_MS:=256}"
+: "${SOL_REPLAY_VERIFY_WAIT_BUDGET_MS:=64}"
 # Keep replay queue waits bounded to avoid multi-second convoy stalls. The
 # runtime defaults are core-count aware; we pin the canary profile to low-tail
 # values for large-core RPC+voting nodes.
@@ -116,6 +116,9 @@ export ROCKSDB_PATH LOG_FILE
 # Cap replay no-conflict batch size so one oversized dispatch doesn't monopolize
 # a shard and create long-tail replay stragglers.
 : "${SOL_TX_POOL_REPLAY_MAX_BATCH_TXS:=384}"
+# Keep replay mostly sequential for stability, but allow very large replay
+# batches to use tx-pool parallel mode.
+: "${SOL_TX_REPLAY_SEQ_MAX_TXS:=1024}"
 # Keep DAG ready-queue pop batches small to reduce worker work-hoarding and
 # replay straggler tails on large-core hosts.
 : "${SOL_TX_DAG_POP_BATCH:=1}"
@@ -166,7 +169,7 @@ export SOL_REPAIR_REQUEST_TIMEOUT_MS SOL_REPAIR_MAX_PENDING SOL_REPAIR_MAX_RETRI
 export SOL_TVU_REPLAY_THREADS
 export SOL_REPLAY_VERIFY_ASYNC SOL_REPLAY_VERIFY_WORKERS SOL_REPLAY_VERIFY_WAIT_BUDGET_MS
 export SOL_TX_POOL_REPLAY_QUEUE_WAIT_LONG_BUDGET_MS SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH SOL_TX_POOL_REPLAY_FORCE_WAIT_ON_BUSY
-export SOL_TX_WORKERS SOL_TX_PER_WORKER SOL_TX_POOL_SHARDS SOL_TX_POOL_REPLAY_MAX_BATCH_TXS
+export SOL_TX_WORKERS SOL_TX_PER_WORKER SOL_TX_POOL_SHARDS SOL_TX_POOL_REPLAY_MAX_BATCH_TXS SOL_TX_REPLAY_SEQ_MAX_TXS
 export SOL_TX_DAG_POP_BATCH SOL_TX_STATUS_BATCH_RECORD
 export SOL_BPF_PROG_CACHE_MB SOL_BPF_PROG_CACHE_ENTRIES
 export SOL_REPLAY_PREWARM_BPF_PROGRAMS SOL_REPLAY_PREWARM_MAX_PROGRAMS SOL_REPLAY_PREWARM_MAX_VARIANTS SOL_REPLAY_PREWARM_INCLUDE_READONLY

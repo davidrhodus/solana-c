@@ -7424,6 +7424,41 @@ tx_replay_parallel_enabled(void) {
     return enabled != 0;
 }
 
+static size_t
+tx_replay_seq_max_txs(void) {
+    static size_t cached = SIZE_MAX;
+    size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != SIZE_MAX, 1)) {
+        return v;
+    }
+
+    /* Replay default is sequential for stability, but very large batches can
+     * become multi-second stragglers. Cap sequential mode by tx count and let
+     * oversized batches use tx-pool parallel execution. 0 disables the cap. */
+    size_t max_txs = 0u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        max_txs = 1024u;
+    } else if (ncpu >= 96) {
+        max_txs = 896u;
+    } else if (ncpu >= 64) {
+        max_txs = 640u;
+    }
+
+    const char* env = getenv("SOL_TX_REPLAY_SEQ_MAX_TXS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            max_txs = (size_t)x;
+        }
+    }
+
+    if (max_txs > 65536u) max_txs = 65536u;
+    __atomic_store_n(&cached, max_txs, __ATOMIC_RELEASE);
+    return max_txs;
+}
+
 static bool
 tx_wave_sched_enabled(void) {
     static int cached = -1;
@@ -11146,21 +11181,31 @@ sol_bank_process_entries_ex(sol_bank_t* bank,
      * replay on a single primary slot. */
     if (g_tls_replay_context &&
         !tx_replay_parallel_enabled()) {
-        static _Atomic int replay_seq_logged = 0;
-        if (__atomic_exchange_n(&replay_seq_logged, 1, __ATOMIC_ACQ_REL) == 0) {
-            sol_log_info("Replay tx execution mode: sequential (set SOL_TX_REPLAY_PARALLEL=1 to re-enable tx-pool parallel replay)");
-        }
-        uint64_t exec_t0 = timing ? bank_monotonic_ns() : 0;
-        for (size_t i = 0; i < batch->num_entries; i++) {
-            sol_err_t err = sol_bank_process_entry(bank, &batch->entries[i]);
-            if (err != SOL_OK) {
-                return err;
+        size_t max_seq_txs = tx_replay_seq_max_txs();
+        uint32_t total_replay_txs = sol_entry_batch_transaction_count(batch);
+        if (max_seq_txs != 0u && (size_t)total_replay_txs >= max_seq_txs) {
+            static _Atomic int replay_hybrid_logged = 0;
+            if (__atomic_exchange_n(&replay_hybrid_logged, 1, __ATOMIC_ACQ_REL) == 0) {
+                sol_log_info("Replay tx execution mode: hybrid (sequential<=%zu tx, parallel above; set SOL_TX_REPLAY_PARALLEL=1 for full parallel replay)",
+                             max_seq_txs);
             }
+        } else {
+            static _Atomic int replay_seq_logged = 0;
+            if (__atomic_exchange_n(&replay_seq_logged, 1, __ATOMIC_ACQ_REL) == 0) {
+                sol_log_info("Replay tx execution mode: sequential (set SOL_TX_REPLAY_PARALLEL=1 to re-enable tx-pool parallel replay)");
+            }
+            uint64_t exec_t0 = timing ? bank_monotonic_ns() : 0;
+            for (size_t i = 0; i < batch->num_entries; i++) {
+                sol_err_t err = sol_bank_process_entry(bank, &batch->entries[i]);
+                if (err != SOL_OK) {
+                    return err;
+                }
+            }
+            if (timing) {
+                timing->tx_exec_ns += bank_monotonic_ns() - exec_t0;
+            }
+            return SOL_OK;
         }
-        if (timing) {
-            timing->tx_exec_ns += bank_monotonic_ns() - exec_t0;
-        }
-        return SOL_OK;
     }
 
     tx_sched_scratch_t* sc = &g_tls_tx_sched_scratch;
