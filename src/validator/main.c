@@ -381,7 +381,7 @@ static validator_config_t g_config = {
     .metrics_port = SOL_DEFAULT_METRICS_PORT,
     .dev_halt_at_slot = 0,
 #ifdef __linux__
-    .io_backend = SOL_IO_BACKEND_URING,
+    .io_backend = SOL_IO_BACKEND_POSIX,
 #else
     .io_backend = SOL_IO_BACKEND_POSIX,
 #endif
@@ -1937,7 +1937,7 @@ static void
 	        "  --no-quic                 Disable TPU QUIC receiver\n"
 	        "  --no-rpc                  Disable RPC server\n"
 #ifdef __linux__
-	        "  --io-backend BACKEND      IO backend: uring|posix (default: uring; falls back to posix if unavailable)\n"
+	        "  --io-backend BACKEND      IO backend: posix|uring (default: posix)\n"
 #else
 	        "  --io-backend BACKEND      IO backend: posix|uring (default: posix)\n"
 #endif

@@ -215,6 +215,14 @@ bank_record_tx_status_batch_enabled(void) {
  * verification (sync or async-then-joined) and can skip redundant per-tx
  * signature re-verification in the bank hot path. */
 static __thread int g_tls_replay_signatures_preverified = 0;
+/* Replay-only thread-local hint: set for the replay hot path regardless of
+ * whether signature preverification is enabled. */
+static __thread int g_tls_replay_context = 0;
+
+void
+sol_bank_set_replay_context(bool enabled) {
+    g_tls_replay_context = enabled ? 1 : 0;
+}
 
 void
 sol_bank_set_replay_signatures_preverified(bool enabled) {
@@ -7057,6 +7065,38 @@ tx_pool_replay_no_seq_fallback_batch(void) {
     return threshold;
 }
 
+static size_t
+tx_pool_replay_max_batch_txs(void) {
+    static size_t cached = SIZE_MAX;
+    size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != SIZE_MAX, 1)) return v;
+
+    /* Cap per-dispatch replay batch size to avoid oversized no-conflict
+     * batches creating long-tail stragglers on busy shards. */
+    size_t threshold = 0u; /* 0 disables the cap. */
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        threshold = 384u;
+    } else if (ncpu >= 96) {
+        threshold = 320u;
+    } else if (ncpu >= 64) {
+        threshold = 256u;
+    }
+
+    const char* env = getenv("SOL_TX_POOL_REPLAY_MAX_BATCH_TXS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        unsigned long x = strtoul(env, &end, 10);
+        if (end != env) {
+            threshold = (size_t)x;
+        }
+    }
+
+    if (threshold > 16384u) threshold = 16384u;
+    __atomic_store_n(&cached, threshold, __ATOMIC_RELEASE);
+    return threshold;
+}
+
 static uint64_t
 tx_pool_replay_queue_wait_long_budget_ns(void) {
     static uint64_t cached = UINT64_MAX;
@@ -7351,6 +7391,32 @@ tx_parallel_enabled(void) {
         while (*env && isspace((unsigned char)*env)) env++;
         if (*env == '0' || *env == 'n' || *env == 'N' || *env == 'f' || *env == 'F') {
             enabled = 0;
+        }
+    }
+
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static bool
+tx_replay_parallel_enabled(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) {
+        return v != 0;
+    }
+
+    /* Default to sequential tx execution during replay.
+     * This avoids rare tx-pool join stalls that can pin the replay frontier.
+     * Set SOL_TX_REPLAY_PARALLEL=1 to force replay through the tx pool. */
+    int enabled = 0;
+    const char* env = getenv("SOL_TX_REPLAY_PARALLEL");
+    if (env && env[0] != '\0') {
+        while (*env && isspace((unsigned char)*env)) env++;
+        if (*env == '0' || *env == 'n' || *env == 'N' || *env == 'f' || *env == 'F') {
+            enabled = 0;
+        } else {
+            enabled = 1;
         }
     }
 
@@ -8240,7 +8306,7 @@ tx_pool_init_once(void) {
         }
     }
 
-    sol_log_info("TX pool: workers=%lu shards=%lu (dag=%d dag_min_batch=%lu min_batch=%lu replay_busy_fallback=%lu replay_no_seq_wait=%lu replay_wait_ms=%.1f replay_wait_long_ms=%.1f lthash_wait_ms=%.1f)",
+    sol_log_info("TX pool: workers=%lu shards=%lu (dag=%d dag_min_batch=%lu min_batch=%lu replay_busy_fallback=%lu replay_no_seq_wait=%lu replay_max_batch=%lu replay_wait_ms=%.1f replay_wait_long_ms=%.1f lthash_wait_ms=%.1f)",
                  (unsigned long)(total_spawned_workers ? total_spawned_workers : workers_total),
                  (unsigned long)g_tx_pool_count,
                  tx_dag_sched_enabled() ? 1 : 0,
@@ -8248,6 +8314,7 @@ tx_pool_init_once(void) {
                  (unsigned long)tx_pool_min_batch(),
                  (unsigned long)tx_pool_replay_busy_fallback_batch(),
                  (unsigned long)tx_pool_replay_no_seq_fallback_batch(),
+                 (unsigned long)tx_pool_replay_max_batch_txs(),
                  (double)tx_pool_replay_queue_wait_budget_ns() / 1000000.0,
                  (double)tx_pool_replay_queue_wait_long_budget_ns() / 1000000.0,
                  (double)lthash_queue_wait_budget_ns() / 1000000.0);
@@ -9667,6 +9734,10 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
     } else {
         skip_tx_status = false;
     }
+    size_t replay_max_batch_txs = 0u;
+    if (skip_tx_status && g_tls_replay_context) {
+        replay_max_batch_txs = tx_pool_replay_max_batch_txs();
+    }
 
     if (tx_wave_sched_enabled()) {
         static int tx_wave_diag_cached = -1;
@@ -10762,6 +10833,17 @@ legacy_sched:
         for (size_t pk = 0; pk < progdata_len; pk++) {
             (void)sol_pubkey_map_insert(batch_reads, &progdata_keys[pk], &one);
         }
+
+        if (replay_max_batch_txs > 0u &&
+            (i + 1u - batch_start) >= replay_max_batch_txs) {
+            if (__builtin_expect(tx_batch_stats, 0)) {
+                TX_BATCH_STATS_ADD((i + 1u) - batch_start);
+            }
+            tx_pool_run_range_ptrs(bank, tx_ptrs, results, batch_start, i + 1u, skip_tx_status);
+            sol_map_clear(batch_reads->inner);
+            sol_map_clear(batch_writes->inner);
+            batch_start = i + 1u;
+        }
     }
 
     /* Execute last batch. */
@@ -11055,6 +11137,28 @@ sol_bank_process_entries_ex(sol_bank_t* bank,
         }
         if (timing) {
             timing->poh_ns += bank_monotonic_ns() - poh_t0;
+        }
+        return SOL_OK;
+    }
+
+    /* Replay calls mark signatures as preverified in TLS. Prefer sequential
+     * execution there by default to avoid tx-pool join stalls that can pin
+     * replay on a single primary slot. */
+    if (g_tls_replay_context &&
+        !tx_replay_parallel_enabled()) {
+        static _Atomic int replay_seq_logged = 0;
+        if (__atomic_exchange_n(&replay_seq_logged, 1, __ATOMIC_ACQ_REL) == 0) {
+            sol_log_info("Replay tx execution mode: sequential (set SOL_TX_REPLAY_PARALLEL=1 to re-enable tx-pool parallel replay)");
+        }
+        uint64_t exec_t0 = timing ? bank_monotonic_ns() : 0;
+        for (size_t i = 0; i < batch->num_entries; i++) {
+            sol_err_t err = sol_bank_process_entry(bank, &batch->entries[i]);
+            if (err != SOL_OK) {
+                return err;
+            }
+        }
+        if (timing) {
+            timing->tx_exec_ns += bank_monotonic_ns() - exec_t0;
         }
         return SOL_OK;
     }

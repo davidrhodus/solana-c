@@ -316,77 +316,6 @@ uring_submit_and_wait_one(sol_io_uring_thread_ctx_t* t,
     return SOL_OK;
 }
 
-static sol_err_t
-uring_submit_and_wait_one_buf(sol_io_uring_thread_ctx_t* t,
-                              uint8_t opcode,
-                              int fd,
-                              const void* buf,
-                              uint32_t len,
-                              uint64_t offset,
-                              int* out_res) {
-    if (!t) return SOL_ERR_UNSUPPORTED;
-    sol_io_uring_t* u = &t->uring;
-    if (u->ring_fd < 0) return SOL_ERR_UNSUPPORTED;
-    if (fd < 0) return SOL_ERR_INVAL;
-    if (!buf && len) return SOL_ERR_INVAL;
-    if (offset > (uint64_t)LLONG_MAX) return SOL_ERR_TOO_LARGE;
-    if (!out_res) return SOL_ERR_INVAL;
-
-    unsigned head = __atomic_load_n(u->sq_head, __ATOMIC_ACQUIRE);
-    unsigned tail = __atomic_load_n(u->sq_tail, __ATOMIC_RELAXED);
-    unsigned entries = __atomic_load_n(u->sq_ring_entries, __ATOMIC_ACQUIRE);
-    if (tail - head >= entries) {
-        return SOL_ERR_BUSY;
-    }
-
-    unsigned mask = __atomic_load_n(u->sq_ring_mask, __ATOMIC_ACQUIRE);
-    unsigned idx = tail & mask;
-    struct io_uring_sqe* sqe = &u->sqes[idx];
-    memset(sqe, 0, sizeof(*sqe));
-
-    sqe->opcode = opcode;
-    sqe->fd = fd;
-    sqe->off = (uint64_t)(off_t)offset;
-    sqe->addr = (uint64_t)(uintptr_t)buf;
-    sqe->len = len;
-    sqe->user_data = 0;
-
-    u->sq_array[idx] = idx;
-
-    __atomic_store_n(u->sq_tail, tail + 1, __ATOMIC_RELEASE);
-
-    unsigned flags = IORING_ENTER_GETEVENTS;
-    if (t->sqpoll) {
-        unsigned sq_flags = __atomic_load_n(u->sq_flags, __ATOMIC_ACQUIRE);
-        if (sq_flags & IORING_SQ_NEED_WAKEUP) {
-            flags |= IORING_ENTER_SQ_WAKEUP;
-        }
-    }
-
-    for (;;) {
-        int rc = io_uring_enter_syscall(u->ring_fd, 1, 1, flags);
-        if (rc < 0) {
-            if (errno == EINTR) continue;
-            return SOL_ERR_IO;
-        }
-        break;
-    }
-
-    unsigned cq_head = __atomic_load_n(u->cq_head, __ATOMIC_ACQUIRE);
-    unsigned cq_tail = __atomic_load_n(u->cq_tail, __ATOMIC_ACQUIRE);
-    if (cq_head == cq_tail) {
-        return SOL_ERR_IO;
-    }
-
-    unsigned cq_mask = __atomic_load_n(u->cq_ring_mask, __ATOMIC_ACQUIRE);
-    struct io_uring_cqe* cqe = &u->cqes[cq_head & cq_mask];
-    int res = cqe->res;
-    __atomic_store_n(u->cq_head, cq_head + 1, __ATOMIC_RELEASE);
-
-    *out_res = res;
-    return SOL_OK;
-}
-
 static void
 uring_tls_destructor(void* p) {
     sol_io_uring_thread_ctx_t* t = (sol_io_uring_thread_ctx_t*)p;
@@ -449,18 +378,7 @@ uring_preadv_all(sol_io_ctx_t* ctx,
 
     while (cur_cnt > 0) {
         int res = 0;
-        sol_err_t err;
-        if (cur_cnt == 1 && cur[0].iov_len <= UINT32_MAX) {
-            err = uring_submit_and_wait_one_buf(t,
-                                                IORING_OP_READ,
-                                                fd,
-                                                cur[0].iov_base,
-                                                (uint32_t)cur[0].iov_len,
-                                                off,
-                                                &res);
-        } else {
-            err = uring_submit_and_wait_one(t, IORING_OP_READV, fd, cur, cur_cnt, off, &res);
-        }
+        sol_err_t err = uring_submit_and_wait_one(t, IORING_OP_READV, fd, cur, cur_cnt, off, &res);
         if (err != SOL_OK) {
             if (v != stack_iov) sol_free(v);
             return err;
@@ -518,18 +436,7 @@ uring_pwritev_all(sol_io_ctx_t* ctx,
 
     while (cur_cnt > 0) {
         int res = 0;
-        sol_err_t err;
-        if (cur_cnt == 1 && cur[0].iov_len <= UINT32_MAX) {
-            err = uring_submit_and_wait_one_buf(t,
-                                                IORING_OP_WRITE,
-                                                fd,
-                                                cur[0].iov_base,
-                                                (uint32_t)cur[0].iov_len,
-                                                off,
-                                                &res);
-        } else {
-            err = uring_submit_and_wait_one(t, IORING_OP_WRITEV, fd, cur, cur_cnt, off, &res);
-        }
+        sol_err_t err = uring_submit_and_wait_one(t, IORING_OP_WRITEV, fd, cur, cur_cnt, off, &res);
         if (err != SOL_OK) {
             if (v != stack_iov) sol_free(v);
             return err;

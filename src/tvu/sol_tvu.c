@@ -39,6 +39,8 @@ typedef struct {
     sol_slot_t          waiting_parent_slot;
     sol_replay_result_t last_replay_result;
     uint64_t            last_replay_ns;
+    uint64_t            replay_started_ns;
+    uint64_t            replay_attempt_id;
     /* Snapshot of blockstore variant state at the last replay attempt.
      *
      * Used to avoid tight replay loops on "complete" slots that fail replay
@@ -151,6 +153,7 @@ struct sol_tvu {
     pthread_mutex_t         lock;
     bool                    running;
     bool                    threads_started;
+    uint64_t                replay_attempt_seq;
 
     /* Sliding-window replay stage latency samples (for percentile reporting). */
     replay_stage_sample_t   replay_samples[SOL_TVU_REPLAY_STAGE_SAMPLES];
@@ -233,6 +236,8 @@ tvu_mark_slot_complete_locked(sol_tvu_t* tvu,
 
     tracker->status = SOL_SLOT_STATUS_COMPLETE;
     tracker->waiting_parent_slot = 0;
+    tracker->replay_started_ns = 0;
+    tracker->replay_attempt_id = 0;
     if (tracker->first_complete_ns == 0) {
         tracker->first_complete_ns = now_ns();
     }
@@ -1136,6 +1141,39 @@ tvu_primary_incomplete_retry_ns(void) {
     return (uint64_t)cached * 1000000ULL;
 }
 
+static uint64_t
+tvu_primary_replaying_timeout_ns(void) {
+    static long cached = -1;
+    if (cached >= 0) {
+        return (uint64_t)cached * 1000000ULL;
+    }
+
+    /* If a replay worker pins the primary slot in REPLAYING for too long,
+     * force it back to COMPLETE so another worker can reclaim the attempt. */
+    const char* env = getenv("SOL_TVU_PRIMARY_REPLAYING_TIMEOUT_MS");
+    long v = 15000; /* default */
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        long parsed = strtol(env, &end, 10);
+        if (end && end != env) {
+            v = parsed;
+        }
+    }
+    if (v < 0) v = 0;
+    if (v > 300000) v = 300000;
+    cached = v;
+    return (uint64_t)cached * 1000000ULL;
+}
+
+static inline uint64_t
+tvu_next_replay_attempt_id_locked(sol_tvu_t* tvu) {
+    tvu->replay_attempt_seq++;
+    if (__builtin_expect(tvu->replay_attempt_seq == 0u, 0)) {
+        tvu->replay_attempt_seq = 1u;
+    }
+    return tvu->replay_attempt_seq;
+}
+
 static size_t
 tvu_replay_parent_probe_limit(void) {
     static long cached = -1;
@@ -1880,10 +1918,13 @@ replay_thread_func(void* arg) {
     uint64_t parent_missing_diag_ns = 0;
     uint64_t replay_scheduler_diag_ns = 0;
     uint64_t replay_primary_result_diag_ns = 0;
+    uint64_t replay_primary_stale_diag_ns = 0;
+    uint64_t replay_stale_result_diag_ns = 0;
 
     while (tvu->running) {
         /* Find slots ready for replay */
         sol_slot_t replay_slot = 0;
+        uint64_t replay_attempt_id = 0;
         double replay_repair_wait_ms = 0.0;
         bool found = false;
         bool fast_mode = tvu_fast_mode();
@@ -1995,6 +2036,30 @@ replay_thread_func(void* arg) {
 
         for (size_t i = 0; i < tvu->num_slots; i++) {
             slot_tracker_t* tracker = &tvu->slots[i];
+
+            if (tvu->replay &&
+                replay_primary_slot != 0 &&
+                tracker->slot == replay_primary_slot &&
+                tracker->status == SOL_SLOT_STATUS_REPLAYING) {
+                uint64_t timeout_ns = tvu_primary_replaying_timeout_ns();
+                if (timeout_ns != 0 &&
+                    tracker->replay_started_ns != 0 &&
+                    loop_now_ns >= tracker->replay_started_ns &&
+                    (loop_now_ns - tracker->replay_started_ns) >= timeout_ns &&
+                    !sol_replay_is_replayed(tvu->replay, tracker->slot) &&
+                    !sol_replay_is_dead(tvu->replay, tracker->slot)) {
+                    uint64_t age_ms = (loop_now_ns - tracker->replay_started_ns) / 1000000ULL;
+                    tvu_mark_slot_complete_locked(tvu, tracker, false);
+                    tracker->replay_retry_requested = false;
+                    if (replay_primary_stale_diag_ns == 0 ||
+                        (loop_now_ns - replay_primary_stale_diag_ns) >= 1000000000ULL) {
+                        sol_log_warn("Replay primary stale in REPLAYING: slot=%lu age_ms=%lu; forcing reschedule",
+                                     (unsigned long)tracker->slot,
+                                     (unsigned long)age_ms);
+                        replay_primary_stale_diag_ns = loop_now_ns;
+                    }
+                }
+            }
 
             if (tvu->replay &&
                 tvu->blockstore &&
@@ -2214,6 +2279,10 @@ replay_thread_func(void* arg) {
                             tvu_count_complete_variants(tvu->blockstore, replay_slot);
                     }
                     tracker->status = SOL_SLOT_STATUS_REPLAYING;
+                    tracker->waiting_parent_slot = 0;
+                    tracker->replay_started_ns = now_ns();
+                    tracker->replay_attempt_id = tvu_next_replay_attempt_id_locked(tvu);
+                    replay_attempt_id = tracker->replay_attempt_id;
                     found = true;
                 }
                 pthread_mutex_unlock(&tvu->slots_lock);
@@ -2400,12 +2469,17 @@ replay_thread_func(void* arg) {
         pthread_mutex_lock(&tvu->slots_lock);
         slot_tracker_t* tracker = find_slot(tvu, replay_slot);
         uint64_t prev_replay_ns = tracker ? tracker->last_replay_ns : 0;
-        if (tracker) {
+        uint64_t current_attempt_id = tracker ? tracker->replay_attempt_id : 0;
+        bool stale_attempt_result =
+            tracker && replay_attempt_id != 0 && current_attempt_id != replay_attempt_id;
+        if (tracker && !stale_attempt_result) {
             bool retry_requested = tracker->replay_retry_requested;
             tracker->replay_retry_requested = false;
             tracker->waiting_parent_slot = 0;
             tracker->last_replay_result = replay_result;
             tracker->last_replay_ns = now_ns();
+            tracker->replay_started_ns = 0;
+            tracker->replay_attempt_id = 0;
 
             if (replay_result == SOL_REPLAY_PARENT_MISSING) {
                 tracker->status = SOL_SLOT_STATUS_WAITING_PARENT;
@@ -2436,6 +2510,20 @@ replay_thread_func(void* arg) {
             }
         }
         pthread_mutex_unlock(&tvu->slots_lock);
+
+        if (stale_attempt_result) {
+            uint64_t now = now_ns();
+            if (replay_stale_result_diag_ns == 0 ||
+                (now - replay_stale_result_diag_ns) >= 1000000000ULL) {
+                sol_log_debug("Replay stale attempt result ignored: slot=%lu attempt=%lu current_attempt=%lu result=%d",
+                              (unsigned long)replay_slot,
+                              (unsigned long)replay_attempt_id,
+                              (unsigned long)current_attempt_id,
+                              (int)replay_result);
+                replay_stale_result_diag_ns = now;
+            }
+            continue;
+        }
 
         if (replay_result == SOL_REPLAY_INCOMPLETE) {
             uint64_t now = now_ns();

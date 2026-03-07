@@ -528,6 +528,13 @@ sol_err_t sol_bank_process_entries_ex(
 );
 
 /*
+ * Replay hint: set true when processing ledger replay on the current thread.
+ * Used to select replay-specific execution paths that are independent from
+ * signature preverification.
+ */
+void sol_bank_set_replay_context(bool enabled);
+
+/*
  * Replay hint: set true when the current thread is processing entries whose
  * transaction signatures were already verified by replay entry verification.
  * This allows bank transaction execution to skip redundant per-transaction

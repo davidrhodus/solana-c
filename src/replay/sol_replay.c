@@ -321,6 +321,9 @@ typedef struct sol_replayed_slot {
     sol_slot_t                  slot;
     bool                        is_dead;
     bool                        in_progress;
+    uint64_t                    in_progress_since_ns;
+    uint64_t                    in_progress_lease_id;
+    _Atomic uint32_t            in_progress_stage;
     uint32_t                    variant_count; /* Variants observed when last attempted */
     uint32_t                    complete_variant_count; /* Complete variants observed when last attempted */
     struct sol_replayed_slot*   next;
@@ -363,6 +366,9 @@ struct sol_replay {
 
     /* Throttle expensive root-prune attempts under bank-forks pressure. */
     uint64_t                    last_full_prune_ns;
+    /* Monotonic lease id for replay in-progress ownership. Guarded by lock. */
+    uint64_t                    replay_lease_seq;
+    uint64_t                    last_in_progress_steal_log_ns;
 };
 
 static bool
@@ -556,6 +562,56 @@ replay_sync_prewarm_budget_ns(void) {
     uint64_t budget_ns = budget_ms * 1000000ULL;
     __atomic_store_n(&cached, budget_ns, __ATOMIC_RELEASE);
     return budget_ns;
+}
+
+static uint64_t
+replay_in_progress_timeout_ns(void) {
+    static _Atomic uint64_t cached = 0;
+    uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v != 0, 1)) {
+        return v - 1u;
+    }
+
+    uint64_t timeout_ms = 15000u;
+    const char* env = getenv("SOL_REPLAY_IN_PROGRESS_TIMEOUT_MS");
+    if (env && env[0] != '\0') {
+        char* end = NULL;
+        errno = 0;
+        unsigned long long parsed = strtoull(env, &end, 10);
+        if (errno == 0 && end != env) {
+            timeout_ms = (uint64_t)parsed;
+        }
+    }
+
+    if (timeout_ms > 600000u) timeout_ms = 600000u;
+    uint64_t timeout_ns = timeout_ms * 1000000ULL;
+    __atomic_store_n(&cached, timeout_ns + 1u, __ATOMIC_RELEASE);
+    return timeout_ns;
+}
+
+enum {
+    REPLAY_STAGE_NONE = 0u,
+    REPLAY_STAGE_PREPARE = 1u,
+    REPLAY_STAGE_BUILD_BANK = 2u,
+    REPLAY_STAGE_EXECUTE = 3u,
+    REPLAY_STAGE_FINALIZE = 4u,
+};
+
+static const char*
+replay_stage_name(uint32_t stage) {
+    switch (stage) {
+        case REPLAY_STAGE_PREPARE: return "prepare";
+        case REPLAY_STAGE_BUILD_BANK: return "build_bank";
+        case REPLAY_STAGE_EXECUTE: return "execute";
+        case REPLAY_STAGE_FINALIZE: return "finalize";
+        default: return "none";
+    }
+}
+
+static inline void
+replay_set_stage(sol_replayed_slot_t* replayed, uint32_t stage) {
+    if (!replayed) return;
+    __atomic_store_n(&replayed->in_progress_stage, stage, __ATOMIC_RELEASE);
 }
 
 static uint64_t get_time_ns(void);
@@ -1291,6 +1347,47 @@ prewarm_done:
     sol_free(warmed_programs);
 }
 
+static inline uint64_t
+replay_next_lease_id_locked(sol_replay_t* replay) {
+    replay->replay_lease_seq++;
+    if (__builtin_expect(replay->replay_lease_seq == 0u, 0)) {
+        replay->replay_lease_seq = 1u;
+    }
+    return replay->replay_lease_seq;
+}
+
+static inline void
+replay_clear_in_progress_locked(sol_replayed_slot_t* entry) {
+    if (!entry) return;
+    entry->in_progress = false;
+    entry->in_progress_since_ns = 0;
+    entry->in_progress_lease_id = 0;
+    replay_set_stage(entry, REPLAY_STAGE_NONE);
+}
+
+static bool
+remove_replayed_entry(sol_replay_t* replay, sol_slot_t slot);
+
+static bool
+replay_release_slot_attempt_locked(sol_replay_t* replay,
+                                   sol_slot_t slot,
+                                   bool entry_created,
+                                   uint64_t lease_id,
+                                   bool remove_if_created) {
+    sol_replayed_slot_t* cur = find_replayed(replay, slot);
+    if (!cur) return false;
+    if (__builtin_expect(cur->in_progress_lease_id != lease_id, 0)) {
+        return false;
+    }
+
+    if (remove_if_created && entry_created) {
+        return remove_replayed_entry(replay, slot);
+    }
+
+    replay_clear_in_progress_locked(cur);
+    return true;
+}
+
 /*
  * Mark slot as replayed (or update existing entry)
  */
@@ -1305,7 +1402,7 @@ mark_replayed(sol_replay_t* replay,
         existing->is_dead = is_dead;
         existing->variant_count = variant_count;
         existing->complete_variant_count = complete_variant_count;
-        existing->in_progress = false;
+        replay_clear_in_progress_locked(existing);
         return;
     }
 
@@ -1315,6 +1412,8 @@ mark_replayed(sol_replay_t* replay,
     entry->slot = slot;
     entry->is_dead = is_dead;
     entry->in_progress = false;
+    entry->in_progress_since_ns = 0;
+    entry->in_progress_lease_id = 0;
     entry->variant_count = variant_count;
     entry->complete_variant_count = complete_variant_count;
 
@@ -1336,6 +1435,8 @@ ensure_replayed_entry(sol_replay_t* replay, sol_slot_t slot) {
     entry->slot = slot;
     entry->is_dead = false;
     entry->in_progress = false;
+    entry->in_progress_since_ns = 0;
+    entry->in_progress_lease_id = 0;
     entry->variant_count = 0;
     entry->complete_variant_count = 0;
 
@@ -2101,6 +2202,7 @@ replay_entries(sol_replay_t* replay,
     /* Process entries through bank */
     uint64_t t_process0 = timing ? get_time_ns() : 0;
     sol_bank_process_entries_timing_t bank_timing = {0};
+    sol_bank_set_replay_context(true);
     if (verify_signatures) {
         sol_bank_set_replay_signatures_preverified(true);
     }
@@ -2108,6 +2210,7 @@ replay_entries(sol_replay_t* replay,
     if (verify_signatures) {
         sol_bank_set_replay_signatures_preverified(false);
     }
+    sol_bank_set_replay_context(false);
     if (timing) {
         timing->process_entries_ns = get_time_ns() - t_process0;
         timing->process_prep_ns = bank_timing.prep_ns;
@@ -2425,8 +2528,10 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     bool previously_replayed = false;
     bool previously_success = false;
     bool entry_created = false;
+    bool in_progress_stolen = false;
     uint32_t current_variants = 0;
     uint32_t current_complete_variants = 0;
+    uint64_t lease_id = 0;
     sol_replayed_slot_t* replayed = NULL;
 
     pthread_mutex_lock(&replay->lock);
@@ -2442,11 +2547,32 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     previously_success = (replayed != NULL) && !replayed->is_dead;
 
     if (replayed && replayed->in_progress) {
-        if (info) {
-            info->result = SOL_REPLAY_INCOMPLETE;
+        uint64_t now = get_time_ns();
+        uint64_t timeout_ns = replay_in_progress_timeout_ns();
+        bool stale_lease = timeout_ns != 0 &&
+                           replayed->in_progress_since_ns != 0 &&
+                           now >= replayed->in_progress_since_ns &&
+                           (now - replayed->in_progress_since_ns) >= timeout_ns;
+        if (!stale_lease) {
+            if (info) {
+                info->result = SOL_REPLAY_INCOMPLETE;
+            }
+            pthread_mutex_unlock(&replay->lock);
+            return SOL_REPLAY_INCOMPLETE;
         }
-        pthread_mutex_unlock(&replay->lock);
-        return SOL_REPLAY_INCOMPLETE;
+
+        in_progress_stolen = true;
+        if (replay->last_in_progress_steal_log_ns == 0 ||
+            (now - replay->last_in_progress_steal_log_ns) >= 1000000000ULL) {
+            uint64_t age_ms = (now - replayed->in_progress_since_ns) / 1000000ULL;
+            uint32_t stage = __atomic_load_n(&replayed->in_progress_stage, __ATOMIC_ACQUIRE);
+            sol_log_warn("Replay in-progress lease timeout: slot=%llu age_ms=%llu stage=%s; reclaiming slot",
+                         (unsigned long long)slot,
+                         (unsigned long long)age_ms,
+                         replay_stage_name(stage));
+            replay->last_in_progress_steal_log_ns = now;
+        }
+        replay_clear_in_progress_locked(replayed);
     }
 
     /* If a new block variant shows up later (duplicate slot), or a previously
@@ -2551,7 +2677,11 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
     if (!previously_replayed) {
         entry_created = true;
     }
+    lease_id = replay_next_lease_id_locked(replay);
     replayed->in_progress = true;
+    replayed->in_progress_since_ns = get_time_ns();
+    replayed->in_progress_lease_id = lease_id;
+    replay_set_stage(replayed, REPLAY_STAGE_PREPARE);
     pthread_mutex_unlock(&replay->lock);
 
     /* Find a complete block variant to learn the parent slot. */
@@ -2562,12 +2692,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             info->result = replay_fast_mode() ? SOL_REPLAY_INCOMPLETE : SOL_REPLAY_DEAD;
         }
         pthread_mutex_lock(&replay->lock);
-        if (entry_created) {
-            remove_replayed_entry(replay, slot);
-        } else {
-            sol_replayed_slot_t* cur = find_replayed(replay, slot);
-            if (cur) cur->in_progress = false;
-        }
+        (void)replay_release_slot_attempt_locked(replay, slot, entry_created, lease_id, true);
         pthread_mutex_unlock(&replay->lock);
         return replay_fast_mode() ? SOL_REPLAY_INCOMPLETE : SOL_REPLAY_DEAD;
     }
@@ -2609,12 +2734,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             info->result = replay_fast_mode() ? SOL_REPLAY_INCOMPLETE : SOL_REPLAY_DEAD;
         }
         pthread_mutex_lock(&replay->lock);
-        if (entry_created) {
-            remove_replayed_entry(replay, slot);
-        } else {
-            sol_replayed_slot_t* cur = find_replayed(replay, slot);
-            if (cur) cur->in_progress = false;
-        }
+        (void)replay_release_slot_attempt_locked(replay, slot, entry_created, lease_id, true);
         pthread_mutex_unlock(&replay->lock);
         return replay_fast_mode() ? SOL_REPLAY_INCOMPLETE : SOL_REPLAY_DEAD;
     }
@@ -2643,12 +2763,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             replay->pending_slots = pending;
             replay->pending_count++;
         }
-        if (entry_created) {
-            remove_replayed_entry(replay, slot);
-        } else {
-            sol_replayed_slot_t* cur = find_replayed(replay, slot);
-            if (cur) cur->in_progress = false;
-        }
+        (void)replay_release_slot_attempt_locked(replay, slot, entry_created, lease_id, true);
         pthread_mutex_unlock(&replay->lock);
 
         if (info) info->result = SOL_REPLAY_PARENT_MISSING;
@@ -2673,12 +2788,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
             sol_block_destroy(first_block);
             if (info) info->result = SOL_REPLAY_PARENT_MISSING;
             pthread_mutex_lock(&replay->lock);
-            if (entry_created) {
-                remove_replayed_entry(replay, slot);
-            } else {
-                sol_replayed_slot_t* cur = find_replayed(replay, slot);
-                if (cur) cur->in_progress = false;
-            }
+            (void)replay_release_slot_attempt_locked(replay, slot, entry_created, lease_id, true);
             pthread_mutex_unlock(&replay->lock);
             return SOL_REPLAY_PARENT_MISSING;
         }
@@ -2830,6 +2940,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
 
             if (!parent_bank) continue;
 
+            replay_set_stage(replayed, REPLAY_STAGE_BUILD_BANK);
             uint64_t t_new0 = timing_collect ? get_time_ns() : 0;
             sol_bank_t* bank = sol_bank_new_from_parent(parent_bank, slot);
             if (timing_collect) {
@@ -2859,6 +2970,7 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
 
             replay_entries_timing_t local_timing = {0};
             uint64_t t_entries_wall0 = timing_collect ? get_time_ns() : 0;
+            replay_set_stage(replayed, REPLAY_STAGE_EXECUTE);
             sol_replay_result_t r = replay_entries(replay, bank, slot, batch,
                                                    timing_collect_stage_metrics ? &local_timing : NULL);
             if (timing_collect) {
@@ -3305,11 +3417,26 @@ sol_replay_slot(sol_replay_t* replay, sol_slot_t slot,
         result = SOL_REPLAY_INCOMPLETE;
     }
 
+    replay_set_stage(replayed, REPLAY_STAGE_FINALIZE);
     pthread_mutex_lock(&replay->lock);
     replayed = find_replayed(replay, slot);
-    if (replayed) {
-        replayed->in_progress = false;
+    bool owns_lease = replayed &&
+                      replayed->in_progress &&
+                      replayed->in_progress_lease_id == lease_id;
+    if (!owns_lease) {
+        pthread_mutex_unlock(&replay->lock);
+        if (info) {
+            info->result = SOL_REPLAY_INCOMPLETE;
+        }
+        if (in_progress_stolen) {
+            sol_log_debug("Replay stale lease result ignored after reclaim: slot=%llu lease=%llu",
+                          (unsigned long long)slot,
+                          (unsigned long long)lease_id);
+        }
+        return SOL_REPLAY_INCOMPLETE;
     }
+
+    replay_clear_in_progress_locked(replayed);
     replay->stats.total_replay_time_ns += elapsed;
 
     if (any_success) {
@@ -3380,6 +3507,7 @@ sol_replay_available(sol_replay_t* replay, size_t max_slots) {
 
     while (pending && (max_slots == 0 || replayed < max_slots)) {
         sol_pending_slot_t* next = pending->next;
+        sol_slot_t pending_slot = pending->slot;
 
         if (replay_parent_available(replay, pending->slot, pending->parent_slot)) {
             /* Parent available, try to replay */
@@ -3389,7 +3517,7 @@ sol_replay_available(sol_replay_t* replay, size_t max_slots) {
 
             pthread_mutex_unlock(&replay->lock);
 
-            sol_replay_result_t result = sol_replay_slot(replay, pending->slot, NULL);
+            sol_replay_result_t result = sol_replay_slot(replay, pending_slot, NULL);
             if (result == SOL_REPLAY_SUCCESS) {
                 replayed++;
             }
