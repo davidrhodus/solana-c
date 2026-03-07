@@ -9763,7 +9763,14 @@ sol_bank_process_transactions_ptrs(sol_bank_t* bank,
     bank_v0_msg_patch_t* saved_v0_patches = v0_cache->patches;
     size_t saved_v0_patches_cap = v0_cache->patches_cap;
     bool v0_cache_disabled = false;
-    if (!tx_sched_ensure_v0_patches(v0_cache, count)) {
+    if (g_tls_replay_context) {
+        /* Replay can overlap transaction processing with async entry
+         * verification. Avoid mutating v0 message fields in-place in this
+         * context so verifier threads never race with scheduler patch/reset. */
+        v0_cache_disabled = true;
+        v0_cache->patches = NULL;
+        v0_cache->patches_cap = 0;
+    } else if (!tx_sched_ensure_v0_patches(v0_cache, count)) {
         /* Fall back to resolving v0 messages without caching. */
         v0_cache_disabled = true;
         v0_cache->patches = NULL;
