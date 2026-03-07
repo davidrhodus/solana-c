@@ -38,6 +38,9 @@ typedef struct sol_replay_verify_worker {
     bool                        verify_signatures;
 } sol_replay_verify_worker_t;
 
+static int g_replay_verify_async_forced_off = 0;
+static int g_replay_verify_async_forced_off_logged = 0;
+
 static bool
 replay_verify_tail_ok(const sol_entry_batch_t* batch) {
     if (!batch || batch->num_entries == 0) return false;
@@ -860,6 +863,11 @@ replay_verify_signatures(const sol_replay_t* replay) {
 static bool
 replay_verify_async(void) {
     static int cached = -1;
+
+    if (__atomic_load_n(&g_replay_verify_async_forced_off, __ATOMIC_ACQUIRE) != 0) {
+        return false;
+    }
+
     int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (v >= 0) {
         return v != 0;
@@ -878,6 +886,57 @@ replay_verify_async(void) {
     }
     __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
     return enabled != 0;
+}
+
+static uint64_t
+replay_verify_wait_stall_cutoff_ns(uint64_t wait_budget_ns) {
+    uint64_t cutoff_ns = 250ull * 1000ull * 1000ull; /* 250ms minimum */
+    if (wait_budget_ns > 0u) {
+        uint64_t scaled = wait_budget_ns;
+        if (wait_budget_ns <= (UINT64_MAX / 4ull)) {
+            scaled = wait_budget_ns * 4ull;
+        }
+        if (scaled > cutoff_ns) {
+            cutoff_ns = scaled;
+        }
+    }
+    return cutoff_ns;
+}
+
+static bool
+replay_verify_async_disable_on_stall(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (v >= 0) {
+        return v != 0;
+    }
+
+    int enabled = 1;
+    const char* env = getenv("SOL_REPLAY_VERIFY_ASYNC_DISABLE_ON_STALL");
+    if (env && env[0] != '\0' && strcmp(env, "0") == 0) {
+        enabled = 0;
+    }
+
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
+static void
+replay_verify_async_force_off(sol_slot_t slot,
+                              uint64_t wait_elapsed_ns,
+                              uint64_t wait_budget_ns) {
+    if (!replay_verify_async_disable_on_stall()) {
+        return;
+    }
+
+    __atomic_store_n(&g_replay_verify_async_forced_off, 1, __ATOMIC_RELEASE);
+    if (__atomic_exchange_n(&g_replay_verify_async_forced_off_logged, 1, __ATOMIC_ACQ_REL) == 0) {
+        sol_log_warn(
+            "Replay verify: disabling async after wait stall (slot=%llu waited=%.2fms budget=%.2fms); switching to sync verify",
+            (unsigned long long)slot,
+            (double)wait_elapsed_ns / 1000000.0,
+            (double)wait_budget_ns / 1000000.0);
+    }
 }
 
 static uint32_t
@@ -2283,6 +2342,7 @@ replay_entries(sol_replay_t* replay,
         uint64_t t0 = timing ? get_time_ns() : 0;
         bool worker_ready = false;
         uint64_t wait_budget_ns = replay_verify_wait_budget_ns();
+        uint64_t wait_elapsed_ns = 0;
 
         pthread_mutex_lock(&verify_worker->mu);
         if (wait_budget_ns > 0) {
@@ -2328,8 +2388,15 @@ replay_entries(sol_replay_t* replay,
             worker_ready = true;
         }
         pthread_mutex_unlock(&verify_worker->mu);
+        wait_elapsed_ns = get_time_ns() - t0;
         if (timing) {
-            timing->verify_wait_ns = get_time_ns() - t0;
+            timing->verify_wait_ns = wait_elapsed_ns;
+        }
+
+        if (!worker_ready &&
+            replay_verify_async_disable_on_stall() &&
+            wait_elapsed_ns >= replay_verify_wait_stall_cutoff_ns(wait_budget_ns)) {
+            replay_verify_async_force_off(slot, wait_elapsed_ns, wait_budget_ns);
         }
 
         if (!worker_ready) {

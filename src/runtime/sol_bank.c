@@ -6104,11 +6104,15 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
         goto unlock_and_return;
     }
 
-    /* 5. Check fee payer can afford fee */
-    /* Fee payer data is not mutated (only lamports/rent_epoch), so avoid the
-     * owned/copying load path (AppendVec pread) and use a view when possible. */
+    /* 5. Check fee payer can afford fee.
+     *
+     * Replay tail latency is sensitive to mmap/page-fault stalls in the view
+     * load path. In replay context, prefer an owned load to avoid those long
+     * outliers even if it costs some extra copying. */
     uint64_t payer_load_t0 = slow_tx_phase_diag ? bank_monotonic_ns() : 0u;
-    sol_account_t* payer_account = sol_bank_load_account_view(bank, fee_payer);
+    sol_account_t* payer_account = g_tls_replay_context
+        ? sol_bank_load_account(bank, fee_payer)
+        : sol_bank_load_account_view(bank, fee_payer);
     if (payer_load_t0) {
         slow_tx_pre_fee_payer_load_ns += (bank_monotonic_ns() - payer_load_t0);
     }
