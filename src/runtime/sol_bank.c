@@ -4869,11 +4869,21 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
         return SOL_ERR_INVAL;
     }
 
+    uint64_t sysvar_total_t0 = bank_monotonic_ns();
+    uint64_t phase_clock_ns = 0u;
+    uint64_t phase_static_ns = 0u;
+    uint64_t phase_recent_blockhashes_ns = 0u;
+    uint64_t phase_slot_hashes_ns = 0u;
+    uint64_t phase_slot_history_ns = 0u;
+    uint64_t phase_stake_history_ns = 0u;
+    uint64_t phase_instructions_ns = 0u;
+
     /* Clock
      *
      * When `overwrite_existing` is false, we only need to ensure the sysvar
      * exists. Avoid computing stake-weighted timestamps in that case because
      * the store helper will no-op on existing accounts anyway. */
+    uint64_t phase_t0 = bank_monotonic_ns();
 
     /* Cache the currently visible Clock sysvar once per bank. Many instructions
      * consult it and repeated AccountsDB loads are expensive. */
@@ -5047,12 +5057,14 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
             bank->cached_clock_valid = true;
         }
     }
+    phase_clock_ns += bank_monotonic_ns() - phase_t0;
 
     /* Rent, EpochSchedule, and Fees are static sysvars that Agave only writes
      * at genesis (or during rare feature activations).  They must NOT be
      * re-stored during normal slot processing because any account store
      * participates in the accounts_lt_hash delta computation.  Only create
      * them when missing (overwrite_existing=false). */
+    phase_t0 = bank_monotonic_ns();
     if (!overwrite_existing) {
         /* Rent — bincode serialized size is 17 (no #[repr(C)] padding). */
         sol_rent_t rent;
@@ -5090,12 +5102,14 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
                                                fees_data, sizeof(fees_data),
                                                false));
     }
+    phase_static_ns += bank_monotonic_ns() - phase_t0;
 
     /* Recent blockhashes — In Agave, the RecentBlockhashes sysvar is updated
      * at register_tick() on the last tick (block boundary), NOT at
      * new_from_parent().  Only create the sysvar if it doesn't exist yet
      * (genesis/test path).  The actual per-slot update happens in
      * update_recent_blockhashes_sysvar() called from sol_bank_register_tick(). */
+    phase_t0 = bank_monotonic_ns();
     if (!overwrite_existing) {
         sol_recent_blockhashes_t rbh;
         sol_recent_blockhashes_init(&rbh);
@@ -5127,8 +5141,10 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
         sol_free(rbh_data);
         SOL_TRY(err);
     }
+    phase_recent_blockhashes_ns += bank_monotonic_ns() - phase_t0;
 
     /* Slot hashes: updated every slot, contains recent parent bank hashes. */
+    phase_t0 = bank_monotonic_ns();
     {
         bool need_update =
             overwrite_existing ||
@@ -5200,12 +5216,14 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
             bank->cached_slot_hashes_valid = false;
         }
     }
+    phase_slot_hashes_ns += bank_monotonic_ns() - phase_t0;
 
     /* Slot history — In Agave, the SlotHistory sysvar is updated at freeze()
-     * time, NOT at new_from_parent().  Only create the sysvar if missing
-     * (genesis/test path).  The actual per-slot update happens in
-     * update_slot_history_sysvar() called from sol_bank_freeze(). */
-    if (!sol_accounts_db_exists(bank->accounts_db, &SOL_SYSVAR_SLOT_HISTORY_ID)) {
+     * time, NOT at new_from_parent().  Avoid probing AccountsDB on the
+     * overwrite_existing hot path; only create if missing during bootstrap. */
+    phase_t0 = bank_monotonic_ns();
+    if (!overwrite_existing &&
+        !sol_accounts_db_exists(bank->accounts_db, &SOL_SYSVAR_SLOT_HISTORY_ID)) {
         uint8_t* slot_history_data = sol_alloc(SOL_SLOT_HISTORY_SIZE);
         if (!slot_history_data) {
             return SOL_ERR_NOMEM;
@@ -5223,26 +5241,20 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
         sol_free(slot_history_data);
         SOL_TRY(store_err);
     }
+    phase_slot_history_ns += bank_monotonic_ns() - phase_t0;
 
-    /* StakeHistory sysvar: updated at the start of every epoch. Snapshot
-     * loading may provide a populated sysvar; do not overwrite it unless we
-     * are advancing epochs. */
-    sol_stake_history_t stake_history;
-    sol_stake_history_init(&stake_history);
-    bool have_stake_history = false;
+    /* StakeHistory sysvar:
+     * - bootstrap path (overwrite_existing=false): ensure the account exists.
+     * - slot hot path (overwrite_existing=true): only load/deserialize at epoch
+     *   boundaries where we may need to append the previous epoch entry. */
+    phase_t0 = bank_monotonic_ns();
+    bool at_slot_start = overwrite_existing;
+    bool is_epoch_start_slot =
+        bank->config.slots_per_epoch > 0 &&
+        ((uint64_t)bank->slot % bank->config.slots_per_epoch) == 0;
 
-    sol_account_t* stake_history_acct =
-        sol_accounts_db_load(bank->accounts_db, &SOL_SYSVAR_STAKE_HISTORY_ID);
-    if (stake_history_acct && stake_history_acct->meta.data_len >= 8) {
-        if (sol_stake_history_deserialize(&stake_history,
-                                          stake_history_acct->data,
-                                          stake_history_acct->meta.data_len) == SOL_OK) {
-            have_stake_history = true;
-        }
-    }
-    sol_account_destroy(stake_history_acct);
-
-    if (!have_stake_history) {
+    if (!at_slot_start &&
+        !sol_accounts_db_exists(bank->accounts_db, &SOL_SYSVAR_STAKE_HISTORY_ID)) {
         uint8_t empty_data[8];
         sol_stake_history_t empty;
         sol_stake_history_init(&empty);
@@ -5250,18 +5262,36 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
         SOL_TRY(store_sysvar_account_if_needed(bank, &SOL_SYSVAR_STAKE_HISTORY_ID,
                                                empty_data, sizeof(empty_data),
                                                false));
-        stake_history = empty;
-        have_stake_history = true;
     }
 
-    /* Only update once per bank at the slot boundary (during bank creation). */
-    bool at_slot_start =
-        overwrite_existing;
-    bool is_epoch_start_slot =
-        bank->config.slots_per_epoch > 0 &&
-        ((uint64_t)bank->slot % bank->config.slots_per_epoch) == 0;
-
     if (at_slot_start && is_epoch_start_slot && bank->epoch > 0) {
+        sol_stake_history_t stake_history;
+        sol_stake_history_init(&stake_history);
+        bool have_stake_history = false;
+
+        sol_account_t* stake_history_acct =
+            sol_accounts_db_load(bank->accounts_db, &SOL_SYSVAR_STAKE_HISTORY_ID);
+        if (stake_history_acct && stake_history_acct->meta.data_len >= 8) {
+            if (sol_stake_history_deserialize(&stake_history,
+                                              stake_history_acct->data,
+                                              stake_history_acct->meta.data_len) == SOL_OK) {
+                have_stake_history = true;
+            }
+        }
+        sol_account_destroy(stake_history_acct);
+
+        if (!have_stake_history) {
+            uint8_t empty_data[8];
+            sol_stake_history_t empty;
+            sol_stake_history_init(&empty);
+            SOL_TRY(sol_stake_history_serialize(&empty, empty_data, sizeof(empty_data)));
+            SOL_TRY(store_sysvar_account_if_needed(bank, &SOL_SYSVAR_STAKE_HISTORY_ID,
+                                                   empty_data, sizeof(empty_data),
+                                                   false));
+            stake_history = empty;
+            have_stake_history = true;
+        }
+
         uint64_t prev_epoch = bank->epoch - 1;
 
         if (!sol_stake_history_get(&stake_history, prev_epoch)) {
@@ -5291,17 +5321,34 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
             SOL_TRY(store_err);
         }
     }
+    phase_stake_history_ns += bank_monotonic_ns() - phase_t0;
 
     /* Instructions sysvar (empty placeholder; populated per-tx as needed).
      * In Agave, the Instructions sysvar is virtual/synthetic — injected via
      * AccountOverrides and never stored to the accounts DB.  Only create
      * the placeholder when missing. */
+    phase_t0 = bank_monotonic_ns();
     if (!overwrite_existing) {
         uint8_t instructions_data[4] = {0};
         SOL_TRY(store_sysvar_account_if_needed(bank, &SOL_SYSVAR_INSTRUCTIONS_ID,
                                                instructions_data,
                                                sizeof(instructions_data),
                                                false));
+    }
+    phase_instructions_ns += bank_monotonic_ns() - phase_t0;
+
+    uint64_t sysvar_total_ns = bank_monotonic_ns() - sysvar_total_t0;
+    if (overwrite_existing && sysvar_total_ns >= 500000000ULL) {
+        sol_log_info("sysvar_refresh_slow: slot=%lu total=%.2fms clock=%.2fms static=%.2fms recent_blockhashes=%.2fms slot_hashes=%.2fms slot_history=%.2fms stake_history=%.2fms instructions=%.2fms",
+                     (unsigned long)bank->slot,
+                     (double)sysvar_total_ns / 1000000.0,
+                     (double)phase_clock_ns / 1000000.0,
+                     (double)phase_static_ns / 1000000.0,
+                     (double)phase_recent_blockhashes_ns / 1000000.0,
+                     (double)phase_slot_hashes_ns / 1000000.0,
+                     (double)phase_slot_history_ns / 1000000.0,
+                     (double)phase_stake_history_ns / 1000000.0,
+                     (double)phase_instructions_ns / 1000000.0);
     }
 
     return SOL_OK;
@@ -7091,19 +7138,20 @@ tx_pool_replay_busy_fallback_batch(void) {
     size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v != SIZE_MAX, 1)) return v;
 
-    /* Replay throughput mode: if all shards are busy, medium ranges should
-     * prefer local execution over queueing behind an in-flight shard job.
-     * This cuts long-tail convoy stalls on high-core hosts. */
+    /* Replay throughput mode: if all shards are busy, only very small ranges
+     * should fall back to local sequential execution. Larger ranges are better
+     * served by waiting briefly for an idle shard; otherwise repeated local
+     * fallback can create multi-second replay tails on hot slots. */
     size_t threshold = 64u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu >= 128) {
-        threshold = 256u;
+        threshold = 96u;
     } else if (ncpu >= 96) {
-        threshold = 224u;
+        threshold = 96u;
     } else if (ncpu >= 64) {
-        threshold = 192u;
+        threshold = 80u;
     } else if (ncpu >= 32) {
-        threshold = 128u;
+        threshold = 64u;
     }
     const char* env = getenv("SOL_TX_POOL_REPLAY_BUSY_FALLBACK_BATCH");
     if (env && env[0] != '\0') {
@@ -7154,11 +7202,18 @@ tx_pool_replay_queue_wait_budget_ns(void) {
     uint64_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v != UINT64_MAX, 1)) return v;
 
-    /* Replay throughput mode: keep queueing bias, but bound wait so replay can
-     * fall back for stubbornly busy shards. 1ms proved too aggressive on
-     * high-throughput slots: transient shard busy periods often exceed that and
-     * trigger expensive sequential fallback. */
+    /* Replay throughput mode: keep queueing bias, but use a slightly larger
+     * default wait on large-core hosts to avoid frequent local-fallback churn
+     * when shards are only transiently busy. */
     uint64_t budget_ms = 4u;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu >= 128) {
+        budget_ms = 12u;
+    } else if (ncpu >= 96) {
+        budget_ms = 10u;
+    } else if (ncpu >= 64) {
+        budget_ms = 8u;
+    }
     const char* env = getenv("SOL_TX_POOL_REPLAY_QUEUE_WAIT_BUDGET_MS");
     if (env && env[0] != '\0') {
         char* end = NULL;
@@ -7180,18 +7235,19 @@ tx_pool_replay_no_seq_fallback_batch(void) {
     size_t v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
     if (__builtin_expect(v != SIZE_MAX, 1)) return v;
 
-    /* For replay, only large ranges should use extended wait windows on busy
-     * shards. Medium ranges typically do better with quick local fallback. */
+    /* For replay, allow extended wait windows for medium ranges as well. On
+     * large-core hosts, quick local fallback for medium batches can amplify
+     * process_tx tails when several replay threads contend for shards. */
     size_t threshold = 128u;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     if (ncpu >= 128) {
-        threshold = 384u;
+        threshold = 128u;
     } else if (ncpu >= 96) {
-        threshold = 320u;
+        threshold = 128u;
     } else if (ncpu >= 64) {
-        threshold = 256u;
+        threshold = 96u;
     } else if (ncpu >= 32) {
-        threshold = 192u;
+        threshold = 64u;
     }
     const char* env = getenv("SOL_TX_POOL_REPLAY_NO_SEQ_FALLBACK_BATCH");
     if (env && env[0] != '\0') {
