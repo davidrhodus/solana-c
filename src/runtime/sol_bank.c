@@ -2524,6 +2524,17 @@ sol_bank_new_from_parent(sol_bank_t* parent, sol_slot_t slot) {
     }
     child->recent_blockhash_count = copy_count;
 
+    /* Seed child sysvar caches from parent to avoid cold AccountsDB loads in
+     * the new_from_parent() hot path. */
+    if (parent->cached_clock_valid) {
+        child->cached_clock = parent->cached_clock;
+        child->cached_clock_valid = true;
+    }
+    if (parent->cached_slot_hashes_valid) {
+        child->cached_slot_hashes = parent->cached_slot_hashes;
+        child->cached_slot_hashes_valid = true;
+    }
+
     pthread_mutex_unlock(&parent->lock);
 
     bank_recent_blockhash_map_rebuild(child);
@@ -4868,7 +4879,13 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
      * consult it and repeated AccountsDB loads are expensive. */
     sol_clock_t prev_clock;
     sol_clock_init(&prev_clock);
-    bool have_prev_clock = load_visible_clock_sysvar(bank, &prev_clock);
+    bool have_prev_clock = false;
+    if (bank->cached_clock_valid) {
+        prev_clock = bank->cached_clock;
+        have_prev_clock = true;
+    } else {
+        have_prev_clock = load_visible_clock_sysvar(bank, &prev_clock);
+    }
 
     if (overwrite_existing ||
         !sol_accounts_db_exists(bank->accounts_db, &SOL_SYSVAR_CLOCK_ID)) {
@@ -5120,23 +5137,32 @@ refresh_sysvar_accounts(sol_bank_t* bank, bool overwrite_existing) {
         sol_slot_hashes_t slot_hashes;
         sol_slot_hashes_init(&slot_hashes);
         bool cache_valid = false;
+        bool have_slot_hashes_base = false;
 
-        sol_account_t* slot_hashes_acct =
-            sol_accounts_db_load(bank->accounts_db, &SOL_SYSVAR_SLOT_HASHES_ID);
-        if (slot_hashes_acct) {
-            sol_err_t sh_err = sol_slot_hashes_deserialize(
-                &slot_hashes, slot_hashes_acct->data, slot_hashes_acct->meta.data_len);
-            sol_account_destroy(slot_hashes_acct);
-            if (sh_err == SOL_OK) {
-                cache_valid = true;
+        if (bank->cached_slot_hashes_valid) {
+            slot_hashes = bank->cached_slot_hashes;
+            cache_valid = true;
+            have_slot_hashes_base = true;
+        }
+
+        if (!have_slot_hashes_base) {
+            sol_account_t* slot_hashes_acct =
+                sol_accounts_db_load(bank->accounts_db, &SOL_SYSVAR_SLOT_HASHES_ID);
+            if (slot_hashes_acct) {
+                sol_err_t sh_err = sol_slot_hashes_deserialize(
+                    &slot_hashes, slot_hashes_acct->data, slot_hashes_acct->meta.data_len);
+                sol_account_destroy(slot_hashes_acct);
+                if (sh_err == SOL_OK) {
+                    cache_valid = true;
+                } else if (need_update) {
+                    /* If we're overwriting/creating anyway, treat corrupt/missing
+                     * data as empty and proceed. */
+                    sol_slot_hashes_init(&slot_hashes);
+                    cache_valid = true;
+                }
             } else if (need_update) {
-                /* If we're overwriting/creating anyway, treat corrupt/missing
-                 * data as empty and proceed. */
-                sol_slot_hashes_init(&slot_hashes);
                 cache_valid = true;
             }
-        } else if (need_update) {
-            cache_valid = true;
         }
 
         if (need_update) {
