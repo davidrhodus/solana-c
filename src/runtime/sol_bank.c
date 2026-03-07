@@ -1327,6 +1327,16 @@ typedef struct {
     uint64_t    stake;
 } timestamp_sample_t;
 
+typedef struct {
+    sol_pubkey_t vote_pubkey;
+    uint64_t     stake;
+} vote_ts_cache_miss_t;
+
+typedef struct {
+    sol_pubkey_t              vote_pubkey;
+    vote_timestamp_cache_val_t value;
+} vote_ts_cache_seed_t;
+
 static int
 cmp_timestamp_sample(const void* a, const void* b) {
     const timestamp_sample_t* sa = (const timestamp_sample_t*)a;
@@ -1334,6 +1344,63 @@ cmp_timestamp_sample(const void* a, const void* b) {
     if (sa->timestamp < sb->timestamp) return -1;
     if (sa->timestamp > sb->timestamp) return 1;
     return 0;
+}
+
+static bool
+stake_weighted_timestamp_append_sample(sol_slot_t bank_slot,
+                                       uint64_t slots_per_epoch,
+                                       uint64_t ns_per_slot,
+                                       uint64_t stake,
+                                       uint64_t last_slot,
+                                       int64_t last_ts,
+                                       timestamp_sample_t** samples,
+                                       size_t* len,
+                                       size_t* cap,
+                                       __uint128_t* total_stake) {
+    if (!samples || !len || !cap || !total_stake) {
+        return false;
+    }
+    if (!stake || !last_slot || !last_ts) {
+        return true;
+    }
+    if ((sol_slot_t)last_slot > bank_slot) {
+        return true;
+    }
+
+    sol_slot_t age = bank_slot - (sol_slot_t)last_slot;
+    if ((uint64_t)age > slots_per_epoch) {
+        return true;
+    }
+
+    __uint128_t delta_ns = (__uint128_t)(uint64_t)age * (__uint128_t)ns_per_slot;
+    uint64_t delta_s = (uint64_t)(delta_ns / 1000000000ULL);
+    if (delta_s > (uint64_t)INT64_MAX) {
+        return true;
+    }
+    if (last_ts > INT64_MAX - (int64_t)delta_s) {
+        return true;
+    }
+
+    if (*len == *cap) {
+        size_t new_cap = *cap ? (*cap * 2u) : 256u;
+        if (new_cap < *cap) {
+            return false;
+        }
+        timestamp_sample_t* next = sol_realloc(*samples, new_cap * sizeof(*next));
+        if (!next) {
+            return false;
+        }
+        *samples = next;
+        *cap = new_cap;
+    }
+
+    int64_t estimate = last_ts + (int64_t)delta_s;
+    (*samples)[(*len)++] = (timestamp_sample_t){
+        .timestamp = estimate,
+        .stake = stake,
+    };
+    *total_stake += (__uint128_t)stake;
+    return true;
 }
 
 static bool
@@ -1353,19 +1420,28 @@ stake_weighted_median_timestamp(sol_bank_t* bank,
      * accounts and then checking stake weights. */
     static __thread timestamp_sample_t* tls_samples = NULL;
     static __thread size_t tls_cap = 0;
+    static __thread vote_ts_cache_miss_t* tls_misses = NULL;
+    static __thread size_t tls_miss_cap = 0;
+    static __thread vote_ts_cache_seed_t* tls_seed = NULL;
+    static __thread size_t tls_seed_cap = 0;
+
     timestamp_sample_t* samples = tls_samples;
     size_t len = 0;
     size_t cap = tls_cap;
+    vote_ts_cache_miss_t* misses = tls_misses;
+    size_t miss_len = 0;
+    size_t miss_cap = tls_miss_cap;
+    vote_ts_cache_seed_t* seed = tls_seed;
+    size_t seed_len = 0;
+    size_t seed_cap = tls_seed_cap;
     __uint128_t total_stake = 0;
 
     vote_ts_cache_init();
 
+    /* Read cache values quickly under read lock. Resolve misses outside the
+     * lock to avoid blocking vote-timestamp writers in the replay hot path. */
     sol_pubkey_map_t* ts_map = NULL;
     pthread_rwlock_rdlock(&g_vote_ts_cache_lock);
-    /* Overlay/forked AccountsDB instances can report different root-ids while
-     * still sharing the same effective vote timestamp set. Use the cache as a
-     * best-effort hint even when root-id changed, and lazily refresh entries
-     * from AccountsDB on misses. */
     if (g_vote_ts_cache) {
         ts_map = g_vote_ts_cache;
     }
@@ -1379,89 +1455,140 @@ stake_weighted_median_timestamp(sol_bank_t* bank,
         uint64_t stake = *(const uint64_t*)v;
         if (stake == 0) continue;
 
-        vote_timestamp_cache_val_t cached = {0};
-        bool have_cached = false;
+        const vote_timestamp_cache_val_t* cached = NULL;
         if (ts_map) {
-            vote_timestamp_cache_val_t* p =
-                (vote_timestamp_cache_val_t*)sol_pubkey_map_get(ts_map, vote_pubkey);
-            if (p) {
-                cached = *p;
-                have_cached = true;
-            }
+            cached = (const vote_timestamp_cache_val_t*)sol_pubkey_map_get(ts_map, vote_pubkey);
         }
 
-        uint64_t last_slot = cached.last_timestamp_slot;
-        int64_t last_ts = cached.last_timestamp;
-
-        if (!have_cached) {
-            sol_account_t* account = sol_accounts_db_load_view(bank->accounts_db, vote_pubkey);
-            if (!account) continue;
-            if (account->meta.lamports == 0 ||
-                !sol_pubkey_eq(&account->meta.owner, &SOL_VOTE_PROGRAM_ID)) {
-                sol_account_destroy(account);
-                continue;
-            }
-
-            sol_vote_state_t vote_state;
-            if (sol_vote_state_deserialize(&vote_state, account->data, account->meta.data_len) != SOL_OK) {
-                sol_account_destroy(account);
-                continue;
-            }
-            sol_account_destroy(account);
-
-            last_slot = vote_state.last_timestamp_slot;
-            last_ts = vote_state.last_timestamp;
-        }
-
-        if (last_slot == 0 || last_ts == 0) {
-            continue;
-        }
-        if ((sol_slot_t)last_slot > bank->slot) {
-            continue;
-        }
-
-        sol_slot_t age = bank->slot - (sol_slot_t)last_slot;
-        if ((uint64_t)age > bank->config.slots_per_epoch) {
-            continue;
-        }
-
-        __uint128_t delta_ns = (__uint128_t)(uint64_t)age * (__uint128_t)ns_per_slot;
-        uint64_t delta_s = (uint64_t)(delta_ns / 1000000000ULL);
-
-        if (delta_s > (uint64_t)INT64_MAX) {
-            continue;
-        }
-        if (last_ts > INT64_MAX - (int64_t)delta_s) {
-            continue;
-        }
-
-        int64_t estimate = last_ts + (int64_t)delta_s;
-
-        if (len == cap) {
-            size_t new_cap = cap ? (cap * 2) : 256;
-            if (new_cap < cap) {
+        if (cached) {
+            if (!stake_weighted_timestamp_append_sample(bank->slot,
+                                                       bank->config.slots_per_epoch,
+                                                       ns_per_slot,
+                                                       stake,
+                                                       cached->last_timestamp_slot,
+                                                       cached->last_timestamp,
+                                                       &samples,
+                                                       &len,
+                                                       &cap,
+                                                       &total_stake)) {
                 pthread_rwlock_unlock(&g_vote_ts_cache_lock);
                 return false;
             }
-            timestamp_sample_t* next = sol_realloc(samples, new_cap * sizeof(*next));
+            continue;
+        }
+
+        if (miss_len == miss_cap) {
+            size_t new_cap = miss_cap ? (miss_cap * 2u) : 256u;
+            if (new_cap < miss_cap) {
+                pthread_rwlock_unlock(&g_vote_ts_cache_lock);
+                return false;
+            }
+            vote_ts_cache_miss_t* next = sol_realloc(misses, new_cap * sizeof(*next));
             if (!next) {
                 pthread_rwlock_unlock(&g_vote_ts_cache_lock);
                 return false;
             }
-            samples = next;
-            cap = new_cap;
-            tls_samples = samples;
-            tls_cap = cap;
+            misses = next;
+            miss_cap = new_cap;
         }
-
-        samples[len++] = (timestamp_sample_t){
-            .timestamp = estimate,
+        misses[miss_len++] = (vote_ts_cache_miss_t){
+            .vote_pubkey = *vote_pubkey,
             .stake = stake,
         };
-        total_stake += (__uint128_t)stake;
+    }
+    pthread_rwlock_unlock(&g_vote_ts_cache_lock);
+
+    for (size_t i = 0; i < miss_len; i++) {
+        const vote_ts_cache_miss_t* miss = &misses[i];
+        sol_account_t* account = sol_accounts_db_load_view(bank->accounts_db, &miss->vote_pubkey);
+        if (!account) continue;
+        if (account->meta.lamports == 0 ||
+            !sol_pubkey_eq(&account->meta.owner, &SOL_VOTE_PROGRAM_ID)) {
+            sol_account_destroy(account);
+            continue;
+        }
+
+        sol_vote_state_t vote_state;
+        if (sol_vote_state_deserialize(&vote_state, account->data, account->meta.data_len) != SOL_OK) {
+            sol_account_destroy(account);
+            continue;
+        }
+        sol_account_destroy(account);
+
+        if (!stake_weighted_timestamp_append_sample(bank->slot,
+                                                   bank->config.slots_per_epoch,
+                                                   ns_per_slot,
+                                                   miss->stake,
+                                                   vote_state.last_timestamp_slot,
+                                                   vote_state.last_timestamp,
+                                                   &samples,
+                                                   &len,
+                                                   &cap,
+                                                   &total_stake)) {
+            return false;
+        }
+
+        if (seed_len == seed_cap) {
+            size_t new_cap = seed_cap ? (seed_cap * 2u) : 256u;
+            if (new_cap < seed_cap) {
+                return false;
+            }
+            vote_ts_cache_seed_t* next = sol_realloc(seed, new_cap * sizeof(*next));
+            if (!next) {
+                return false;
+            }
+            seed = next;
+            seed_cap = new_cap;
+        }
+        seed[seed_len++] = (vote_ts_cache_seed_t){
+            .vote_pubkey = miss->vote_pubkey,
+            .value = {
+                .last_timestamp_slot = vote_state.last_timestamp_slot,
+                .last_timestamp = vote_state.last_timestamp,
+            },
+        };
     }
 
-    pthread_rwlock_unlock(&g_vote_ts_cache_lock);
+    if (seed_len > 0) {
+        uint64_t root_id = vote_ts_cache_root_id_for_db(bank->accounts_db);
+        if (root_id != 0) {
+            pthread_rwlock_wrlock(&g_vote_ts_cache_lock);
+
+            if (!g_vote_ts_cache) {
+                size_t cap_hint = seed_len * 2u;
+                if (cap_hint < 1024u) {
+                    cap_hint = 1024u;
+                }
+                g_vote_ts_cache =
+                    sol_pubkey_map_new(sizeof(vote_timestamp_cache_val_t), cap_hint);
+            }
+
+            if (g_vote_ts_cache) {
+                g_vote_ts_cache_root_id = root_id;
+                for (size_t i = 0; i < seed_len; i++) {
+                    vote_timestamp_cache_val_t* cur =
+                        (vote_timestamp_cache_val_t*)sol_pubkey_map_get(g_vote_ts_cache,
+                                                                        &seed[i].vote_pubkey);
+                    if (!cur ||
+                        cur->last_timestamp_slot != seed[i].value.last_timestamp_slot ||
+                        cur->last_timestamp != seed[i].value.last_timestamp) {
+                        (void)sol_pubkey_map_insert(g_vote_ts_cache,
+                                                    &seed[i].vote_pubkey,
+                                                    &seed[i].value);
+                    }
+                }
+            }
+
+            pthread_rwlock_unlock(&g_vote_ts_cache_lock);
+        }
+    }
+
+    tls_samples = samples;
+    tls_cap = cap;
+    tls_misses = misses;
+    tls_miss_cap = miss_cap;
+    tls_seed = seed;
+    tls_seed_cap = seed_cap;
 
     if (len == 0 || total_stake == 0) {
         return false;
