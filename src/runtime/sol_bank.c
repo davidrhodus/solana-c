@@ -5650,6 +5650,11 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
     uint64_t slow_tx_post_ns = 0u;
     uint64_t slow_tx_pre_mark_ns = slow_tx_phase_diag ? slow_tx_t0 : 0u;
     uint64_t slow_tx_pre_validate_ns = 0u;
+    uint64_t slow_tx_pre_sanitize_ns = 0u;
+    uint64_t slow_tx_pre_tx_status_reserve_ns = 0u;
+    uint64_t slow_tx_pre_v0_resolve_ns = 0u;
+    uint64_t slow_tx_pre_fee_payer_load_ns = 0u;
+    uint64_t slow_tx_pre_sig_verify_ns = 0u;
     uint64_t slow_tx_pre_blockhash_fee_ns = 0u;
     uint64_t slow_tx_pre_payer_sig_ns = 0u;
     uint64_t slow_tx_pre_fee_commit_ns = 0u;
@@ -5686,7 +5691,11 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
     BANK_STAT_INC(bank, transactions_processed);
 
     /* Basic transaction validation */
+    uint64_t sanitize_t0 = slow_tx_phase_diag ? bank_monotonic_ns() : 0u;
     sol_err_t sanitize_err = sol_transaction_sanitize(tx);
+    if (sanitize_t0) {
+        slow_tx_pre_sanitize_ns += (bank_monotonic_ns() - sanitize_t0);
+    }
     if (sanitize_err != SOL_OK) {
         result.status = sanitize_err;
         BANK_STAT_INC(bank, transactions_failed);
@@ -5699,7 +5708,12 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
      * before execution to avoid lock contention in the hot path). */
     tx_sig = sol_transaction_signature(tx);
     if (enable_tx_status_cache && tx_sig) {
-        if (!tx_status_reserve(bank, tx_sig)) {
+        uint64_t reserve_t0 = slow_tx_phase_diag ? bank_monotonic_ns() : 0u;
+        bool reserve_ok = tx_status_reserve(bank, tx_sig);
+        if (reserve_t0) {
+            slow_tx_pre_tx_status_reserve_ns += (bank_monotonic_ns() - reserve_t0);
+        }
+        if (!reserve_ok) {
             result.status = SOL_ERR_TX_ALREADY_PROCESSED;
             BANK_STAT_INC(bank, transactions_failed);
             BANK_STAT_INC(bank, rejected_duplicate);
@@ -5731,6 +5745,7 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
 
         if (!have_cached) {
             resolved_len = 0;
+            uint64_t resolve_t0 = slow_tx_phase_diag ? bank_monotonic_ns() : 0u;
             sol_err_t resolve_err = bank_resolve_v0_message_accounts(bank,
                                                                      tx,
                                                                      resolved_accounts,
@@ -5738,6 +5753,9 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
                                                                      resolved_is_signer,
                                                                      SOL_MAX_MESSAGE_ACCOUNTS,
                                                                      &resolved_len);
+            if (resolve_t0) {
+                slow_tx_pre_v0_resolve_ns += (bank_monotonic_ns() - resolve_t0);
+            }
             if (resolve_err != SOL_OK) {
                 result.status = resolve_err;
                 BANK_STAT_INC(bank, transactions_failed);
@@ -5889,7 +5907,11 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
     /* 5. Check fee payer can afford fee */
     /* Fee payer data is not mutated (only lamports/rent_epoch), so avoid the
      * owned/copying load path (AppendVec pread) and use a view when possible. */
+    uint64_t payer_load_t0 = slow_tx_phase_diag ? bank_monotonic_ns() : 0u;
     sol_account_t* payer_account = sol_bank_load_account_view(bank, fee_payer);
+    if (payer_load_t0) {
+        slow_tx_pre_fee_payer_load_ns += (bank_monotonic_ns() - payer_load_t0);
+    }
     if (!payer_account) {
         result.status = SOL_ERR_TX_ACCOUNT_NOT_FOUND;
         BANK_STAT_INC(bank, transactions_failed);
@@ -5919,14 +5941,20 @@ sol_bank_process_transaction_impl(sol_bank_t* bank,
     BANK_STAT_ADD(bank, signatures_verified, (uint64_t)tx->signatures_len);
 
     if (!bank_skip_signature_verify() &&
-        !g_tls_replay_signatures_preverified &&
-        !sol_transaction_verify_signatures(tx, NULL)) {
-        result.status = SOL_ERR_TX_SIGNATURE;
-        BANK_STAT_INC(bank, transactions_failed);
-        BANK_STAT_INC(bank, rejected_signature);
-        log_prevalidation_rejection(bank, tx, "signature", SOL_ERR_TX_SIGNATURE);
-        sol_account_destroy(payer_account);
-        goto unlock_and_return;
+        !g_tls_replay_signatures_preverified) {
+        uint64_t sig_verify_t0 = slow_tx_phase_diag ? bank_monotonic_ns() : 0u;
+        bool sig_ok = sol_transaction_verify_signatures(tx, NULL);
+        if (sig_verify_t0) {
+            slow_tx_pre_sig_verify_ns += (bank_monotonic_ns() - sig_verify_t0);
+        }
+        if (!sig_ok) {
+            result.status = SOL_ERR_TX_SIGNATURE;
+            BANK_STAT_INC(bank, transactions_failed);
+            BANK_STAT_INC(bank, rejected_signature);
+            log_prevalidation_rejection(bank, tx, "signature", SOL_ERR_TX_SIGNATURE);
+            sol_account_destroy(payer_account);
+            goto unlock_and_return;
+        }
     }
 
     if (slow_tx_pre_mark_ns) {
@@ -6619,12 +6647,17 @@ unlock_and_return:
             }
 
             if (slow_tx_phase_diag) {
-                sol_log_info("SLOW_TX: slot=%lu dur_ms=%.3f pre_ms=%.3f pre_validate_ms=%.3f pre_blockhash_fee_ms=%.3f pre_payer_sig_ms=%.3f pre_fee_commit_ms=%.3f pre_setup_ms=%.3f pre_setup_demote_ms=%.3f pre_setup_instr_sysvar_ms=%.3f pre_setup_undo_ms=%.3f pre_setup_rent_fixup_ms=%.3f pre_setup_invoke_ctx_ms=%.3f exec_ms=%.3f post_ms=%.3f err=%d cu=%lu fee=%lu payer=%s sig=%s",
+                sol_log_info("SLOW_TX: slot=%lu dur_ms=%.3f pre_ms=%.3f pre_validate_ms=%.3f pre_sanitize_ms=%.3f pre_tx_status_reserve_ms=%.3f pre_v0_resolve_ms=%.3f pre_blockhash_fee_ms=%.3f pre_fee_payer_load_ms=%.3f pre_sig_verify_ms=%.3f pre_payer_sig_ms=%.3f pre_fee_commit_ms=%.3f pre_setup_ms=%.3f pre_setup_demote_ms=%.3f pre_setup_instr_sysvar_ms=%.3f pre_setup_undo_ms=%.3f pre_setup_rent_fixup_ms=%.3f pre_setup_invoke_ctx_ms=%.3f exec_ms=%.3f post_ms=%.3f err=%d cu=%lu fee=%lu payer=%s sig=%s",
                              (unsigned long)bank->slot,
                              (double)dt_ns / 1e6,
                              (double)slow_tx_pre_ns / 1e6,
                              (double)slow_tx_pre_validate_ns / 1e6,
+                             (double)slow_tx_pre_sanitize_ns / 1e6,
+                             (double)slow_tx_pre_tx_status_reserve_ns / 1e6,
+                             (double)slow_tx_pre_v0_resolve_ns / 1e6,
                              (double)slow_tx_pre_blockhash_fee_ns / 1e6,
+                             (double)slow_tx_pre_fee_payer_load_ns / 1e6,
+                             (double)slow_tx_pre_sig_verify_ns / 1e6,
                              (double)slow_tx_pre_payer_sig_ns / 1e6,
                              (double)slow_tx_pre_fee_commit_ns / 1e6,
                              (double)slow_tx_pre_setup_ns / 1e6,

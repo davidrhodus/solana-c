@@ -8915,21 +8915,41 @@ void
 sol_accounts_db_clear_local(sol_accounts_db_t* db) {
     if (!db || !db->parent) return;
 
-    pthread_rwlock_wrlock(&db->lock);
-
-    for (size_t i = 0; i < db->bucket_count; i++) {
-        sol_account_entry_t* entry = db->buckets[i];
-        while (entry) {
-            sol_account_entry_t* next = entry->next;
-            if (entry->account) {
-                sol_account_destroy(entry->account);
+    size_t bucket_count = db->bucket_count;
+    sol_account_entry_t** detached = sol_calloc(bucket_count, sizeof(*detached));
+    if (!detached) {
+        /* Fallback to the legacy lock-held clear path on allocation failure. */
+        pthread_rwlock_wrlock(&db->lock);
+        for (size_t i = 0; i < db->bucket_count; i++) {
+            sol_account_entry_t* entry = db->buckets[i];
+            while (entry) {
+                sol_account_entry_t* next = entry->next;
+                if (entry->account) {
+                    sol_account_destroy(entry->account);
+                }
+                sol_free(entry);
+                entry = next;
             }
-            sol_free(entry);
-            entry = next;
+            db->buckets[i] = NULL;
         }
-        db->buckets[i] = NULL;
+
+        db->account_count = 0;
+
+        sol_accounts_db_stats_t parent_stats;
+        sol_accounts_db_stats(db->parent, &parent_stats);
+        db->stats.accounts_count = parent_stats.accounts_count;
+        db->stats.total_lamports = parent_stats.total_lamports;
+        db->stats.total_data_bytes = parent_stats.total_data_bytes;
+        pthread_rwlock_unlock(&db->lock);
+        return;
     }
 
+    pthread_rwlock_wrlock(&db->lock);
+
+    for (size_t i = 0; i < bucket_count; i++) {
+        detached[i] = db->buckets[i];
+        db->buckets[i] = NULL;
+    }
     db->account_count = 0;
 
     sol_accounts_db_stats_t parent_stats;
@@ -8939,6 +8959,19 @@ sol_accounts_db_clear_local(sol_accounts_db_t* db) {
     db->stats.total_data_bytes = parent_stats.total_data_bytes;
 
     pthread_rwlock_unlock(&db->lock);
+
+    for (size_t i = 0; i < bucket_count; i++) {
+        sol_account_entry_t* entry = detached[i];
+        while (entry) {
+            sol_account_entry_t* next = entry->next;
+            if (entry->account) {
+                sol_account_destroy(entry->account);
+            }
+            sol_free(entry);
+            entry = next;
+        }
+    }
+    sol_free(detached);
 }
 
 void

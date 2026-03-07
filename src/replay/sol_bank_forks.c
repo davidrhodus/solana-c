@@ -969,10 +969,18 @@ sol_bank_forks_set_root(sol_bank_forks_t* forks, sol_slot_t slot) {
          * Apply deltas from old-root-child to new-root while fork insertions
          * continue under the bank-forks rwlock. */
         for (size_t i = chain_len - 1; i-- > 0;) {
+            bool src_immutable = true;
+            if (chain_frozen && !chain_frozen[i]) {
+                static _Atomic int warned_nonfrozen_root_chain = 0;
+                if (__atomic_exchange_n(&warned_nonfrozen_root_chain, 1, __ATOMIC_ACQ_REL) == 0) {
+                    sol_log_warn("set_root: encountered non-frozen bank in root chain (slot=%lu); applying delta as immutable for replay latency",
+                                 (unsigned long)chain_slots[i]);
+                }
+            }
             sol_err_t err = sol_accounts_db_apply_delta_default_slot_ex(forks->accounts_db,
                                                                          chain_dbs[i],
                                                                          chain_slots[i],
-                                                                         chain_frozen ? chain_frozen[i] : false);
+                                                                         src_immutable);
             if (err != SOL_OK) {
                 ret = err;
                 goto out_unlock_root;
@@ -1296,10 +1304,18 @@ sol_bank_forks_set_root_hash(sol_bank_forks_t* forks,
 
     if (have_root_chain) {
         for (size_t i = chain_len - 1; i-- > 0;) {
+            bool src_immutable = true;
+            if (chain_frozen && !chain_frozen[i]) {
+                static _Atomic int warned_nonfrozen_root_chain_hash = 0;
+                if (__atomic_exchange_n(&warned_nonfrozen_root_chain_hash, 1, __ATOMIC_ACQ_REL) == 0) {
+                    sol_log_warn("set_root_hash: encountered non-frozen bank in root chain (slot=%lu); applying delta as immutable for replay latency",
+                                 (unsigned long)chain_slots[i]);
+                }
+            }
             sol_err_t err = sol_accounts_db_apply_delta_default_slot_ex(forks->accounts_db,
                                                                          chain_dbs[i],
                                                                          chain_slots[i],
-                                                                         chain_frozen ? chain_frozen[i] : false);
+                                                                         src_immutable);
             if (err != SOL_OK) {
                 ret = err;
                 goto out_unlock_root_hash;
