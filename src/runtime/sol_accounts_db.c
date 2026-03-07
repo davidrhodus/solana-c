@@ -37,6 +37,22 @@ accounts_db_monotonic_ns(void) {
     return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
 }
 
+static bool
+accounts_db_prefer_writer_locks(void) {
+    const char* env = getenv("SOL_ACCOUNTS_DB_PREFER_WRITER_LOCKS");
+    if (!env || env[0] == '\0') return false;
+    switch (env[0]) {
+    case '1':
+    case 't':
+    case 'T':
+    case 'y':
+    case 'Y':
+        return true;
+    default:
+        return false;
+    }
+}
+
 static uint64_t
 appendvec_map_slow_threshold_ns(void) {
     static int cached = 0;
@@ -3512,15 +3528,15 @@ sol_accounts_db_new(const sol_accounts_db_config_t* config) {
         db->config = (sol_accounts_db_config_t)SOL_ACCOUNTS_DB_CONFIG_DEFAULT;
     }
 
-    /* Root advancement needs to take writer locks on overlay AccountsDB views.
-     * Under sustained read load, the default rwlock kind can starve writers and
-     * stall the validator main loop. Prefer writers on glibc/Linux to ensure
-     * root advancement makes forward progress. */
+    /* Default to reader-friendly rwlocks to avoid replay read-tail spikes.
+     * Enable writer preference via SOL_ACCOUNTS_DB_PREFER_WRITER_LOCKS=1. */
     pthread_rwlockattr_t lock_attr;
     pthread_rwlockattr_t* lock_attr_p = NULL;
     if (pthread_rwlockattr_init(&lock_attr) == 0) {
 #if defined(SOL_OS_LINUX) && defined(__GLIBC__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
-        (void)pthread_rwlockattr_setkind_np(&lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        if (accounts_db_prefer_writer_locks()) {
+            (void)pthread_rwlockattr_setkind_np(&lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        }
 #endif
         lock_attr_p = &lock_attr;
     }
@@ -3747,7 +3763,9 @@ sol_accounts_db_new(const sol_accounts_db_config_t* config) {
         pthread_rwlockattr_t* stripe_lock_attr_p = NULL;
         if (pthread_rwlockattr_init(&stripe_lock_attr) == 0) {
 #if defined(SOL_OS_LINUX) && defined(__GLIBC__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
-            (void)pthread_rwlockattr_setkind_np(&stripe_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+            if (accounts_db_prefer_writer_locks()) {
+                (void)pthread_rwlockattr_setkind_np(&stripe_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+            }
 #endif
             stripe_lock_attr_p = &stripe_lock_attr;
         }
@@ -3807,7 +3825,9 @@ sol_accounts_db_new(const sol_accounts_db_config_t* config) {
         pthread_rwlockattr_t* stripe_lock_attr_p = NULL;
         if (pthread_rwlockattr_init(&stripe_lock_attr) == 0) {
 #if defined(SOL_OS_LINUX) && defined(__GLIBC__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
-            (void)pthread_rwlockattr_setkind_np(&stripe_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+            if (accounts_db_prefer_writer_locks()) {
+                (void)pthread_rwlockattr_setkind_np(&stripe_lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+            }
 #endif
             stripe_lock_attr_p = &stripe_lock_attr;
         }

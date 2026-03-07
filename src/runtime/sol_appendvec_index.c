@@ -5,6 +5,7 @@
 #include "sol_appendvec_index.h"
 #include "../util/sol_alloc.h"
 #include "../util/sol_bits.h"
+#include <stdlib.h>
 #include <string.h>
 
 SOL_INLINE size_t
@@ -60,12 +61,15 @@ sol_appendvec_index_new(uint32_t shard_count, size_t capacity_per_shard) {
         return NULL;
     }
 
-    /* Prefer writers on glibc/Linux to avoid starving updates under heavy read load. */
+    /* Default to reader-friendly rwlocks to reduce replay read-tail spikes.
+     * Enable writer preference explicitly via SOL_APPENDVEC_INDEX_PREFER_WRITER=1. */
     pthread_rwlockattr_t lock_attr;
     pthread_rwlockattr_t* lock_attr_p = NULL;
     if (pthread_rwlockattr_init(&lock_attr) == 0) {
 #if defined(SOL_OS_LINUX) && defined(__GLIBC__) && defined(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP)
-        (void)pthread_rwlockattr_setkind_np(&lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        if (sol_appendvec_index_prefer_writer()) {
+            (void)pthread_rwlockattr_setkind_np(&lock_attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+        }
 #endif
         lock_attr_p = &lock_attr;
     }
@@ -259,4 +263,19 @@ sol_appendvec_index_get(const sol_appendvec_index_t* idx,
     }
     pthread_rwlock_unlock((pthread_rwlock_t*)&s->lock);
     return false;
+}
+static bool
+sol_appendvec_index_prefer_writer(void) {
+    const char* env = getenv("SOL_APPENDVEC_INDEX_PREFER_WRITER");
+    if (!env || env[0] == '\0') return false;
+    switch (env[0]) {
+    case '1':
+    case 't':
+    case 'T':
+    case 'y':
+    case 'Y':
+        return true;
+    default:
+        return false;
+    }
 }

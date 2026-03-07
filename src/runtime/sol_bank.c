@@ -1191,6 +1191,7 @@ bank_get_vote_stakes_cached(sol_bank_t* bank, uint64_t epoch, uint64_t* out_tota
 typedef struct {
     uint64_t last_timestamp_slot;
     int64_t  last_timestamp;
+    uint8_t  missing;
 } vote_timestamp_cache_val_t;
 
 static pthread_once_t   g_vote_ts_cache_once = PTHREAD_ONCE_INIT;
@@ -1255,23 +1256,25 @@ sol_bank_seed_vote_timestamp_cache(sol_accounts_db_t* accounts_db,
         uint64_t stake = *(const uint64_t*)v;
         if (stake == 0) continue;
 
-        sol_account_t* account = sol_accounts_db_load_view(accounts_db, vote_pubkey);
-        if (!account) continue;
-        if (account->meta.lamports == 0 ||
-            !sol_pubkey_eq(&account->meta.owner, &SOL_VOTE_PROGRAM_ID)) {
-            sol_account_destroy(account);
-            continue;
-        }
+        vote_timestamp_cache_val_t val = {
+            .last_timestamp_slot = 0,
+            .last_timestamp = 0,
+            .missing = 1u,
+        };
 
-        sol_vote_state_t vote_state;
-        if (sol_vote_state_deserialize(&vote_state, account->data, account->meta.data_len) == SOL_OK) {
-            vote_timestamp_cache_val_t val = {
-                .last_timestamp_slot = vote_state.last_timestamp_slot,
-                .last_timestamp = vote_state.last_timestamp,
-            };
-            (void)sol_pubkey_map_insert(tmp, vote_pubkey, &val);
+        sol_account_t* account = sol_accounts_db_load_view(accounts_db, vote_pubkey);
+        if (account &&
+            account->meta.lamports > 0 &&
+            sol_pubkey_eq(&account->meta.owner, &SOL_VOTE_PROGRAM_ID)) {
+            sol_vote_state_t vote_state;
+            if (sol_vote_state_deserialize(&vote_state, account->data, account->meta.data_len) == SOL_OK) {
+                val.last_timestamp_slot = vote_state.last_timestamp_slot;
+                val.last_timestamp = vote_state.last_timestamp;
+                val.missing = 0u;
+            }
         }
         sol_account_destroy(account);
+        (void)sol_pubkey_map_insert(tmp, vote_pubkey, &val);
     }
 
     pthread_rwlock_wrlock(&g_vote_ts_cache_lock);
@@ -1310,10 +1313,12 @@ sol_bank_vote_timestamp_cache_update(sol_bank_t* bank,
             (vote_timestamp_cache_val_t*)sol_pubkey_map_get(g_vote_ts_cache, vote_pubkey);
         if (!cur ||
             cur->last_timestamp_slot != last_timestamp_slot ||
-            cur->last_timestamp != last_timestamp) {
+            cur->last_timestamp != last_timestamp ||
+            cur->missing != 0u) {
             vote_timestamp_cache_val_t val = {
                 .last_timestamp_slot = last_timestamp_slot,
                 .last_timestamp = last_timestamp,
+                .missing = 0u,
             };
             (void)sol_pubkey_map_insert(g_vote_ts_cache, vote_pubkey, &val);
         }
@@ -1461,6 +1466,9 @@ stake_weighted_median_timestamp(sol_bank_t* bank,
         }
 
         if (cached) {
+            if (cached->missing) {
+                continue;
+            }
             if (!stake_weighted_timestamp_append_sample(bank->slot,
                                                        bank->config.slots_per_epoch,
                                                        ns_per_slot,
@@ -1500,31 +1508,38 @@ stake_weighted_median_timestamp(sol_bank_t* bank,
 
     for (size_t i = 0; i < miss_len; i++) {
         const vote_ts_cache_miss_t* miss = &misses[i];
-        sol_account_t* account = sol_accounts_db_load_view(bank->accounts_db, &miss->vote_pubkey);
-        if (!account) continue;
-        if (account->meta.lamports == 0 ||
-            !sol_pubkey_eq(&account->meta.owner, &SOL_VOTE_PROGRAM_ID)) {
-            sol_account_destroy(account);
-            continue;
-        }
+        vote_timestamp_cache_val_t cache_val = {
+            .last_timestamp_slot = 0,
+            .last_timestamp = 0,
+            .missing = 1u,
+        };
+        bool have_sample = false;
 
-        sol_vote_state_t vote_state;
-        if (sol_vote_state_deserialize(&vote_state, account->data, account->meta.data_len) != SOL_OK) {
-            sol_account_destroy(account);
-            continue;
+        sol_account_t* account = sol_accounts_db_load_view(bank->accounts_db, &miss->vote_pubkey);
+        if (account &&
+            account->meta.lamports > 0 &&
+            sol_pubkey_eq(&account->meta.owner, &SOL_VOTE_PROGRAM_ID)) {
+            sol_vote_state_t vote_state;
+            if (sol_vote_state_deserialize(&vote_state, account->data, account->meta.data_len) == SOL_OK) {
+                cache_val.last_timestamp_slot = vote_state.last_timestamp_slot;
+                cache_val.last_timestamp = vote_state.last_timestamp;
+                cache_val.missing = 0u;
+                have_sample = true;
+            }
         }
         sol_account_destroy(account);
 
-        if (!stake_weighted_timestamp_append_sample(bank->slot,
-                                                   bank->config.slots_per_epoch,
-                                                   ns_per_slot,
-                                                   miss->stake,
-                                                   vote_state.last_timestamp_slot,
-                                                   vote_state.last_timestamp,
-                                                   &samples,
-                                                   &len,
-                                                   &cap,
-                                                   &total_stake)) {
+        if (have_sample &&
+            !stake_weighted_timestamp_append_sample(bank->slot,
+                                                    bank->config.slots_per_epoch,
+                                                    ns_per_slot,
+                                                    miss->stake,
+                                                    cache_val.last_timestamp_slot,
+                                                    cache_val.last_timestamp,
+                                                    &samples,
+                                                    &len,
+                                                    &cap,
+                                                    &total_stake)) {
             return false;
         }
 
@@ -1542,10 +1557,7 @@ stake_weighted_median_timestamp(sol_bank_t* bank,
         }
         seed[seed_len++] = (vote_ts_cache_seed_t){
             .vote_pubkey = miss->vote_pubkey,
-            .value = {
-                .last_timestamp_slot = vote_state.last_timestamp_slot,
-                .last_timestamp = vote_state.last_timestamp,
-            },
+            .value = cache_val,
         };
     }
 
@@ -1571,7 +1583,8 @@ stake_weighted_median_timestamp(sol_bank_t* bank,
                                                                         &seed[i].vote_pubkey);
                     if (!cur ||
                         cur->last_timestamp_slot != seed[i].value.last_timestamp_slot ||
-                        cur->last_timestamp != seed[i].value.last_timestamp) {
+                        cur->last_timestamp != seed[i].value.last_timestamp ||
+                        cur->missing != seed[i].value.missing) {
                         (void)sol_pubkey_map_insert(g_vote_ts_cache,
                                                     &seed[i].vote_pubkey,
                                                     &seed[i].value);

@@ -64,6 +64,23 @@ struct sol_rocksdb {
 #ifdef SOL_HAS_ROCKSDB
 
 static bool
+sol_rocksdb_env_truthy(const char* name) {
+    if (!name || name[0] == '\0') return false;
+    const char* env = getenv(name);
+    if (!env || env[0] == '\0') return false;
+    switch (env[0]) {
+    case '1':
+    case 't':
+    case 'T':
+    case 'y':
+    case 'Y':
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool
 sol_rocksdb_open_err_is_lock_conflict(const char* err) {
     if (!err) return false;
     /* RocksDB typically reports lock contention like:
@@ -761,6 +778,11 @@ sol_rocksdb_new(const sol_rocksdb_config_t* config) {
 
     /* Set max open files */
     rocksdb_options_set_max_open_files(db->options, config->max_open_files);
+
+    if (sol_rocksdb_env_truthy("SOL_ROCKSDB_DISABLE_AUTO_COMPACTIONS")) {
+        rocksdb_options_set_disable_auto_compactions(db->options, 1);
+        sol_log_warn("RocksDB: auto-compactions disabled via SOL_ROCKSDB_DISABLE_AUTO_COMPACTIONS=1");
+    }
 
     /* Improve ingestion throughput under multi-threaded write loads. */
     rocksdb_options_set_allow_concurrent_memtable_write(db->options, 1);
