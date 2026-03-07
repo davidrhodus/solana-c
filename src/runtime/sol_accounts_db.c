@@ -3078,6 +3078,31 @@ accounts_db_lookup_meta_local(sol_accounts_db_t* db,
 
     /* Backend lookup */
     if (db->backend) {
+        if (db->config.storage_type == SOL_ACCOUNTS_STORAGE_APPENDVEC &&
+            db->appendvec_index) {
+            sol_appendvec_index_val_t v = {0};
+            if (sol_appendvec_index_get(db->appendvec_index, pubkey, &v)) {
+                out->local_miss = false;
+                if (v.lamports == 0 || sol_hash_is_zero(&v.leaf_hash)) {
+                    out->found = false;
+                    return;
+                }
+                out->found = true;
+                out->lamports = v.lamports;
+                out->data_len = v.data_len;
+                return;
+            }
+
+            /* The root AppendVec index is complete after bootstrap and kept in
+             * sync on writes. A miss means the key is absent; avoid RocksDB
+             * point-get fallback on this hot path. */
+            if (!db->parent) {
+                out->local_miss = false;
+                out->found = false;
+                return;
+            }
+        }
+
         uint8_t* value = NULL;
         size_t value_len = 0;
         sol_err_t err = db->backend->get(db->backend->ctx,
@@ -3287,6 +3312,12 @@ accounts_db_lookup_rent_meta_local(sol_accounts_db_t* db,
                     return SOL_OK;
                 }
                 return merr;
+            }
+
+            if (!db->parent) {
+                out->local_miss = false;
+                out->found = false;
+                return SOL_OK;
             }
         }
 
@@ -3936,7 +3967,8 @@ sol_accounts_db_load_ex(sol_accounts_db_t* db, const sol_pubkey_t* pubkey,
         /* Hot-path: use the in-memory AppendVec index to avoid a RocksDB read. */
         if (db->config.storage_type == SOL_ACCOUNTS_STORAGE_APPENDVEC && db->appendvec_index) {
             sol_appendvec_index_val_t v = {0};
-            if (sol_appendvec_index_get(db->appendvec_index, pubkey, &v)) {
+            bool idx_hit = sol_appendvec_index_get(db->appendvec_index, pubkey, &v);
+            if (idx_hit) {
                 if (v.lamports == 0 || sol_hash_is_zero(&v.leaf_hash)) {
                     local_miss = false;
                     if (out_stored_slot) *out_stored_slot = (sol_slot_t)v.slot;
@@ -3965,6 +3997,11 @@ sol_accounts_db_load_ex(sol_accounts_db_t* db, const sol_pubkey_t* pubkey,
                 }
 
                 atomic_inc_u64(&db->stats.load_misses);
+            } else if (!db->parent) {
+                local_miss = false;
+                atomic_inc_u64(&db->stats.load_misses);
+                result = NULL;
+                goto out_backend;
             }
         }
 
@@ -4117,7 +4154,8 @@ sol_accounts_db_load_view_ex(sol_accounts_db_t* db,
          * a RocksDB read for every account load. */
         if (db->config.storage_type == SOL_ACCOUNTS_STORAGE_APPENDVEC && db->appendvec_index) {
             sol_appendvec_index_val_t v = {0};
-            if (sol_appendvec_index_get(db->appendvec_index, pubkey, &v)) {
+            bool idx_hit = sol_appendvec_index_get(db->appendvec_index, pubkey, &v);
+            if (idx_hit) {
                 if (v.lamports == 0 || sol_hash_is_zero(&v.leaf_hash)) {
                     local_miss = false;
                     if (out_stored_slot) *out_stored_slot = (sol_slot_t)v.slot;
@@ -4147,6 +4185,11 @@ sol_accounts_db_load_view_ex(sol_accounts_db_t* db,
 
                 /* Unexpected error - fall back to RocksDB for robustness. */
                 atomic_inc_u64(&db->stats.load_misses);
+            } else if (!db->parent) {
+                local_miss = false;
+                atomic_inc_u64(&db->stats.load_misses);
+                result = NULL;
+                goto out_backend;
             }
         }
 
@@ -4325,9 +4368,14 @@ sol_accounts_db_exists(sol_accounts_db_t* db, const sol_pubkey_t* pubkey) {
 
         if (db->config.storage_type == SOL_ACCOUNTS_STORAGE_APPENDVEC && db->appendvec_index) {
             sol_appendvec_index_val_t v = {0};
-            if (sol_appendvec_index_get(db->appendvec_index, pubkey, &v)) {
+            bool idx_hit = sol_appendvec_index_get(db->appendvec_index, pubkey, &v);
+            if (idx_hit) {
                 local_miss = false;
                 exists = (v.lamports != 0) && !sol_hash_is_zero(&v.leaf_hash);
+                goto out_backend;
+            } else if (!db->parent) {
+                local_miss = false;
+                exists = false;
                 goto out_backend;
             }
         }
