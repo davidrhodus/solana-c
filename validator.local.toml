@@ -1,0 +1,8 @@
+[snapshots]
+rpc_urls = [
+  "http://69.67.148.123:18899",
+  "http://5.199.164.220:8899",
+  "http://38.92.24.108:8899"
+]
+# Keep the bootstrap lag threshold tight so we refresh when newer snapshots are available.
+max_bootstrap_lag_slots = 1

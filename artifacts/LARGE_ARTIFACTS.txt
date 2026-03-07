@@ -1,0 +1,20 @@
+# Large untracked artifacts intentionally not committed
+# Reason: multi-terabyte data footprint unsuitable for git object storage.
+# Generated: 2026-03-07
+
+722G  bench_diag_wavebpf/
+589G  bench_halt_diag_a/
+588G  bench_mix_fastmeta/
+579G  bench_halt_post_txstatus0/
+579G  bench_mix_fresh/
+575G  bench_mix_prewarm_hi/
+574G  bench_halt_interleave_a/
+574G  bench_halt_interleave_c/
+558G  bench_mix_capfix/
+108G  snapshot_speed_test4/
+108G  snapshot_verify/
+108G  snapshot_verify2/
+11G   bench_halt_interleave_b/
+6.6G  snapshot_speed_test/
+2.7G  snapshot_speed_test2/
+2.6G  snapshot_speed_test3/

@@ -1,0 +1,27 @@
+Setting CPU governor to performance via sudo (best-effort)...
+Voting enabled: identity=/home/ubuntu/pipedev-inc-baseline/ledger/identity.json vote_account=/home/ubuntu/StrongTowerRouter/.anchor/test-ledger/vote-account-keypair.json
+Dev smoke: halting once slot 404163620 is replayed.
+tx_pool_stats(ptrs): slot=404163613 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=1 par_txs=1494 par_ms=97.798 lock_ms=0.001 wait_ms=0.000 caller_ms=97.702 join_ms=0.035
+tx_pool_stats(ptrs): slot=404163614 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=1213 par_ms=91.067 lock_ms=0.003 wait_ms=0.001 caller_ms=90.947 join_ms=0.062
+tx_pool_stats(ptrs): slot=404163615 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=3 par_txs=1483 par_ms=62.461 lock_ms=0.001 wait_ms=0.001 caller_ms=62.357 join_ms=0.052
+tx_pool_stats(ptrs): slot=404163616 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=1 par_txs=1972 par_ms=98.682 lock_ms=0.000 wait_ms=0.002 caller_ms=98.612 join_ms=0.032
+tx_pool_stats(ptrs): slot=404163617 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=1162 par_ms=74.384 lock_ms=0.001 wait_ms=0.001 caller_ms=74.274 join_ms=0.061
+tx_pool_stats(ptrs): slot=404163618 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=1 par_txs=1522 par_ms=74.967 lock_ms=0.001 wait_ms=0.000 caller_ms=74.897 join_ms=0.037
+tx_pool_stats(ptrs): slot=404163619 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=1364 par_ms=58.442 lock_ms=0.001 wait_ms=0.001 caller_ms=58.318 join_ms=0.053
+tx_pool_stats(ptrs): slot=404163620 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=1 par_txs=1907 par_ms=90.039 lock_ms=0.000 wait_ms=0.001 caller_ms=89.956 join_ms=0.033
+tx_pool_stats(ptrs): slot=404163621 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=4 par_txs=1853 par_ms=74.439 lock_ms=0.001 wait_ms=0.001 caller_ms=74.237 join_ms=0.100
+tx_pool_stats(ptrs): slot=404163622 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=1717 par_ms=70.592 lock_ms=0.001 wait_ms=0.001 caller_ms=70.469 join_ms=0.068
+tx_pool_stats(ptrs): slot=404163623 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=1638 par_ms=78.221 lock_ms=0.001 wait_ms=0.001 caller_ms=78.103 join_ms=0.067
+tx_pool_stats(ptrs): slot=404163624 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=1 par_txs=1287 par_ms=15.164 lock_ms=0.000 wait_ms=0.001 caller_ms=15.107 join_ms=0.035
+tx_pool_stats(ptrs): slot=404163625 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=1759 par_ms=96.276 lock_ms=0.001 wait_ms=0.001 caller_ms=96.188 join_ms=0.042
+tx_pool_stats(ptrs): slot=404163626 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=1875 par_ms=108.396 lock_ms=0.001 wait_ms=0.001 caller_ms=108.278 join_ms=0.063
+tx_pool_stats(ptrs): slot=404163627 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=3 par_txs=1080 par_ms=86.604 lock_ms=0.001 wait_ms=0.001 caller_ms=86.448 join_ms=0.080
+tx_pool_stats(ptrs): slot=404163628 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=3 par_txs=1681 par_ms=119.989 lock_ms=0.001 wait_ms=0.001 caller_ms=119.127 join_ms=0.781
+tx_pool_stats(ptrs): slot=404163629 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=2011 par_ms=144.406 lock_ms=0.001 wait_ms=0.001 caller_ms=144.284 join_ms=0.070
+tx_pool_stats(ptrs): slot=404163630 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=3 par_txs=1869 par_ms=111.708 lock_ms=0.001 wait_ms=0.001 caller_ms=111.554 join_ms=0.074
+tx_pool_stats(ptrs): slot=404163631 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=1 par_txs=1754 par_ms=105.338 lock_ms=0.000 wait_ms=0.001 caller_ms=105.265 join_ms=0.037
+tx_pool_stats(ptrs): slot=404163632 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=1881 par_ms=107.084 lock_ms=0.001 wait_ms=0.001 caller_ms=106.967 join_ms=0.062
+tx_pool_stats(ptrs): slot=404163633 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=4 par_txs=1314 par_ms=116.005 lock_ms=0.002 wait_ms=0.002 caller_ms=115.783 join_ms=0.111
+tx_pool_stats(ptrs): slot=404163634 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=2 par_txs=903 par_ms=108.388 lock_ms=0.001 wait_ms=0.001 caller_ms=108.272 join_ms=0.066
+tx_pool_stats(ptrs): slot=404163635 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=4 par_txs=1759 par_ms=133.278 lock_ms=0.002 wait_ms=0.002 caller_ms=133.039 join_ms=0.134
+tx_pool_stats(ptrs): slot=404163636 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=1 par_txs=1899 par_ms=119.867 lock_ms=0.000 wait_ms=0.001 caller_ms=119.786 join_ms=0.041

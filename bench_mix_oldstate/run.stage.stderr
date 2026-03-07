@@ -1,0 +1,4 @@
+Setting CPU governor to performance via sudo (best-effort)...
+Voting enabled: identity=/home/ubuntu/pipedev-inc-baseline/ledger/identity.json vote_account=/home/ubuntu/StrongTowerRouter/.anchor/test-ledger/vote-account-keypair.json
+Dev smoke: halting once slot 404163620 is replayed.
+tx_pool_stats(ptrs): slot=404163613 seq_calls=0 seq_txs=0 seq_ms=0.000 par_calls=1 par_txs=1494 par_ms=105.611 lock_ms=0.000 wait_ms=0.000 caller_ms=105.509 join_ms=0.024
