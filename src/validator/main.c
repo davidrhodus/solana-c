@@ -6506,6 +6506,10 @@ validator_run(validator_t* v) {
             static sol_slot_t auto_root_emergency_headroom = 0;
             static sol_slot_t emergency_last_root_slot = 0;
             static uint64_t emergency_last_root_progress_ns = 0;
+            static uint64_t auto_root_fail_backoff_ns = 0;
+            static uint64_t auto_root_next_try_ns = 0;
+            static sol_slot_t auto_root_last_fail_slot = 0;
+            static uint32_t auto_root_fail_count = 0;
 
             if (auto_root_period_ns == 0) {
                 /* Root advancement commits AccountsDB deltas and can be
@@ -6679,6 +6683,10 @@ validator_run(validator_t* v) {
                 (last_auto_root_ns == 0 || (now_ns - last_auto_root_ns) >= auto_root_period_ns)) {
                 last_auto_root_ns = now_ns;
 
+                if (auto_root_next_try_ns != 0 && now_ns < auto_root_next_try_ns) {
+                    continue;
+                }
+
                 sol_slot_t effective_window = auto_root_window;
                 if (auto_root_adaptive) {
                     /* Tighten the root window under backlog to reduce fork depth. */
@@ -6721,6 +6729,10 @@ validator_run(validator_t* v) {
                     }
                     sol_err_t err = sol_replay_set_root(v->replay, target_root);
                     if (err == SOL_OK) {
+                        auto_root_fail_backoff_ns = 0;
+                        auto_root_next_try_ns = 0;
+                        auto_root_last_fail_slot = 0;
+                        auto_root_fail_count = 0;
                         sol_log_info("Auto root advanced to slot %lu (highest_replayed=%lu lag=%lu "
                                      "window=%lu mode=%s)",
                                      (unsigned long)target_root,
@@ -6747,9 +6759,42 @@ validator_run(validator_t* v) {
                             }
                         }
                     } else if (err != SOL_ERR_NOTFOUND) {
-                        sol_log_warn("Auto root advance failed for slot %lu: %s",
+                        /* Repeated root-advance I/O failures can convoy replay
+                         * with expensive retry work every period. Back off
+                         * retries exponentially to keep replay responsive. */
+                        if (target_root == auto_root_last_fail_slot) {
+                            if (auto_root_fail_count < UINT32_MAX) auto_root_fail_count++;
+                        } else {
+                            auto_root_last_fail_slot = target_root;
+                            auto_root_fail_count = 1u;
+                            auto_root_fail_backoff_ns = 0u;
+                        }
+
+                        uint64_t min_backoff_ns = auto_root_period_ns;
+                        uint64_t max_backoff_ns = 10000ull * 1000ull * 1000ull; /* 10s cap */
+                        if (err == SOL_ERR_IO) {
+                            min_backoff_ns = 1000ull * 1000ull * 1000ull; /* 1s */
+                            max_backoff_ns = 60000ull * 1000ull * 1000ull; /* 60s */
+                        }
+
+                        if (auto_root_fail_backoff_ns < min_backoff_ns) {
+                            auto_root_fail_backoff_ns = min_backoff_ns;
+                        } else if (auto_root_fail_backoff_ns < max_backoff_ns) {
+                            uint64_t next_backoff = auto_root_fail_backoff_ns * 2ull;
+                            if (next_backoff < auto_root_fail_backoff_ns || next_backoff > max_backoff_ns) {
+                                next_backoff = max_backoff_ns;
+                            }
+                            auto_root_fail_backoff_ns = next_backoff;
+                        }
+
+                        auto_root_next_try_ns = now_ns + auto_root_fail_backoff_ns;
+
+                        sol_log_warn("Auto root advance failed for slot %lu: %s (failures=%u backoff_ms=%lu next_try_in_ms=%lu)",
                                      (unsigned long)target_root,
-                                     sol_err_str(err));
+                                     sol_err_str(err),
+                                     (unsigned)auto_root_fail_count,
+                                     (unsigned long)(auto_root_fail_backoff_ns / 1000000ull),
+                                     (unsigned long)((auto_root_next_try_ns - now_ns) / 1000000ull));
                     }
                 }
             }
