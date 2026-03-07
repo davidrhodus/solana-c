@@ -73,6 +73,25 @@ appendvec_map_wait_slow_threshold_ns(void) {
     return threshold_ns;
 }
 
+static bool
+appendvec_view_wait_inflight(void) {
+    static int cached = -1;
+    int v = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (__builtin_expect(v >= 0, 1)) return v != 0;
+
+    /* Default to no-wait fallback for view loads: when a mapping is in-flight,
+     * callers can safely fall back to direct pread instead of convoying behind
+     * a single mmap operation. Set SOL_APPENDVEC_VIEW_WAIT_INFLIGHT=1 to keep
+     * legacy wait behavior for diagnostics. */
+    int enabled = 0;
+    const char* env = getenv("SOL_APPENDVEC_VIEW_WAIT_INFLIGHT");
+    if (env && env[0] != '\0' && strcmp(env, "0") != 0) {
+        enabled = 1;
+    }
+    __atomic_store_n(&cached, enabled, __ATOMIC_RELEASE);
+    return enabled != 0;
+}
+
 static sol_err_t
 appendvec_get_fd_size(int fd, uint64_t* out_size) {
     if (out_size) *out_size = 0;
@@ -2049,6 +2068,10 @@ appendvec_get_map_ro(sol_accounts_db_t* db,
 
             if (cur->map_inflight) {
                 pthread_rwlock_unlock(&db->appendvec_lock);
+                if (!appendvec_view_wait_inflight()) {
+                    close(fd);
+                    return SOL_ERR_BUSY;
+                }
                 sol_err_t werr =
                     appendvec_wait_for_inflight_map(db, file_key, out_base, out_size);
                 if (werr == SOL_OK) {
@@ -2145,6 +2168,9 @@ appendvec_get_map_ro(sol_accounts_db_t* db,
 
         if (cur->map_inflight) {
             pthread_rwlock_unlock(&db->appendvec_lock);
+            if (!appendvec_view_wait_inflight()) {
+                return SOL_ERR_BUSY;
+            }
             sol_err_t werr =
                 appendvec_wait_for_inflight_map(db, file_key, out_base, out_size);
             if (werr == SOL_OK) return SOL_OK;

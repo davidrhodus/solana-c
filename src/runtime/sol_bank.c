@@ -11679,14 +11679,17 @@ sol_bank_freeze(sol_bank_t* bank) {
         run_incinerator(bank);
     }
 
+    /* Publish frozen=true before hash computation. This enables the
+     * freeze-time immutable delta-view fast path in accounts_lt_hash
+     * computation and avoids expensive clone-based snapshots on the replay
+     * hot path. We still hold bank->lock here, so no externally visible
+     * partial freeze state is released until after hash computation finishes. */
+    __atomic_store_n(&bank->frozen, true, __ATOMIC_RELEASE);
+
     /* Precompute frozen bank hash while we already own bank->lock. Child-bank
      * construction relies on parent bank hash and tail latency improves when
      * this work is done at freeze-time instead of first child creation. */
     bank_compute_hash_locked(bank);
-
-    /* Publish frozen=true with release semantics so readers can check the flag
-     * without contending on bank->lock (used by RPC hot paths). */
-    __atomic_store_n(&bank->frozen, true, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&bank->lock);
 }
 
